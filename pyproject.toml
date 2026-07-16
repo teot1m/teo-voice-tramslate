@@ -4,13 +4,16 @@ build-backend = "hatchling.build"
 
 [project]
 name = "uvt"
-version = "0.1.0"
-description = "Universal Voice Translator — закадровый перевод любого системного звука в реальном времени"
+version = "0.2.0"
+description = "Universal Voice Translator — закадровый AI-перевод любого видео и звука: кнопка в браузере, дубляж файлов, живой режим"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 authors = [{ name = "UVT contributors" }]
-keywords = ["translation", "speech", "whisper", "tts", "vad", "realtime"]
+keywords = [
+    "translation", "voice-over", "dubbing", "speech", "whisper", "tts",
+    "vad", "realtime", "ollama", "userscript",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: MIT License",
