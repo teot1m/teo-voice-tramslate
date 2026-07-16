@@ -18,6 +18,24 @@ def _strip_malloc_env() -> None:
         if key.startswith("Malloc"):
             os.environ.pop(key, None)
 
+def _load_env_file(path: str = ".env") -> None:
+    """Подхватывает переменные окружения (OPENAI_API_KEY и т.п.) из .env
+    в текущей папке. Уже выставленные переменные не перезаписывает."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip().removeprefix("export ").strip()
+                value = value.strip().strip("'\"")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError:
+        pass
+
+
 _VIRTUAL_MARKERS = ("blackhole", "vb-audio", "cable", "monitor", "loopback", "virtual", "voicemeeter")
 
 
@@ -107,6 +125,7 @@ def _print_devices() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     _strip_malloc_env()
+    _load_env_file()
     parser = _build_parser()
     args = parser.parse_args(argv)
 

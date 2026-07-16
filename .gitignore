@@ -23,3 +23,6 @@ models/
 .DS_Store
 .idea/
 .vscode/
+
+# Секреты
+.env
