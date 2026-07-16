@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Инструменты
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Данные приложения
+*.onnx
+*.bin
+history/
+models/
+
+# ОС / редакторы
+.DS_Store
+.idea/
+.vscode/

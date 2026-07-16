@@ -1,0 +1,44 @@
+# Полностью бесплатный режим: ни ключей, ни оплаты токенов.
+#   STT     — Whisper локально (бесплатно)
+#   Перевод — локальная LLM через Ollama (бесплатно; сервер должен работать:
+#             brew services start ollama)
+#   Озвучка — Edge TTS (бесплатно, без ключа)
+# Запуск: uvt serve -p free   (или uvt dub <файл|ссылка> -p free)
+#
+# Нет Ollama под рукой — переключите translation на google-free (ниже).
+mode: voiceover
+source_lang: auto
+target_lang: ru
+
+vad:
+  engine: silero
+
+stt:
+  engine: faster-whisper
+  model: small            # самый быстрый локальный вариант (CPU)
+  device: auto
+  compute_type: auto
+# Тоже бесплатно, но точность large и секунды на весь ролик (ключ: console.groq.com):
+# stt:
+#   engine: openai-compatible
+#   base_url: https://api.groq.com/openai/v1
+#   api_key_env: GROQ_API_KEY
+#   model: whisper-large-v3-turbo
+# Локально с точностью large (GPU Apple Silicon, ~3x реального времени):
+# stt:
+#   engine: mlx-whisper     # pip install -e ".[mlx]"
+#   model: large-v3-turbo
+
+translation:
+  engine: openai-compatible     # локальная LLM через Ollama — бесплатно, качеством близко к GPT
+  base_url: http://localhost:11434/v1
+  model: qwen2.5:3b
+# translation:
+#   engine: google-free         # запасной бесплатный вариант без Ollama (без ключа)
+
+tts:
+  engine: edge            # бесплатные нейронные голоса Microsoft
+  voice: auto             # м/ж подбирается детектором голоса
+
+latency:
+  preset: balanced

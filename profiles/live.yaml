@@ -1,0 +1,46 @@
+# Живой перевод ЛЮБОГО приложения (Telegram, Zoom, плееры, игры):
+# системный звук заворачивается в BlackHole, UVT слушает его и озвучивает
+# перевод поверх (плюс субтитры в терминале).
+#
+# Разовая настройка macOS:
+#   1) brew install blackhole-2ch
+#   2) Audio MIDI Setup → «+» → Multi-Output Device →
+#      отметить «Динамики» И «BlackHole 2ch» → выбрать его выходом системы
+# Запуск: uvt run -p live
+#
+# Важно: это реальное время — перевод звучит после конца фразы (~2–4 с),
+# подготовить его заранее, как в dub, физически невозможно.
+mode: voiceover
+source_lang: auto
+target_lang: ru
+
+capture:
+  backend: sounddevice
+  device: "BlackHole 2ch"   # номер/имя из `uvt devices`
+
+vad:
+  engine: silero
+
+stt:
+  engine: faster-whisper
+  model: small              # для живого режима важна скорость; base — ещё быстрее
+  device: auto
+  compute_type: auto
+
+translation:
+  engine: openai-compatible # локальная Ollama; для GPT смените на блок из cloud.yaml
+  base_url: http://localhost:11434/v1
+  model: qwen2.5:3b
+
+tts:
+  engine: edge
+  voice: auto
+
+output:
+  device: null              # наушники/колонки; тем же устройством, что и оригинал
+
+latency:
+  preset: ultra             # минимальная пауза-отсечка
+
+history:
+  enabled: false

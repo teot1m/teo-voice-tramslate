@@ -1,0 +1,69 @@
+# Профиль по умолчанию — справочник всех настроек UVT.
+# Любой ключ можно опустить: возьмётся значение по умолчанию.
+
+# Режим (ТЗ §9): subtitles | voiceover | replace | dual
+# replace/dual пока работают как voiceover (приглушение оригинала — v1.5)
+mode: voiceover
+source_lang: auto        # язык оригинала; auto — определяет Whisper
+target_lang: ru          # язык перевода и озвучки
+
+# Каталоги пользовательских плагинов (ТЗ §15)
+plugin_dirs:
+  - plugins
+
+capture:
+  backend: sounddevice   # sounddevice | wasapi-loopback (Windows) | dummy
+  device: null           # номер или имя устройства; null — по умолчанию (uvt devices)
+  sample_rate: null      # null — нативная частота устройства
+
+vad:
+  engine: silero         # silero | webrtc | energy
+  threshold: 0.5         # порог вероятности речи
+  min_speech_ms: 250     # короче — не реплика
+  # min_silence_ms / max_segment_s / pre_roll_ms не заданы →
+  # берутся из пресета задержки (latency.preset)
+
+stt:
+  engine: faster-whisper # faster-whisper | openai-compatible | dummy
+  model: small           # tiny | base | small | medium | large-v3 | distil-large-v3
+  device: auto           # auto | cuda | cpu
+  compute_type: auto
+  beam_size: 1           # 1 — быстрее, 5 — точнее
+
+translation:
+  engine: openai-compatible   # openai-compatible | none | dummy
+  base_url: http://localhost:11434/v1   # Ollama; LM Studio: http://localhost:1234/v1
+  model: qwen2.5:7b-instruct
+  api_key_env: OPENAI_API_KEY # имя переменной окружения с ключом (для облака)
+  temperature: 0.3
+  context_pairs: 3            # прошлые реплики как контекст диалога
+  # prompt_template: путь к файлу или текст шаблона (ТЗ §5); {source_lang},
+  # {target_lang} и {glossary} подставляются автоматически
+  glossary: []                # например: ["Название канала не переводить"]
+
+tts:
+  engine: edge           # edge | kokoro | none | dummy
+  voice: auto            # auto — голос по целевому языку; или ru-RU-SvetlanaNeural и т.п.
+  rate: "+0%"            # темп edge-tts: "+20%" — быстрее
+
+output:
+  backend: sounddevice   # sounddevice | null
+  device: null           # наушники или виртуальный кабель → OBS/Discord (ТЗ §10)
+  sample_rate: 24000
+  max_backlog_s: 8.0     # отставание, после которого сегменты пропускаются
+
+overlay:
+  enabled: true
+  show: both             # original | translation | both
+  font_size: 20
+  opacity: 0.85
+  color: "#FFFFFF"
+  position: bottom       # top | bottom
+
+history:
+  enabled: true
+  dir: ~/UVT/history
+  formats: [srt, txt, json]   # доступны: srt, vtt, txt, json
+
+latency:
+  preset: balanced       # ultra (~300 мс пауза) | balanced (~500) | accuracy (~800)

@@ -1,0 +1,24 @@
+# Проверка GPT-перевода без BlackHole: говорите в микрофон —
+# видите оригинал и перевод (нужен OPENAI_API_KEY в окружении).
+mode: subtitles
+source_lang: auto
+target_lang: ru          # говорите по-английски; или поменяйте на en и говорите по-русски
+capture:
+  backend: sounddevice
+  device: null           # микрофон по умолчанию
+vad:
+  engine: silero
+stt:
+  engine: faster-whisper
+  model: small
+  device: cpu
+  compute_type: int8
+translation:
+  engine: openai-compatible
+  base_url: https://api.openai.com/v1
+  model: gpt-4o-mini
+  api_key_env: OPENAI_API_KEY
+latency:
+  preset: balanced
+history:
+  enabled: false

@@ -1,0 +1,22 @@
+# Zoom / Meet / Discord: минимальная задержка, только субтитры,
+# чтобы озвучка не мешала живому разговору.
+mode: subtitles
+source_lang: auto
+target_lang: ru
+capture:
+  backend: sounddevice
+  device: null
+vad:
+  engine: silero
+stt:
+  engine: faster-whisper
+  model: base             # скорость важнее полноты
+translation:
+  engine: openai-compatible
+  base_url: http://localhost:11434/v1
+  model: qwen2.5:7b-instruct
+latency:
+  preset: ultra
+overlay:
+  show: translation
+  position: top

@@ -1,0 +1,22 @@
+# Демо: проверка установки без моделей, сети и настройки звука.
+# Тестовый источник генерирует «реплики», конвейер прогоняет их целиком:
+#   uvt run --profile demo
+mode: voiceover
+target_lang: ru
+capture:
+  backend: dummy
+  bursts: 3
+vad:
+  engine: energy
+stt:
+  engine: dummy
+translation:
+  engine: dummy
+tts:
+  engine: dummy
+output:
+  backend: sounddevice   # нет звуковой карты — поставьте null
+latency:
+  preset: ultra
+history:
+  enabled: false

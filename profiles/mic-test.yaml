@@ -1,0 +1,21 @@
+# Мгновенная проверка на микрофоне: говорите — видите распознанный текст.
+# Перевод отключён (не требует ни Ollama, ни API-ключей), модель tiny лёгкая.
+mode: subtitles
+source_lang: auto
+target_lang: ru
+capture:
+  backend: sounddevice
+  device: null            # устройство ввода по умолчанию = микрофон
+vad:
+  engine: silero
+stt:
+  engine: faster-whisper
+  model: tiny             # для точности замените на small или base
+  device: cpu
+  compute_type: int8
+translation:
+  engine: none            # только распознавание, без перевода
+latency:
+  preset: ultra
+history:
+  enabled: false

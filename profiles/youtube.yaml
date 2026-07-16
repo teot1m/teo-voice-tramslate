@@ -1,0 +1,24 @@
+# YouTube / Twitch / любой плеер: EN(auto) → RU, локальный Whisper + Ollama.
+# macOS: звук браузера → BlackHole (Multi-Output Device), capture.device: "BlackHole 2ch"
+# Windows: capture.backend: wasapi-loopback
+mode: voiceover
+source_lang: auto
+target_lang: ru
+capture:
+  backend: sounddevice
+  device: null            # uvt devices → подставьте BlackHole/кабель
+vad:
+  engine: silero
+stt:
+  engine: faster-whisper
+  model: small            # RTX 3060+: distil-large-v3 или large-v3
+  device: auto
+translation:
+  engine: openai-compatible
+  base_url: http://localhost:11434/v1
+  model: qwen2.5:7b-instruct
+tts:
+  engine: edge
+  voice: ru-RU-DmitryNeural
+latency:
+  preset: balanced

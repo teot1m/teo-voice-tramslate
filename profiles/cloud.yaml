@@ -1,0 +1,39 @@
+# Облачный вариант: перевод через OpenAI API (нужен OPENAI_API_KEY в окружении).
+# STT остаётся локальным; хотите облачный — раскомментируйте блок ниже.
+mode: voiceover
+source_lang: auto
+target_lang: ru
+vad:
+  engine: silero
+stt:
+  engine: faster-whisper
+  model: small            # самый быстрый локальный вариант (CPU, ~6.7x реального времени)
+# ЛУЧШЕЕ (точность large + секунды на весь ролик, бесплатно):
+#   бесплатный ключ на console.groq.com → export GROQ_API_KEY=...
+# stt:
+#   engine: openai-compatible
+#   base_url: https://api.groq.com/openai/v1
+#   api_key_env: GROQ_API_KEY
+#   model: whisper-large-v3-turbo
+# Локально с точностью large, без сети (GPU Apple Silicon, ~3x реального времени):
+# stt:
+#   engine: mlx-whisper     # pip install -e ".[mlx]"
+#   model: large-v3-turbo
+# stt:
+#   engine: openai-compatible
+#   base_url: https://api.groq.com/openai/v1   # Groq Whisper, ключ в GROQ_API_KEY
+#   api_key_env: GROQ_API_KEY
+#   model: whisper-large-v3
+translation:
+  engine: openai-compatible
+  base_url: https://api.openai.com/v1
+  model: gpt-4o-mini
+  api_key_env: OPENAI_API_KEY
+tts:
+  engine: openai         # естественные голоса OpenAI через ваш же ключ (~$15 за 1 млн симв.)
+  model: tts-1           # tts-1-hd — ещё чище звук, вдвое дороже
+  voice: auto            # auto → мужской onyx / женский nova (по детекции голоса)
+# tts:
+#   engine: edge         # бесплатная альтернатива (Microsoft), менее живая
+latency:
+  preset: balanced
