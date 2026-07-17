@@ -106,6 +106,33 @@ async def test_dub_job_from_file(tmp_path):
         await client.close()
 
 
+async def test_optional_api_token_protects_jobs_and_audio(monkeypatch, tmp_path):
+    """Remote personal deployments can opt into a token without changing localhost DX."""
+    monkeypatch.setenv("UVT_API_TOKEN", "personal-secret")
+    from uvt.server import DubServer
+
+    server = DubServer(_cfg())
+    server.audio_dir = tmp_path
+    (tmp_path / "ready.m4a").write_bytes(b"not-a-real-m4a")
+    server._audio_access_tokens["ready"] = "audio-secret"
+    client = TestClient(TestServer(server.app()))
+    await client.start_server()
+    try:
+        denied = await client.get("/meta")
+        assert denied.status == 401
+        assert denied.headers["Access-Control-Allow-Origin"] == "*"
+
+        allowed = await client.get("/meta", headers={"X-UVT-Token": "personal-secret"})
+        assert allowed.status == 200
+
+        no_audio_token = await client.get("/audio/ready.m4a")
+        assert no_audio_token.status == 401
+        audio = await client.get("/audio/ready.m4a?access=audio-secret")
+        assert audio.status == 200
+    finally:
+        await client.close()
+
+
 async def test_restricted_or_html_media_url_gets_actionable_error(monkeypatch, tmp_path):
     """Do not hide a browser denial page behind an opaque ffmpeg exit code."""
     import uvt.server as server_module

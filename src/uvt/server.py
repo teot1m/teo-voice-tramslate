@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import logging
 import os
 import re
@@ -412,6 +413,10 @@ class Job:
 class DubServer:
     def __init__(self, cfg: AppConfig) -> None:
         self.cfg = cfg
+        # Пустое значение сохраняет localhost DX без обязательной настройки.
+        # На удалённом личном сервере задайте UVT_API_TOKEN: тогда API нельзя
+        # вызвать с чужой страницы без токена из userscript.
+        self.api_token = os.environ.get("UVT_API_TOKEN", "").strip()
         self.jobs: dict[str, Job] = {}
         self.audio_dir = _cache_dir()
         self._lock = asyncio.Lock()
@@ -432,6 +437,10 @@ class DubServer:
         self._download_last_log_at: dict[str, float] = {}
         # Открытые запросы апрува на переход к локальному резерву, по job id.
         self._approval_gates: dict[str, ApprovalGate] = {}
+        # Аудио запрашивается тегом <audio>, куда нельзя положить заголовок.
+        # Поэтому готовая дорожка получает отдельный непредсказуемый токен;
+        # основной API-токен в URL дорожки не попадает.
+        self._audio_access_tokens: dict[str, str] = {}
         self._cleanup_audio_cache()
 
     def _cleanup_audio_cache(self, max_age_days: float = 7.0) -> None:
@@ -442,6 +451,7 @@ class DubServer:
             try:
                 if file.stat().st_mtime < cutoff:
                     file.unlink()
+                    self._audio_access_tokens.pop(file.stem, None)
                     removed += 1
             except OSError:
                 continue
@@ -460,6 +470,13 @@ class DubServer:
             str(data.get("target_lang") or self.cfg.target_lang),
             str(voice_gender),
         )
+
+    def _request_has_api_token(self, request) -> bool:
+        """Проверяет opt-in токен без утечки его значения в логах."""
+        if not self.api_token:
+            return True
+        supplied = request.headers.get("X-UVT-Token", "")
+        return bool(supplied) and hmac.compare_digest(supplied, self.api_token)
 
     # --- видимый контракт batch-задачи ---
 
@@ -897,7 +914,12 @@ class DubServer:
                     )
 
                 job.entries = [asdict(e) for e in entries]
-                job.audio_url = f"/audio/{job.id}.m4a"
+                if self.api_token:
+                    audio_token = uuid.uuid4().hex
+                    self._audio_access_tokens[job.id] = audio_token
+                    job.audio_url = f"/audio/{job.id}.m4a?access={audio_token}"
+                else:
+                    job.audio_url = f"/audio/{job.id}.m4a"
                 job.progress = 1.0
                 job.status = "done"
                 job.finished_at = time.time()
@@ -946,15 +968,25 @@ class DubServer:
                     response = exc
             response.headers["Access-Control-Allow-Origin"] = "*"
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-UVT-Token"
             if isinstance(response, web.HTTPException):
                 raise response
             return response
 
+        @web.middleware
+        async def auth(request, handler):
+            # Дорожка проверяет короткоживущий URL-токен в _get_audio: HTMLAudio
+            # не позволяет передать X-UVT-Token. OPTIONS остаётся доступным для
+            # корректного preflight userscript.
+            if request.method != "OPTIONS" and not request.path.startswith("/audio/"):
+                if not self._request_has_api_token(request):
+                    raise web.HTTPUnauthorized(text="нужен заголовок X-UVT-Token")
+            return await handler(request)
+
         async def options(_request):
             return web.Response()
 
-        app = web.Application(middlewares=[cors])
+        app = web.Application(middlewares=[cors, auth])
         app.router.add_route("OPTIONS", "/{tail:.*}", options)
         app.router.add_get("/", self._index)
         app.router.add_get("/meta", self._get_meta)
@@ -1063,6 +1095,12 @@ class DubServer:
         from aiohttp import web
 
         name = Path(request.match_info["name"]).name  # без обхода каталогов
+        if self.api_token:
+            job_id = Path(name).stem
+            expected = self._audio_access_tokens.get(job_id, "")
+            supplied = request.query.get("access", "")
+            if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+                raise web.HTTPUnauthorized(text="нужен корректный токен дорожки")
         path = self.audio_dir / name
         if not path.is_file():
             raise web.HTTPNotFound(text="дорожка не найдена")

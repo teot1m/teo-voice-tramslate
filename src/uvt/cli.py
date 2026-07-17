@@ -41,6 +41,7 @@ _LEGACY_LIVE_MODES = {"replace", "dual"}
 _PROFILE_OVERVIEW = (
     ("local", "private local: Whisper + Ollama + Piper; модели и Piper нужно настроить"),
     ("free", "без платных API: локальные STT/перевод + Microsoft Edge TTS через сеть"),
+    ("free-vps", "Linux VPS: CPU Whisper + Ollama Qwen 3B последовательно + Edge TTS"),
     ("free-quality", "Apple Silicon: MLX Whisper large + Qwen 3B последовательно + Edge TTS"),
     ("cloud-fast", "облачные STT/перевод/TTS с упором на минимальную задержку"),
     ("cloud-quality", "облачный пакетный дубляж с упором на качество"),

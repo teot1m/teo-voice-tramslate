@@ -1,0 +1,34 @@
+# Бесплатный маршрут для Linux VPS. Это не free-quality: MLX Whisper работает
+# только на Apple Silicon, поэтому на сервере используем faster-whisper CPU.
+# Профиль рассчитан на один последовательный batch-job, а не на live-перевод.
+mode: voiceover
+source_lang: auto
+target_lang: ru
+
+vad:
+  engine: silero
+
+stt:
+  engine: faster-whisper
+  model: small
+  device: cpu
+  compute_type: int8
+
+translation:
+  engine: openai-compatible
+  base_url: http://127.0.0.1:11434/v1
+  model: qwen2.5:3b
+  temperature: 0.15
+  batch_size: 4
+  concurrency: 1
+
+tts:
+  engine: edge
+  voice: auto
+  rate: "+0%"
+
+latency:
+  preset: balanced
+
+history:
+  enabled: true

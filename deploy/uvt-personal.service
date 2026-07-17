@@ -1,0 +1,21 @@
+[Unit]
+Description=UVT personal Free and GPT Cloud batch servers
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=uvt
+Group=uvt
+WorkingDirectory=/opt/uvt
+Environment=UVT_HOST=127.0.0.1
+Environment=UVT_FREE_PORT=8765
+Environment=UVT_CLOUD_PORT=8766
+ExecStart=/bin/bash /opt/uvt/scripts/serve-personal.sh
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

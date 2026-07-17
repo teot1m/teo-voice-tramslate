@@ -76,6 +76,7 @@ uvt serve -p free --port 8080              # сервер для браузер�
 | --- | --- | --- | --- |
 | [`local`](profiles/local.yaml) | STT + Ollama + Piper локально | Чувствительный контент и offline после подготовки | Локальные модели, Ollama, `piper` и путь `tts.model_path` к голосу |
 | [`free`](profiles/free.yaml) | Whisper + Ollama локально, **Microsoft Edge TTS через сеть** | Ноль платных API и быстрый старт | Локальные модели/Ollama; ключ не нужен |
+| [`free-vps`](profiles/free-vps.yaml) | CPU Whisper + Ollama локально, **Microsoft Edge TTS через сеть** | Личный Linux VPS с одной batch-задачей | 2+ vCPU, 8+ GB RAM, Ollama Qwen 3B |
 | [`free-quality`](profiles/free-quality.yaml) | MLX Whisper large + Ollama Qwen 3B локально, **Edge TTS через сеть** | Apple Silicon: выше качество STT/структуры речи | `.[mlx]`, заранее загруженные модели; медленнее `free` |
 | [`cloud-fast`](profiles/cloud-fast.yaml) | Аудио/STT, текст/перевод и TTS в OpenAI | Live с меньшей ожидаемой задержкой | `OPENAI_API_KEY` |
 | [`cloud-quality`](profiles/cloud-quality.yaml) | Облачные STT, перевод и TTS с более качественными моделями | В первую очередь batch-дубляж | `OPENAI_API_KEY` |
@@ -181,6 +182,21 @@ uvt gui -p cloud-fast   # облачный маршрут с упором на �
 - Передавайте в cloud-профили только контент, на который у вас есть право и согласие для обработки выбранным провайдером.
 - `uvt serve` слушает localhost, но localhost не делает сетевые движки локальными.
 - Переводите только контент, к которому у вас есть законный доступ, и соблюдайте условия сайтов/API.
+
+### Личный сервер: Free и GPT Cloud одновременно
+
+Для Linux VPS есть профиль [`free-vps`](profiles/free-vps.yaml): он заменяет
+Apple-only MLX Whisper на CPU `faster-whisper` и использует `qwen2.5:3b` через
+Ollama. Два независимых batch-сервера запускаются одной командой:
+
+```bash
+ollama pull qwen2.5:3b
+bash scripts/serve-personal.sh
+```
+
+По умолчанию `free-vps` работает на `127.0.0.1:8765`, `cloud-fast` — на
+`127.0.0.1:8766`. В userscript выберите маршрут в поле «Модель» перед
+запуском. Для VPS, HTTPS и токена доступа следуйте [инструкции](docs/PERSONAL_DEPLOY.md).
 
 ## Лицензия
 

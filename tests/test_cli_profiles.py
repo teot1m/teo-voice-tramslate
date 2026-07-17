@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
     [
         ("local", "piper"),
         ("free", "edge"),
+        ("free-vps", "edge"),
         ("free-quality", "edge"),
         ("cloud-fast", "openai"),
         ("cloud-quality", "openai"),
@@ -48,6 +49,14 @@ def test_local_profile_is_configured_for_real_local_tts():
 def test_free_profile_does_not_silently_claim_local_tts():
     cfg = load_config(str(ROOT / "profiles" / "free.yaml"))
     assert cfg.tts.engine == "edge"
+
+
+def test_free_vps_profile_is_explicitly_linux_cpu_safe():
+    cfg = load_config(str(ROOT / "profiles" / "free-vps.yaml"))
+    assert cfg.stt.engine == "faster-whisper"
+    assert cfg.stt.device == "cpu"
+    assert cfg.stt.compute_type == "int8"
+    assert cfg.translation.model == "qwen2.5:3b"
 
 
 def test_free_quality_is_an_opt_in_serial_local_llm_profile():

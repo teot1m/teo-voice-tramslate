@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         UVT — закадровый перевод видео
 // @namespace    uvt
-// @version      0.11.3
-// @description  Пакетный закадровый перевод видео через локальный сервер uvt serve: готовит синхронную дорожку, не live-перевод
+// @version      0.12.0
+// @description  Пакетный закадровый перевод видео через личные UVT-серверы: free или GPT Cloud, не live-перевод
 // @match        *://*/*
 // @grant        none
 // @run-at       document-idle
@@ -12,7 +12,22 @@
   "use strict";
 
   // --- настройки ---
-  const SERVER = "http://127.0.0.1:8765"; // адрес uvt serve
+  // Два независимых процесса `uvt serve`. Для удалённого личного VPS замените
+  // только URL: free и cloud должны указывать на разные reverse-proxy routes.
+  // Не вставляйте OPENAI_API_KEY в userscript: он остаётся только на сервере.
+  const SERVERS = Object.freeze({
+    free: {
+      url: "http://127.0.0.1:8765",
+      label: "Бесплатный — Whisper + Qwen",
+    },
+    cloud: {
+      url: "http://127.0.0.1:8766",
+      label: "GPT Cloud — OpenAI",
+    },
+  });
+  // Задайте тот же секрет, что и UVT_API_TOKEN на удалённом сервере. Для
+  // localhost оставьте пустую строку. Это личный доступ, не биллинг-аккаунт.
+  const UVT_API_TOKEN = "";
   const DEFAULT_DUCK = 0.15;   // громкость оригинала ВО ВРЕМЯ реплики (по умолчанию)
   const DEFAULT_VOICE_VOL = 1; // громкость переведённого голоса (по умолчанию)
   const DRIFT_S = 0.12;      // допустимый рассинхрон перевода с видео
@@ -36,6 +51,11 @@
   }
 
   const prefs = {
+    get route() {
+      const value = localStorage.getItem("uvt.route") || "free";
+      return Object.prototype.hasOwnProperty.call(SERVERS, value) ? value : "free";
+    },
+    set route(v) { localStorage.setItem("uvt.route", v); },
     get source() { return localStorage.getItem("uvt.source") || "auto"; },
     set source(v) { localStorage.setItem("uvt.source", v); },
     get target() { return localStorage.getItem("uvt.target") || "ru"; },
@@ -102,8 +122,19 @@
     if (label) btn.setAttribute("aria-label", label);
   }
 
-  async function api(path, options) {
-    const response = await fetch(SERVER + path, options);
+  function serverForRoute(route) {
+    return SERVERS[route] || SERVERS.free;
+  }
+
+  function urlFor(server, path) {
+    return new URL(path, server.url.endsWith("/") ? server.url : server.url + "/").toString();
+  }
+
+  async function api(path, options, server) {
+    const activeServer = server || serverForRoute(prefs.route);
+    const headers = new Headers((options && options.headers) || {});
+    if (UVT_API_TOKEN) headers.set("X-UVT-Token", UVT_API_TOKEN);
+    const response = await fetch(urlFor(activeServer, path), { ...options, headers });
     if (!response.ok) {
       const detail = await response.text().catch(() => "");
       throw new Error(
@@ -316,9 +347,9 @@
 
   // --- синхронное воспроизведение готовой дорожки ---
 
-  function attachAudio(video, audioUrl, entries) {
+  function attachAudio(video, audioUrl, entries, server) {
     const s = state.get(video);
-    const audio = new Audio(SERVER + audioUrl);
+    const audio = new Audio(urlFor(server, audioUrl));
     audio.preload = "auto";
     s.audio = audio;
     s.windows = buildWindows(entries);
@@ -327,7 +358,7 @@
       if (!s.on) return;
       detachAudio(video);
       setRetryButton(video);
-      showError(video, new Error("готовая аудиодорожка не загрузилась с локального сервера"));
+      showError(video, new Error("готовая аудиодорожка не загрузилась с выбранного UVT-сервера"));
     };
     audio.addEventListener("error", s.audioErrorHandler, { once: true });
 
@@ -495,6 +526,10 @@
     s.busy = true;
     s.cancelled = false;
     s.jobId = null;
+    // Выбранный маршрут фиксируется на весь job: смена настройки во время
+    // ожидания не отправит polling/cancel к другому процессу.
+    s.server = serverForRoute(prefs.route);
+    s.routeSelect.disabled = true;
     s.cancelButton.hidden = false;
     s.cancelButton.disabled = false;
     renderJobStatus(video, { status: "queued", stage: "queue", progress: 0 });
@@ -502,6 +537,7 @@
       const current = state.get(video);
       if (!current) return;
       current.busy = false;
+      current.routeSelect.disabled = false;
       current.cancelButton.hidden = true;
       current.cancelButton.disabled = false;
       if (!current.on && !current.errorPanel) setIdleButton(video);
@@ -526,9 +562,9 @@
           target_lang: prefs.target,
           voice_gender: prefs.voice,
         }),
-      });
+      }, s.server);
       if (s.cancelled) {
-        if (job.id) await api("/job/" + job.id + "/cancel", { method: "POST" }).catch(() => {});
+        if (job.id) await api("/job/" + job.id + "/cancel", { method: "POST" }, s.server).catch(() => {});
         return;
       }
       if (!job.id) throw new Error("сервер UVT не вернул идентификатор задачи");
@@ -540,10 +576,10 @@
       for (;;) {
         await new Promise((resolve) => setTimeout(resolve, 1250));
         if (s.cancelled) return;
-        const info = await api("/job/" + job.id);
+        const info = await api("/job/" + job.id, undefined, s.server);
         if (info.status === "done") {
           if (!info.audio_url) throw new Error("сервер отметил задачу готовой, но не отдал аудиодорожку");
-          attachAudio(video, info.audio_url, info.entries);
+          attachAudio(video, info.audio_url, info.entries, s.server);
           setEnabledButton(video);
           return;
         }
@@ -568,7 +604,7 @@
     s.cancelButton.disabled = true;
     if (s.jobId) {
       try {
-        await api("/job/" + s.jobId + "/cancel", { method: "POST" });
+        await api("/job/" + s.jobId + "/cancel", { method: "POST" }, s.server);
       } catch (_) { /* сервер мог уже завершить задачу */ }
     }
   }
@@ -577,6 +613,30 @@
 
   function chipLabel() {
     return prefs.source + " → " + prefs.target;
+  }
+
+  function makeRouteSelect(onChange, id) {
+    const select = document.createElement("select");
+    if (id) select.id = id;
+    Object.assign(select.style, CHIP_STYLE, {
+      padding: "4px 7px",
+      maxWidth: "150px",
+      textOverflow: "ellipsis",
+      appearance: "auto",
+    });
+    for (const [value, server] of Object.entries(SERVERS)) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = value === "cloud" ? "GPT Cloud" : "Free";
+      option.title = server.label;
+      if (value === prefs.route) option.selected = true;
+      select.appendChild(option);
+    }
+    select.title = "Выберите тип перевода перед запуском";
+    select.setAttribute("aria-label", "Модель перевода");
+    select.addEventListener("change", () => onChange(select.value));
+    select.addEventListener("click", (event) => event.stopPropagation());
+    return select;
   }
 
   function makeSelect(current, withAuto, onChange, id) {
@@ -734,7 +794,7 @@
     }, volumeId));
 
     const hint = document.createElement("div");
-    hint.textContent = "Язык и голос применятся к следующему batch-запуску. «Авто» — эвристика тона, не определение личности или спикера.";
+    hint.textContent = "Язык и голос применятся к следующему batch-запуску. Модель выбирается отдельной кнопкой рядом с «UVT · перевести». «Авто» — эвристика тона, не определение личности или спикера.";
     hint.style.gridColumn = "1 / -1";
     hint.style.color = "#aeb6c2";
     panel.appendChild(hint);
@@ -801,6 +861,9 @@
     chip.setAttribute("aria-expanded", "false");
     chip.setAttribute("aria-label", `Настройки пакетного перевода: ${chipLabel()}`);
 
+    const routeId = nextControlId("route");
+    const routeSelect = makeRouteSelect((value) => { prefs.route = value; }, routeId);
+
     const cancelBtn = document.createElement("button");
     cancelBtn.type = "button";
     cancelBtn.textContent = "✕";
@@ -835,18 +898,21 @@
     });
 
     wrapper.appendChild(btn);
+    wrapper.appendChild(routeSelect);
     wrapper.appendChild(chip);
     wrapper.appendChild(cancelBtn);
     parent.appendChild(wrapper);
     state.set(video, {
       wrapper,
       button: btn,
+      routeSelect,
       chip,
       cancelButton: cancelBtn,
       on: false,
       busy: false,
       cancelled: false,
       jobId: null,
+      server: null,
       errorPanel: null,
     });
     setIdleButton(video);
