@@ -99,6 +99,24 @@ class Segmenter:
         self._active = False
         return self._finalize()
 
+    @property
+    def clock_retention_start(self) -> int:
+        """Первый sample, timestamp которого ещё может понадобиться.
+
+        Live-адаптер хранит соответствие sample-offset → часы захвата. При
+        тишине ``_pre`` — единственный старый звук, который ещё может попасть
+        в следующую реплику; при активной речи таким хвостом становится
+        ``_frames``. Всё раньше можно безопасно выбросить из этого адаптера,
+        не удерживая timestamp каждой секунды долгой паузы.
+        """
+        if self._active and self._frames:
+            return self._frames[0][0]
+        if self._pre:
+            return self._pre[0][0]
+        # Неполный ``_buf`` начинается в _pos. Сам span, содержащий _pos,
+        # остаётся в AudioClock, поэтому его timestamp не теряется.
+        return self._pos
+
     def _step(self, frame: np.ndarray) -> SpeechSegment | None:
         start = self._pos
         self._pos += FRAME

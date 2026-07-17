@@ -1,4 +1,4 @@
-"""CLI: uvt run | dub | serve | devices | gui | version."""
+"""CLI: uvt run | dub | serve | devices | profiles | gui | version."""
 from __future__ import annotations
 
 import argparse
@@ -37,6 +37,16 @@ def _load_env_file(path: str = ".env") -> None:
 
 
 _VIRTUAL_MARKERS = ("blackhole", "vb-audio", "cable", "monitor", "loopback", "virtual", "voicemeeter")
+_LEGACY_LIVE_MODES = {"replace", "dual"}
+_PROFILE_OVERVIEW = (
+    ("local", "private local: Whisper + Ollama + Piper; модели и Piper нужно настроить"),
+    ("free", "без платных API: локальные STT/перевод + Microsoft Edge TTS через сеть"),
+    ("free-quality", "Apple Silicon: MLX Whisper large + Qwen 3B последовательно + Edge TTS"),
+    ("cloud-fast", "облачные STT/перевод/TTS с упором на минимальную задержку"),
+    ("cloud-quality", "облачный пакетный дубляж с упором на качество"),
+    ("live", "системный звук через виртуальный вход + бесплатный Edge TTS через сеть"),
+    ("cloud", "устаревшее совместимое имя cloud-fast"),
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -50,7 +60,12 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--profile", "-p", help="имя профиля из profiles/ или путь к YAML")
     run.add_argument("--source-lang", help="язык оригинала (по умолчанию auto)")
     run.add_argument("--target-lang", help="язык перевода (по умолчанию ru)")
-    run.add_argument("--mode", choices=["subtitles", "voiceover", "replace", "dual"], help="режим (ТЗ §9)")
+    run.add_argument(
+        "--mode",
+        choices=["subtitles", "voiceover", "replace", "dual"],
+        metavar="{subtitles,voiceover}",
+        help="Live-вывод: subtitles или voiceover; replace/dual принимаются только как legacy-алиасы voiceover",
+    )
     run.add_argument("--debug", action="store_true", help="подробные логи и тайминги стадий")
 
     dub = sub.add_parser(
@@ -84,9 +99,10 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--debug", action="store_true")
 
     sub.add_parser("devices", help="список аудиоустройств (вход/выход, виртуальные помечены)")
+    sub.add_parser("profiles", help="показать готовые профили и их маршрут данных")
 
-    gui = sub.add_parser("gui", help="графический интерфейс (экспериментальный)")
-    gui.add_argument("--profile", "-p")
+    gui = sub.add_parser("gui", help="графический интерфейс: отдельные Live и Batch сценарии")
+    gui.add_argument("--profile", "-p", help="профиль при старте; в GUI можно переключить маршрут")
     gui.add_argument("--debug", action="store_true")
 
     sub.add_parser("version", help="показать версию")
@@ -94,10 +110,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _overrides(args: argparse.Namespace) -> dict:
+    mode = getattr(args, "mode", None)
+    # Старые скрипты не ломаем, но больше не создаём иллюзию, что оригинальная
+    # речь реально будет удалена/разнесена по каналам.
+    if mode in _LEGACY_LIVE_MODES:
+        mode = "voiceover"
     pairs = {
         "source_lang": getattr(args, "source_lang", None),
         "target_lang": getattr(args, "target_lang", None),
-        "mode": getattr(args, "mode", None),
+        "mode": mode,
     }
     return {k: v for k, v in pairs.items() if v}
 
@@ -123,6 +144,18 @@ def _print_devices() -> int:
     return 0
 
 
+def _print_profiles() -> int:
+    print("Готовые профили UVT:\n")
+    for name, description in _PROFILE_OVERVIEW:
+        print(f"  {name:14} {description}")
+    print(
+        "\n`local` не ходит в сеть во время работы после установки моделей. "
+        "`free` бесплатен по цене, но Edge TTS отправляет текст в Microsoft.\n"
+        "Выберите: uvt run -p <имя>, uvt dub <файл> -p <имя> или uvt gui -p <имя>."
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _strip_malloc_env()
     _load_env_file()
@@ -140,6 +173,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "devices":
         return _print_devices()
+    if args.command == "profiles":
+        return _print_profiles()
+
+    if getattr(args, "mode", None) in _LEGACY_LIVE_MODES:
+        print(
+            f"Предупреждение: --mode {args.mode} устарел и работает как voiceover; "
+            "реальной замены/разделения оригинала в Live пока нет.",
+            file=sys.stderr,
+        )
 
     cfg = load_config(getattr(args, "profile", None), overrides=_overrides(args))
 
@@ -196,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
         except ImportError:
             print('GUI требует PySide6 — установите: pip install "uvt[gui]"', file=sys.stderr)
             return 1
-        return run_gui(cfg)
+        return run_gui(cfg, profile_name=getattr(args, "profile", None))
 
     parser.print_help()
     return 1

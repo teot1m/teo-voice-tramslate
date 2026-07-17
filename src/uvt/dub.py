@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -35,6 +36,7 @@ import numpy as np
 from uvt import registry
 from uvt.audio import resample
 from uvt.config import PRESETS, AppConfig
+from uvt.fallback import ApprovalGate, create_stt_engine, create_translation_engine
 from uvt.gender import estimate_gender_f0
 from uvt.history import EXPORTERS, HistoryEntry
 from uvt.interfaces import STTSpan
@@ -53,6 +55,16 @@ TTS_CONCURRENCY = 4
 
 ProgressFn = Callable[[int, int], None]
 _StageCb = Callable[[float], None]
+
+
+@dataclass(slots=True)
+class _SynthClip:
+    """Озвученная реплика до размещения на итоговой временной шкале."""
+
+    index: int
+    source_start: float
+    samples: np.ndarray
+    sample_rate: int
 
 
 def _ffmpeg(args: list[str]) -> None:
@@ -148,8 +160,9 @@ async def _transcribe_all(
     mono16: np.ndarray,
     source_lang: str | None,
     progress: _StageCb | None,
+    approval: ApprovalGate | None = None,
 ) -> list[STTSpan]:
-    stt = registry.create("stt", cfg.stt.engine, cfg.stt)
+    stt = create_stt_engine(cfg, approval=approval)
     await stt.warmup()
     try:
         def stt_progress(done_s: float, total_s: float) -> None:
@@ -215,19 +228,24 @@ async def _translate_all(
     source_lang: str | None,
     genders: list[str] | None,
     progress: _StageCb | None,
+    approval: ApprovalGate | None = None,
 ) -> list[str | None]:
     """Возвращает переводы по репликам; None — перевод не удался совсем."""
     if cfg.translation.engine in ("none", "passthrough"):
         return [span.text for span in spans]
 
-    translator = registry.create("translation", cfg.translation.engine, cfg.translation)
+    translator = create_translation_engine(cfg, approval=approval)
     await translator.warmup()
     try:
         detected = Counter(span.language or "und" for span in spans).most_common(1)[0][0]
         lang = source_lang or (None if detected == "und" else detected)
         translated: list[str | None] = [None] * len(spans)
         completed = 0
-        limit = asyncio.Semaphore(3)  # пачки переводятся параллельно
+        # Cloud выдерживает несколько пачек, но локальная LLM сообщает hint=1:
+        # на малой unified-memory машине параллельные контексты ухудшают
+        # стабильность и не ускоряют Ollama, который обычно всё равно очередит.
+        parallelism = max(1, int(getattr(translator, "concurrency_hint", 3)))
+        limit = asyncio.Semaphore(parallelism)
 
         async def run_batch(batch: list[int]) -> None:
             nonlocal completed
@@ -247,9 +265,10 @@ async def _translate_all(
                 )
                 for idx in batch:
                     try:
-                        translated[idx] = await translator.translate(
-                            spans[idx].text, lang or "und", cfg.target_lang, []
-                        )
+                        async with limit:
+                            translated[idx] = await translator.translate(
+                                spans[idx].text, lang or "und", cfg.target_lang, []
+                            )
                     except Exception as exc2:  # noqa: BLE001
                         log.error(
                             "реплика @%.1f с осталась без перевода (%s: %s)",
@@ -288,11 +307,10 @@ async def _translate_all(
         retry = [i for i in range(len(spans)) if needs_retry(i)]
         if retry:
             log.info("доперевожу %d реплик, оставшихся без перевода", len(retry))
-            retry_limit = asyncio.Semaphore(4)
 
             async def retry_one(index: int) -> None:
                 try:
-                    async with retry_limit:
+                    async with limit:
                         translated[index] = await translator.translate(
                             spans[index].text, lang or "und", cfg.target_lang, []
                         )
@@ -318,7 +336,7 @@ async def _synthesize_all(
     texts: list[str],
     genders: list[str],
     progress: _StageCb | None,
-) -> list[tuple[float, np.ndarray, int]]:
+) -> list[_SynthClip]:
     # Отдельный движок на каждый нужный пол голоса (мужской/женский диалог)
     engines: dict[str, object] = {}
     for gender in dict.fromkeys(genders):
@@ -331,7 +349,7 @@ async def _synthesize_all(
     limit = asyncio.Semaphore(int(getattr(cfg.tts, "concurrency", TTS_CONCURRENCY)))
     finished = 0
 
-    async def synth(span: STTSpan, text: str, gender: str, speed: float = 1.0):
+    async def synth(index: int, span: STTSpan, text: str, gender: str, speed: float = 1.0):
         nonlocal finished
         engine = engines[gender]
         try:
@@ -355,12 +373,12 @@ async def _synthesize_all(
             finished += 1
             if progress is not None:
                 progress(finished / max(len(spans) * 1.2, 1))
-        return (span.start, speech, rate) if len(speech) else None
+        return _SynthClip(index, span.start, speech, rate) if len(speech) else None
 
     try:
         tasks = [
-            asyncio.create_task(synth(s, t, g))
-            for s, t, g in zip(spans, texts, genders)
+            asyncio.create_task(synth(i, s, t, g))
+            for i, (s, t, g) in enumerate(zip(spans, texts, genders))
         ]
         try:
             clips = list(await asyncio.gather(*tasks))
@@ -375,14 +393,14 @@ async def _synthesize_all(
         for i, clip in enumerate(clips):
             if clip is None or i + 1 >= len(spans):
                 continue
-            duration = len(clip[1]) / clip[2]
+            duration = len(clip.samples) / clip.sample_rate
             slot = spans[i + 1].start - spans[i].start - SLOT_MARGIN_S
             if slot > 0.5 and duration > slot + 0.3:
                 refit.append((i, min(MAX_SPEEDUP, duration / slot)))
         if refit:
             log.info("ускоряю %d реплик, чтобы уложиться в тайминги оригинала", len(refit))
             refit_tasks = [
-                asyncio.create_task(synth(spans[i], texts[i], genders[i], speed))
+                asyncio.create_task(synth(i, spans[i], texts[i], genders[i], speed))
                 for i, speed in refit
             ]
             refit_clips = await asyncio.gather(*refit_tasks)
@@ -402,6 +420,7 @@ async def render_dub_track(
     duck_db: float = -12.0,
     progress: ProgressFn | None = None,
     mix_original: bool = True,
+    approval: ApprovalGate | None = None,
 ) -> tuple[np.ndarray, list[HistoryEntry]]:
     """Готовит дублированную дорожку.
 
@@ -434,7 +453,7 @@ async def render_dub_track(
     translating = cfg.translation.engine not in ("none", "passthrough")
 
     # 1. Реплики с таймкодами
-    spans = await _transcribe_all(cfg, mono16, source_lang, stage(0, 70))
+    spans = await _transcribe_all(cfg, mono16, source_lang, stage(0, 70), approval=approval)
     spans = [
         STTSpan(s.start, s.end, " ".join(s.text.split()), s.language)
         for s in spans
@@ -482,7 +501,9 @@ async def render_dub_track(
         genders_all = [configured_gender] * len(spans)
 
     # 2. Перевод пачками (с полом говорящего)
-    translated = await _translate_all(cfg, spans, source_lang, genders_all, stage(70, 15))
+    translated = await _translate_all(
+        cfg, spans, source_lang, genders_all, stage(70, 15), approval=approval
+    )
     kept_spans: list[STTSpan] = []
     kept_texts: list[str] = []
     kept_genders: list[str] = []
@@ -507,14 +528,6 @@ async def render_dub_track(
     clips = await _synthesize_all(cfg, kept_spans, kept_texts, kept_genders, stage(85, 12))
     if not clips:
         raise RuntimeError("озвучка не удалась ни для одной реплики")
-    entries = [
-        HistoryEntry(
-            start=span.start, end=span.end,
-            original=span.text, translated=text,
-            language=span.language or "und", target_lang=cfg.target_lang,
-        )
-        for span, text in zip(kept_spans, kept_texts)
-    ]
 
     # 4. Сборка дорожки
     log.info("собираю дорожку (%d реплик, режим %s)…", len(clips), "микс" if mix_original else "только голос")
@@ -525,12 +538,17 @@ async def render_dub_track(
     tts_track = np.zeros(total, dtype=np.float32)
     envelope = np.ones(total, dtype=np.float32)
     cursor = 0
+    # Индекс реплики → её реальные границы в готовой дорожке. Раньше браузер
+    # угадывал длительность из числа символов, из-за чего ducking расходился
+    # с произнесённой фразой.
+    tts_bounds: dict[int, tuple[float, float]] = {}
 
     def _rms(x: np.ndarray) -> float:
         return float(np.sqrt(np.mean(np.square(x, dtype=np.float64)))) if len(x) else 0.0
 
-    for start_ts, speech, rate in clips:
-        clip = resample(speech, rate, MIX_RATE)
+    for item in clips:
+        start_ts = item.source_start
+        clip = resample(item.samples, item.sample_rate, MIX_RATE)
         # Выравнивание громкости: перевод не должен звучать тише оригинала.
         # Целевой уровень — RMS оригинальной речи в этом месте, +20 % сверху.
         orig_from = int(start_ts * PIPE_RATE)
@@ -560,6 +578,7 @@ async def render_dub_track(
             fade = np.linspace(duck_gain, 1.0, ramp_to - end, dtype=np.float32)
             envelope[end:ramp_to] = np.minimum(envelope[end:ramp_to], fade)
         cursor = end
+        tts_bounds[item.index] = (start / MIX_RATE, end / MIX_RATE)
 
     if native is not None:
         mixed = native * envelope[:, None]
@@ -569,6 +588,22 @@ async def render_dub_track(
         track = mixed
     else:
         track = np.clip(tts_track, -1.0, 1.0)
+
+    entries = [
+        HistoryEntry(
+            start=span.start,
+            end=span.end,
+            original=span.text,
+            translated=text,
+            language=span.language or "und",
+            target_lang=cfg.target_lang,
+            tts_start=tts_bounds.get(i, (None, None))[0],
+            tts_end=tts_bounds.get(i, (None, None))[1],
+            # F0 — это выбор тембра TTS, не идентификация человека.
+            voice_style=gender,
+        )
+        for i, (span, text, gender) in enumerate(zip(kept_spans, kept_texts, kept_genders))
+    ]
 
     if progress is not None:
         progress(100, 100)

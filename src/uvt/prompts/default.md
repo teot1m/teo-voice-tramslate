@@ -9,6 +9,9 @@ Rules:
 - Do not shorten, summarize or omit anything; do not add commentary.
 - Keep numbers, units and technical terms accurate.
 - The text comes from speech recognition and may contain small errors — translate the intended meaning.
+- Restore only confidently implied sentence boundaries and natural punctuation so the
+  result can be voiced with pauses and intonation; preserve questions, exclamations
+  and dialogue turns. Do not add SSML, markup or speaker labels.
 - Output ONLY the translation: no quotes, no notes, no explanations.
 
 Glossary and extra instructions:

@@ -1,39 +1,52 @@
-# Облачный вариант: перевод через OpenAI API (нужен OPENAI_API_KEY в окружении).
-# STT остаётся локальным; хотите облачный — раскомментируйте блок ниже.
+# Совместимый профиль для старой команды `-p cloud`.
+# Новые команды: `-p cloud-fast` (меньше задержка) и `-p cloud-quality`
+# (пакетный дубляж с упором на качество). Этот профиль эквивалентен cloud-fast.
+# Аудио, текст и синтез отправляются в OpenAI; нужен OPENAI_API_KEY.
 mode: voiceover
 source_lang: auto
 target_lang: ru
 vad:
   engine: silero
 stt:
-  engine: faster-whisper
-  model: small            # самый быстрый локальный вариант (CPU, ~6.7x реального времени)
-# ЛУЧШЕЕ (точность large + секунды на весь ролик, бесплатно):
-#   бесплатный ключ на console.groq.com → export GROQ_API_KEY=...
-# stt:
-#   engine: openai-compatible
-#   base_url: https://api.groq.com/openai/v1
-#   api_key_env: GROQ_API_KEY
-#   model: whisper-large-v3-turbo
-# Локально с точностью large, без сети (GPU Apple Silicon, ~3x реального времени):
-# stt:
-#   engine: mlx-whisper     # pip install -e ".[mlx]"
-#   model: large-v3-turbo
-# stt:
-#   engine: openai-compatible
-#   base_url: https://api.groq.com/openai/v1   # Groq Whisper, ключ в GROQ_API_KEY
-#   api_key_env: GROQ_API_KEY
-#   model: whisper-large-v3
+  engine: openai-compatible
+  base_url: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  model: gpt-4o-mini-transcribe
+  # При HTTP/timeout/отказе облака не скачиваем ролик заново: продолжаем уже
+  # декодированный звук локальным Whisper.
+  fallback:
+    engine: faster-whisper
+    model: small
+    device: auto
+    compute_type: auto
 translation:
   engine: openai-compatible
   base_url: https://api.openai.com/v1
   model: gpt-4o-mini
   api_key_env: OPENAI_API_KEY
+  temperature: 0.2
+  # Локальный резерв. Подготовка один раз: `ollama pull qwen2.5:3b`.
+  # OPENAI_API_KEY намеренно не наследуется локальному endpoint.
+  fallback:
+    engine: openai-compatible
+    base_url: http://127.0.0.1:11434/v1
+    api_key_env: UVT_OLLAMA_API_KEY
+    model: qwen2.5:3b
+    temperature: 0.2
+    timeout_s: 90
 tts:
-  engine: openai         # естественные голоса OpenAI через ваш же ключ (~$15 за 1 млн симв.)
-  model: tts-1           # tts-1-hd — ещё чище звук, вдвое дороже
-  voice: auto            # auto → мужской onyx / женский nova (по детекции голоса)
-# tts:
-#   engine: edge         # бесплатная альтернатива (Microsoft), менее живая
+  engine: openai
+  base_url: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  model: tts-1
+  voice: auto            # тембр-эвристика, не точное определение спикера
+output:
+  # Совместимый alias cloud-fast: окно live-озвучки 2–4 с, старые реплики
+  # отбрасываются вместо накапливания за свежей речью.
+  target_delay_s: 2.0
+  max_backlog_s: 2.0
+  latest_wins: true
 latency:
-  preset: balanced
+  preset: ultra
+history:
+  enabled: false

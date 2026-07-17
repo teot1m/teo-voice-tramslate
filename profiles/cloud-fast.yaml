@@ -1,0 +1,55 @@
+# Cloud Fast: минимальная задержка при готовом API-ключе OpenAI.
+# Аудио отправляется в STT, текст — в переводчик, текст перевода — в TTS.
+# Это не private-профиль. Требуется OPENAI_API_KEY в .env или окружении.
+# Лучший выбор для live, когда важнее скорость ответа, чем идеальная стилистика.
+mode: voiceover
+source_lang: auto
+target_lang: ru
+
+vad:
+  engine: silero
+
+stt:
+  engine: openai-compatible
+  base_url: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  model: gpt-4o-mini-transcribe
+  fallback:
+    engine: faster-whisper
+    model: small
+    device: auto
+    compute_type: auto
+
+translation:
+  engine: openai-compatible
+  base_url: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  model: gpt-4o-mini
+  temperature: 0.2
+  fallback:
+    engine: openai-compatible
+    base_url: http://127.0.0.1:11434/v1
+    api_key_env: UVT_OLLAMA_API_KEY
+    model: qwen2.5:3b
+    temperature: 0.2
+    timeout_s: 90
+
+tts:
+  engine: openai
+  base_url: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  model: tts-1
+  voice: auto
+
+output:
+  # Цель — услышать перевод через ~2 с после реплики; позже ~4 с сегмент
+  # отбрасывается, чтобы новая речь не ждала старую очередь.
+  target_delay_s: 2.0
+  max_backlog_s: 2.0
+  latest_wins: true
+
+latency:
+  preset: ultra
+
+history:
+  enabled: false

@@ -50,6 +50,21 @@ class VADConfig(_Section):
     model_path: str | None = None  # свой путь к silero_vad.onnx
 
 
+class STTFallbackConfig(_Section):
+    """Локальный резерв для облачного STT.
+
+    Используется только после ошибки удалённого openai-compatible движка.
+    По умолчанию резерв выключен: облачные профили включают его явно, чтобы
+    чужой пользовательский endpoint не менял маршрут без его выбора.
+    """
+
+    engine: str = "faster-whisper"
+    model: str = "small"
+    device: str = "auto"
+    compute_type: str = "auto"
+    beam_size: int = 1
+
+
 class STTConfig(_Section):
     engine: str = "faster-whisper"  # faster-whisper | openai-compatible | dummy
     model: str = "small"
@@ -59,6 +74,27 @@ class STTConfig(_Section):
     # Для openai-compatible (OpenAI, Groq и любые совместимые endpoint)
     base_url: str = "https://api.openai.com/v1"
     api_key_env: str = "OPENAI_API_KEY"
+    fallback: STTFallbackConfig | None = None
+
+
+class TranslationFallbackConfig(_Section):
+    """Локальный резерв для облачного LLM-перевода (Ollama/LM Studio)."""
+
+    engine: str = "openai-compatible"
+    base_url: str = "http://127.0.0.1:11434/v1"
+    # Не наследуем OPENAI_API_KEY: локальному серверу он не нужен и не должен
+    # случайно попасть в заголовок Authorization.
+    api_key_env: str = "UVT_OLLAMA_API_KEY"
+    model: str = "qwen2.5:3b"
+    temperature: float = 0.3
+    timeout_s: float = 90.0
+    prompt_template: str | None = None
+    context_pairs: int = 3
+    glossary: list[str] = Field(default_factory=list)
+    # Маленькие локальные LLM надёжнее держат короткие пачки и один запрос
+    # одновременно. Это также ограничивает повтор cloud-пачки после failover.
+    batch_size: int = Field(default=4, ge=1)
+    concurrency: int = Field(default=1, ge=1)
 
 
 class TranslationConfig(_Section):
@@ -72,6 +108,11 @@ class TranslationConfig(_Section):
     prompt_template: str | None = None
     context_pairs: int = 3  # сколько прошлых реплик отдавать LLM как контекст
     glossary: list[str] = Field(default_factory=list)
+    # Для batch-дубляжа: размер одной пачки и число одновременных запросов.
+    # Локальный Ollama по умолчанию работает последовательно, облако — параллельно.
+    batch_size: int | None = Field(default=None, ge=1)
+    concurrency: int | None = Field(default=None, ge=1)
+    fallback: TranslationFallbackConfig | None = None
 
 
 class TTSConfig(_Section):
@@ -81,13 +122,41 @@ class TTSConfig(_Section):
     speed: float = 1.0  # темп для kokoro
     model_path: str | None = None
     voices_path: str | None = None
+    # ``auto`` выбирается SpeakerService для каждой реплики; явное male/female
+    # сохраняет прежнее ручное поведение и побеждает авто-определение.
+    voice_gender: str = "auto"
+
+
+class SpeakerConfig(_Section):
+    """Лёгкая локальная привязка реплик к спикерам для live TTS.
+
+    Это не биометрическая идентификация и не определение личности: состояние
+    живёт только в памяти сессии и использует тембр/F0, чтобы голос перевода
+    не сваливался в один мужской default.
+    """
+
+    enabled: bool = True
+    max_speakers: int = 8
+    match_threshold: float = 0.42
+    # Явные правки для конкретных session IDs, например
+    # {"speaker-1": "female", "speaker-2": "male"}.
+    voice_map: dict[str, str] = Field(default_factory=dict)
+    # Когда F0 неуверен, роли назначаются стабильно по очереди, а не
+    # наследуют прежний male voice.
+    fallback_voice_roles: list[str] = Field(default_factory=lambda: ["female", "male"])
 
 
 class OutputConfig(_Section):
     backend: str = "sounddevice"  # sounddevice | null
     device: int | str | None = None  # наушники, VB-Cable, BlackHole → OBS/Discord
     sample_rate: int = 24000
-    max_backlog_s: float = 8.0  # отставание, после которого сегменты пропускаются
+    max_backlog_s: float = 8.0  # допустимая просрочка target, после которой пропускаем
+    # От конца исходной реплики до запланированного старта перевода. Небольшой
+    # запас даёт STT/MT/TTS шанс закончить, но не превращает live в batch.
+    target_delay_s: float = 0.75
+    # Обработчики тяжёлых стадий берут последний сегмент из очереди; старые
+    # выбрасываются до следующего сетевого/модельного вызова.
+    latest_wins: bool = True
 
 
 class OverlayConfig(_Section):
@@ -122,6 +191,7 @@ class AppConfig(_Section):
     stt: STTConfig = Field(default_factory=STTConfig)
     translation: TranslationConfig = Field(default_factory=TranslationConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
+    speaker: SpeakerConfig = Field(default_factory=SpeakerConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     overlay: OverlayConfig = Field(default_factory=OverlayConfig)
     history: HistoryConfig = Field(default_factory=HistoryConfig)

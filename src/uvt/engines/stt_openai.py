@@ -24,6 +24,45 @@ log = logging.getLogger("uvt.stt.openai")
 _MAX_UPLOAD_BYTES = 38_000_000  # лимит Groq free — 40 МБ, оставляем запас
 
 
+def _error_detail(response) -> str:
+    detail = ""
+    try:
+        body = response.json()
+        if isinstance(body, dict):
+            error = body.get("error")
+            if isinstance(error, dict):
+                detail = str(error.get("message") or error.get("code") or "")
+            else:
+                detail = str(error or "")
+    except Exception:  # noqa: BLE001 — в ошибке может быть HTML от proxy
+        pass
+    if not detail:
+        detail = response.text
+    return " ".join(str(detail).split())[:360]
+
+
+def _require_success(response) -> None:
+    """Не теряем текст HTTP 400: он нужен для понятного local failover."""
+    if response.is_success:
+        return
+    detail = _error_detail(response)
+    suffix = f" — {detail}" if detail else ""
+    raise RuntimeError(f"облачное STT вернуло HTTP {response.status_code}{suffix}")
+
+
+def _is_response_format_incompatible(response) -> bool:
+    """Модель (например gpt-4o(-mini)-transcribe) не умеет verbose_json с сегментами.
+
+    Это не сбой облака — просто у batch-режима нет пары для этой модели, поэтому
+    вызывающий код должен уйти на VAD + пореплечное распознавание тем же
+    облачным движком, а не на локальный резерв.
+    """
+    if response.status_code != 400:
+        return False
+    detail = _error_detail(response).lower()
+    return "response_format" in detail and "verbose_json" in detail
+
+
 @register("stt", "openai-compatible")
 class OpenAICompatibleSTT(STTEngine):
     async def warmup(self) -> None:
@@ -52,7 +91,7 @@ class OpenAICompatibleSTT(STTEngine):
             data=data,
             files={"file": ("segment.wav", wav_bytes(samples, sample_rate), "audio/wav")},
         )
-        response.raise_for_status()
+        _require_success(response)
         payload = response.json()
         text = (payload.get("text") or "").strip()
         if not text:
@@ -91,7 +130,14 @@ class OpenAICompatibleSTT(STTEngine):
             files={"file": ("audio.flac", payload, "audio/flac")},
             timeout=300.0,
         )
-        response.raise_for_status()
+        if not response.is_success and _is_response_format_incompatible(response):
+            log.info(
+                "модель %s не поддерживает verbose_json — переключаюсь на VAD + "
+                "пореплечное распознавание тем же облачным движком",
+                data["model"],
+            )
+            return None
+        _require_success(response)
         body = response.json()
         detected = body.get("language") or language
         spans = [

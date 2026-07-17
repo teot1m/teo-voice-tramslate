@@ -44,6 +44,14 @@ class Service(ABC):
         """Цикл сервиса-источника (когда consumes=None)."""
         raise NotImplementedError
 
+    async def handle_with_inbox(self, item, inbox: asyncio.Queue):
+        """Вариант handle для сервисов, которым нужен доступ к свежей очереди.
+
+        Обычно достаточно handle(). OutputService переопределяет этот хук,
+        чтобы новую реплику можно было предпочесть во время ожидания target.
+        """
+        return await self.handle(item)
+
     # --- инфраструктура ---
 
     def publish(self, item) -> None:
@@ -52,6 +60,58 @@ class Service(ABC):
 
     def set_status(self, state: str, detail: str = "") -> None:
         self.bus.topic(TOPIC_STATUS).publish(ServiceStatus(self.name, state, detail))
+
+    # --- realtime admission control ---
+
+    @staticmethod
+    def _trace_for(item):
+        trace = getattr(item, "trace", None)
+        if trace is not None:
+            return trace
+        # Сохраняем совместимость с внешними plugin events, которые держат
+        # trace только в исходном сегменте.
+        for attr in ("segment", "transcript", "translation"):
+            parent = getattr(item, attr, None)
+            trace = getattr(parent, "trace", None)
+            if trace is not None:
+                return trace
+        return None
+
+    def enforces_deadline(self) -> bool:
+        """Только тяжёлые live-стадии должны терять просроченную работу.
+
+        Overlay/History продолжают получать готовый текст: пропуск аудио не
+        должен скрывать перевод или ломать историю сессии.
+        """
+        return self.name in {"stt", "translate", "tts", "output"}
+
+    def latest_wins_enabled(self) -> bool:
+        return bool(getattr(self.cfg.output, "latest_wins", True)) and self.enforces_deadline()
+
+    def is_expired(self, item) -> bool:
+        trace = self._trace_for(item)
+        return bool(trace is not None and trace.is_expired())
+
+    def drop_item(self, item, reason: str) -> None:
+        """Отметить намеренный drop, не превращая его в service error."""
+        trace = self._trace_for(item)
+        if trace is not None:
+            trace.mark_dropped(self.name, reason)
+        self.metrics.record_drop(self.name, reason)
+        self.log.debug("сегмент пропущен (%s)", reason)
+
+    def _take_latest(self, inbox: asyncio.Queue, item):
+        """Слить уже накопившуюся очередь, сохранив newest event."""
+        if not self.latest_wins_enabled():
+            return item
+        latest = item
+        while True:
+            try:
+                newer = inbox.get_nowait()
+            except asyncio.QueueEmpty:
+                return latest
+            self.drop_item(latest, "superseded")
+            latest = newer
 
     @property
     def task(self) -> asyncio.Task | None:
@@ -87,8 +147,12 @@ class Service(ABC):
 
             while True:
                 item = await inbox.get()
+                item = self._take_latest(inbox, item)
+                if self.enforces_deadline() and self.is_expired(item):
+                    self.drop_item(item, "deadline")
+                    continue
                 try:
-                    out = await self.handle(item)
+                    out = await self.handle_with_inbox(item, inbox)
                 except Exception as exc:  # noqa: BLE001
                     self.log.exception("ошибка обработки события")
                     self.set_status("error", str(exc))
@@ -96,6 +160,12 @@ class Service(ABC):
                 if out is None:
                     continue
                 for event in out if isinstance(out, list) else [out]:
+                    # STT и TTS имеют одного downstream-потребителя, поэтому
+                    # можно не публиковать работу, просроченную во время модели.
+                    # Translation сохраняем для субтитров/истории даже поздней.
+                    if self.name in {"stt", "tts"} and self.is_expired(event):
+                        self.drop_item(event, "deadline_after_processing")
+                        continue
                     self.publish(event)
         finally:
             with contextlib.suppress(Exception):

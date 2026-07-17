@@ -1,8 +1,8 @@
 """Сервис распознавания речи + фильтр типовых галлюцинаций Whisper на тишине."""
 from __future__ import annotations
 
-from uvt import registry
 from uvt.events import TOPIC_SPEECH, TOPIC_TRANSCRIPT, SpeechSegment, Transcript
+from uvt.fallback import create_stt_engine
 from uvt.services.base import Service
 
 # Типовые фразы, которые Whisper выдаёт на тишине/музыке
@@ -28,7 +28,7 @@ class STTService(Service):
     produces = TOPIC_TRANSCRIPT
 
     async def setup(self) -> None:
-        self.engine = registry.create("stt", self.cfg.stt.engine, self.cfg.stt)
+        self.engine = create_stt_engine(self.cfg)
         await self.engine.warmup()
         lang = self.cfg.source_lang
         self._language = None if lang in (None, "", "auto") else lang

@@ -1,0 +1,43 @@
+# Качественный бесплатный маршрут для Apple Silicon: точнее и естественнее,
+# чем `free`, но медленнее. Ничего не скачивается самим UVT.
+#
+# MLX Whisper large-v3-turbo занимает около 1.5 ГБ, Qwen 3B — около 1.9 ГБ.
+# До запуска убедитесь, что они уже доступны локально:
+#   pip install -e ".[mlx]"
+#   ollama pull qwen2.5:3b
+#   brew services start ollama
+#
+# Edge Neural — лучший доступный бесплатный RU TTS по естественности и
+# интонации, но это сеть: текст отправляется Microsoft. Для полного offline
+# используйте `local` с заранее настроенным Piper — он обычно менее выразителен.
+mode: voiceover
+source_lang: auto
+target_lang: ru
+
+vad:
+  engine: silero
+
+stt:
+  engine: mlx-whisper
+  model: large-v3-turbo
+
+translation:
+  engine: openai-compatible
+  base_url: http://127.0.0.1:11434/v1
+  model: qwen2.5:3b
+  temperature: 0.15
+  timeout_s: 120
+  # 3B увереннее сохраняет формат и смысл в коротких последовательных пачках.
+  batch_size: 4
+  concurrency: 1
+
+tts:
+  engine: edge
+  voice: auto
+  rate: "+0%"
+
+latency:
+  preset: accuracy
+
+history:
+  enabled: true

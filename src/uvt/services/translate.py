@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from collections import deque
 
-from uvt import registry
 from uvt.events import TOPIC_TRANSCRIPT, TOPIC_TRANSLATION, Transcript, Translation
+from uvt.fallback import create_translation_engine
 from uvt.services.base import Service
 
 
@@ -29,7 +29,7 @@ class TranslationService(Service):
             self.engine = None
             self.log.info("перевод отключён (engine=none) — сквозной режим")
         else:
-            self.engine = registry.create("translation", tcfg.engine, tcfg)
+            self.engine = create_translation_engine(self.cfg)
             await self.engine.warmup()
         pairs = max(0, tcfg.context_pairs)
         self._context_enabled = pairs > 0

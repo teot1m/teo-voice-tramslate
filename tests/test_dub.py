@@ -81,6 +81,9 @@ async def test_voice_only_track_for_browser(tmp_path):
     assert len(entries) == 2
     assert np.max(np.abs(track[: 48000 // 10])) < 1e-6  # первые 100 мс — тишина
     assert np.max(np.abs(track)) > 0.05  # а голос в дорожке есть
+    # Browser больше не должен угадывать окно ducking по числу символов.
+    assert all(entry.tts_start is not None and entry.tts_end is not None for entry in entries)
+    assert all(entry.tts_end > entry.tts_start for entry in entries)
 
 
 async def test_dub_same_language_fails_clearly(tmp_path):

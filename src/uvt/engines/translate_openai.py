@@ -89,6 +89,28 @@ def load_template(spec: str | None) -> str:
     return spec  # шаблон задан прямо в конфиге
 
 
+def _response_content(payload: object) -> str:
+    """Извлекает текст или явно сигнализирует failover о refusal/пустом ответе."""
+    if not isinstance(payload, dict):
+        raise RuntimeError("модель вернула не-JSON ответ перевода")
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise RuntimeError("модель не вернула choices для перевода")
+    choice = choices[0]
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        raise RuntimeError("модель не вернула сообщение перевода")
+    refusal = message.get("refusal")
+    if refusal:
+        raise RuntimeError(f"модель отказалась переводить: {str(refusal).strip()[:240]}")
+    if choice.get("finish_reason") == "content_filter":
+        raise RuntimeError("модель остановила перевод content filter")
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("модель вернула пустой текст перевода")
+    return content.strip()
+
+
 @register("translation", "openai-compatible")
 class OpenAICompatibleTranslator(TranslationEngine):
     async def warmup(self) -> None:
@@ -102,8 +124,11 @@ class OpenAICompatibleTranslator(TranslationEngine):
         self._client = httpx.AsyncClient(timeout=cfg.timeout_s, headers=headers)
         await _ping_local(self._client, self._base)
         self._template = load_template(cfg.prompt_template)
-        # Маленьким локальным моделям большие пачки не по зубам — сбивают нумерацию
-        self.batch_hint = 8 if _is_local_host(self._base) else 20
+        # Маленьким локальным моделям большие/параллельные пачки чаще ломают
+        # нумерацию и давят память. Облаку оставляем прежний быстрый маршрут.
+        local = _is_local_host(self._base)
+        self.batch_hint = int(cfg.batch_size or (8 if local else 20))
+        self.concurrency_hint = int(cfg.concurrency or (1 if local else 3))
 
     async def close(self) -> None:
         if hasattr(self, "_client"):
@@ -141,7 +166,7 @@ class OpenAICompatibleTranslator(TranslationEngine):
             },
         )
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()
+        return _response_content(response.json())
 
     async def translate_batch(
         self, texts: Sequence[str], source_lang: str | None, target_lang: str
@@ -189,7 +214,7 @@ class OpenAICompatibleTranslator(TranslationEngine):
             timeout=timeout,
         )
         response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
+        content = _response_content(response.json())
         parsed = _parse_numbered(content)
         if _misaligned(texts, parsed):
             # слабая модель вернула исходные строки со сдвигом нумерации —
@@ -207,7 +232,14 @@ class OpenAICompatibleTranslator(TranslationEngine):
                 out.append(original)
                 missing += 1
         if missing:
-            log.warning("пакетный перевод: %d строк из %d без ответа — оставлены как есть", missing, len(texts))
+            # Для cloud это сигнал FailoverTranslator сразу перейти на
+            # локальный LLM для всей пачки. Без failover _translate_all
+            # штатно деградирует до построчного перевода тем же движком.
+            # Нельзя молча оставить source: валидатор увидит непустой список
+            # и отказ/обрыв ответа провайдера будет скрыт.
+            raise RuntimeError(
+                f"модель не вернула {missing} строк из {len(texts)} в нумерованной пачке"
+            )
         return out
 
 

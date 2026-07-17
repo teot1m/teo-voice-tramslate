@@ -1,8 +1,9 @@
 # Профиль по умолчанию — справочник всех настроек UVT.
 # Любой ключ можно опустить: возьмётся значение по умолчанию.
 
-# Режим (ТЗ §9): subtitles | voiceover | replace | dual
-# replace/dual пока работают как voiceover (приглушение оригинала — v1.5)
+# Режимы: subtitles (только текст) | voiceover (перевод поверх оригинала).
+# UVT пока не умеет в реальном времени заменять или раздельно микшировать
+# оригинальную речь, поэтому таких пунктов в профилях и GUI нет.
 mode: voiceover
 source_lang: auto        # язык оригинала; auto — определяет Whisper
 target_lang: ru          # язык перевода и озвучки
@@ -42,15 +43,25 @@ translation:
   glossary: []                # например: ["Название канала не переводить"]
 
 tts:
-  engine: edge           # edge | kokoro | none | dummy
+  engine: edge           # бесплатный облачный Microsoft TTS; локальные: piper | kokoro
   voice: auto            # auto — голос по целевому языку; или ru-RU-SvetlanaNeural и т.п.
+  voice_gender: auto     # live speaker-layer выбирает роль; не определение личности/пола
   rate: "+0%"            # темп edge-tts: "+20%" — быстрее
+
+# Лёгкая session-local привязка тембра к speaker-N в live. Это не биометрия и
+# не полноценная диаризация; явно закрепить роль/голос можно через voice_map.
+speaker:
+  enabled: true
+  max_speakers: 8
+  # voice_map: {speaker-1: female, speaker-2: ru-RU-DmitryNeural}
 
 output:
   backend: sounddevice   # sounddevice | null
   device: null           # наушники или виртуальный кабель → OBS/Discord (ТЗ §10)
   sample_rate: 24000
-  max_backlog_s: 8.0     # отставание, после которого сегменты пропускаются
+  target_delay_s: 0.75   # цель от конца исходной фразы до старта перевода
+  max_backlog_s: 8.0     # допустимая просрочка цели; дальше сегмент пропускается
+  latest_wins: true      # в live свежая реплика важнее накопившейся старой
 
 overlay:
   enabled: true

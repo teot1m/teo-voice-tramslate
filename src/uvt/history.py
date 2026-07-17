@@ -18,6 +18,14 @@ class HistoryEntry:
     translated: str
     language: str
     target_lang: str
+    # Фактические границы дорожки TTS. Для live-сессии они могут быть неизвестны,
+    # зато batch/browser использует их для корректного ducking и индикации sync.
+    tts_start: float | None = None
+    tts_end: float | None = None
+    # Это идентификатор спикера/тембра, а не утверждение о поле человека.
+    speaker_id: str | None = None
+    speaker_confidence: float | None = None
+    voice_style: str | None = None
 
 
 def _fmt_ts(seconds: float, sep: str = ",") -> str:

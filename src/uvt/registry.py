@@ -31,6 +31,7 @@ _BUILTIN_MODULES = [
     "uvt.engines.tts_edge",
     "uvt.engines.tts_openai",
     "uvt.engines.tts_kokoro",
+    "uvt.engines.tts_piper",
     "uvt.engines.testing",
 ]
 

@@ -1,0 +1,49 @@
+# Cloud Quality: пакетный дубляж с приоритетом качества текста и голоса.
+# Аудио и текст уходят в OpenAI, поэтому не используйте для чувствительного
+# материала без разрешения. Требуется OPENAI_API_KEY.
+# Для live этот профиль будет точнее, но обычно медленнее cloud-fast.
+mode: voiceover
+source_lang: auto
+target_lang: ru
+
+vad:
+  engine: silero
+
+stt:
+  engine: openai-compatible
+  base_url: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  model: gpt-4o-transcribe
+  fallback:
+    engine: faster-whisper
+    model: small
+    device: auto
+    compute_type: auto
+
+translation:
+  engine: openai-compatible
+  base_url: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  model: gpt-4o
+  temperature: 0.2
+  context_pairs: 5
+  fallback:
+    engine: openai-compatible
+    base_url: http://127.0.0.1:11434/v1
+    api_key_env: UVT_OLLAMA_API_KEY
+    model: qwen2.5:3b
+    temperature: 0.2
+    timeout_s: 90
+
+tts:
+  engine: openai
+  base_url: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  model: gpt-4o-mini-tts
+  voice: auto
+
+latency:
+  preset: accuracy
+
+history:
+  enabled: true

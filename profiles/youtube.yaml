@@ -18,7 +18,7 @@ translation:
   base_url: http://localhost:11434/v1
   model: qwen2.5:7b-instruct
 tts:
-  engine: edge
+  engine: edge              # бесплатный облачный Microsoft TTS, не offline
   voice: ru-RU-DmitryNeural
 latency:
   preset: balanced

@@ -9,7 +9,9 @@
 # Запуск: uvt run -p live
 #
 # Важно: это реальное время — перевод звучит после конца фразы (~2–4 с),
-# подготовить его заранее, как в dub, физически невозможно.
+# подготовить его заранее, как в dub, физически невозможно. В этом профиле
+# Edge TTS бесплатен, но обращается к облаку Microsoft. Для приватного пути
+# используйте local.yaml и задайте capture.device/выход вручную.
 mode: voiceover
 source_lang: auto
 target_lang: ru
@@ -28,16 +30,21 @@ stt:
   compute_type: auto
 
 translation:
-  engine: openai-compatible # локальная Ollama; для GPT смените на блок из cloud.yaml
+  engine: openai-compatible # локальная Ollama; облако: cloud-fast.yaml
   base_url: http://localhost:11434/v1
   model: qwen2.5:3b
 
 tts:
-  engine: edge
+  engine: edge              # Microsoft cloud, без ключа, но не offline
   voice: auto
 
 output:
   device: null              # наушники/колонки; тем же устройством, что и оригинал
+  # Планируем старт через 2 с после конца фразы и пропускаем то, что не
+  # успело за следующие 2 с: честное live-окно около 2–4 с, без старого хвоста.
+  target_delay_s: 2.0
+  max_backlog_s: 2.0
+  latest_wins: true
 
 latency:
   preset: ultra             # минимальная пауза-отсечка

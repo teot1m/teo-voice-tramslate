@@ -1,0 +1,42 @@
+# Локальный / private профиль: после установки моделей UVT не делает сетевых
+# запросов. Подходит для файлов и системного звука, если приватность важнее
+# удобства. Whisper может один раз скачать свою модель при первом запуске;
+# Piper и Ollama-модели поставьте заранее.
+#
+# Подготовка:
+#   pip install -e ".[piper]"
+#   ollama pull qwen2.5:7b-instruct
+#   # скачайте совместимую с target_lang Piper .onnx-модель сами и укажите путь
+#
+# Это единственный штатный профиль с локальным TTS. `free` дешевле, но Edge
+# отправляет текст Microsoft; он не является private/offline-профилем.
+mode: voiceover
+source_lang: auto
+target_lang: ru
+
+vad:
+  engine: silero
+
+stt:
+  engine: faster-whisper
+  model: small
+  device: auto
+  compute_type: auto
+
+translation:
+  engine: openai-compatible
+  base_url: http://localhost:11434/v1
+  model: qwen2.5:7b-instruct
+
+tts:
+  engine: piper
+  # Замените на существующую локальную модель нужного языка. Рядом обязательно
+  # должен лежать её Piper sidecar `voice.onnx.json`: UVT читает из него
+  # audio.sample_rate и не угадывает частоту сырого PCM.
+  model_path: ~/.local/share/uvt/piper/voice.onnx
+
+latency:
+  preset: balanced
+
+history:
+  enabled: true
