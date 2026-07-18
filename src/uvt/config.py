@@ -116,7 +116,7 @@ class TranslationConfig(_Section):
 
 
 class TTSConfig(_Section):
-    engine: str = "edge"  # edge | kokoro | none | dummy | плагин
+    engine: str = "edge"  # edge | openai | elevenlabs | kokoro | piper | none | dummy
     voice: str = "auto"  # auto → голос по целевому языку
     rate: str = "+0%"  # темп речи для edge-tts
     speed: float = 1.0  # темп для kokoro

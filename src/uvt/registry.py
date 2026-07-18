@@ -30,6 +30,7 @@ _BUILTIN_MODULES = [
     "uvt.engines.translate_google",
     "uvt.engines.tts_edge",
     "uvt.engines.tts_openai",
+    "uvt.engines.tts_elevenlabs",
     "uvt.engines.tts_kokoro",
     "uvt.engines.tts_piper",
     "uvt.engines.testing",

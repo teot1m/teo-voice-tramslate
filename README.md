@@ -79,16 +79,17 @@ uvt serve -p free --port 8080              # сервер для браузер�
 | [`free-vps`](profiles/free-vps.yaml) | CPU Whisper + Ollama локально, **Microsoft Edge TTS через сеть** | Личный Linux VPS с одной batch-задачей | 2+ vCPU, 8+ GB RAM, Ollama Qwen 3B |
 | [`free-quality`](profiles/free-quality.yaml) | MLX Whisper large + Ollama Qwen 3B локально, **Edge TTS через сеть** | Apple Silicon: выше качество STT/структуры речи | `.[mlx]`, заранее загруженные модели; медленнее `free` |
 | [`cloud-fast`](profiles/cloud-fast.yaml) | Аудио/STT, текст/перевод и TTS в OpenAI | Live с меньшей ожидаемой задержкой | `OPENAI_API_KEY` |
+| [`cloud-eleven`](profiles/cloud-eleven.yaml) | OpenAI STT + GPT-перевод, озвучка в ElevenLabs | Альтернативные облачные голоса для batch-дубляжа | `OPENAI_API_KEY` + `ELEVENLABS_API_KEY` |
 | [`cloud-quality`](profiles/cloud-quality.yaml) | Облачные STT, перевод и TTS с более качественными моделями | В первую очередь batch-дубляж | `OPENAI_API_KEY` |
 | [`live`](profiles/live.yaml) | Локальные STT/перевод + **Edge TTS через сеть** | Системный звук с BlackHole/VB-Cable/monitor | Виртуальный вход, Ollama |
 
 ### Резерв cloud-профилей
 
-`cloud`, `cloud-fast` и `cloud-quality` при ошибке или отказе OpenAI лениво
+`cloud`, `cloud-fast`, `cloud-eleven` и `cloud-quality` при ошибке или отказе OpenAI лениво
 переключают STT на локальный Whisper, а перевод — на локальный Ollama с
 `qwen2.5:3b`. Для этого резерва заранее должны быть доступны модель Whisper,
 запущенный Ollama и модель Qwen; до ошибки облака они не загружаются в память.
-OpenAI TTS остаётся облачным компонентом.
+Выбранный OpenAI или ElevenLabs TTS остаётся облачным компонентом.
 
 `cloud` сохранён как совместимое имя `cloud-fast`. Он больше не означает «локальный Whisper + облачный только перевод»: в cloud-профилях активный STT и TTS также могут быть облачными.
 
@@ -119,6 +120,7 @@ uvt dub файл.mp4 -p local --duck-db -18  # оригинал остаётся
 ```bash
 uvt serve -p cloud       # облачный маршрут (OpenAI), localhost:8765
 uvt serve -p free        # без платных API: локальные STT/перевод + Edge TTS через сеть
+uvt serve-personal       # сразу Free + GPT + ElevenLabs на портах 8765–8767
 # либо: uvt serve -p local    # после настройки Piper и Ollama
 ```
 
@@ -183,20 +185,28 @@ uvt gui -p cloud-fast   # облачный маршрут с упором на �
 - `uvt serve` слушает localhost, но localhost не делает сетевые движки локальными.
 - Переводите только контент, к которому у вас есть законный доступ, и соблюдайте условия сайтов/API.
 
-### Личный сервер: Free и GPT Cloud одновременно
+### Личный сервер: Free, GPT и ElevenLabs одновременно
 
 Для Linux VPS есть профиль [`free-vps`](profiles/free-vps.yaml): он заменяет
 Apple-only MLX Whisper на CPU `faster-whisper` и использует `qwen2.5:3b` через
-Ollama. Два независимых batch-сервера запускаются одной командой:
+Ollama. Один раз перед первым запуском скачайте локальную модель:
 
 ```bash
 ollama pull qwen2.5:3b
-bash scripts/serve-personal.sh
 ```
 
-По умолчанию `free-vps` работает на `127.0.0.1:8765`, `cloud-fast` — на
-`127.0.0.1:8766`. В userscript выберите маршрут в поле «Модель» перед
-запуском. Для VPS, HTTPS и токена доступа следуйте [инструкции](docs/PERSONAL_DEPLOY.md).
+После этого все три версии запускаются одной командой:
+
+```bash
+uvt serve-personal
+```
+
+Обёртка `bash scripts/serve-personal.sh` запускает ту же команду. По умолчанию
+`free-vps` работает на `127.0.0.1:8765`, `cloud-fast` — на `127.0.0.1:8766`,
+`cloud-eleven` — на `127.0.0.1:8767`. Userscript отправляет задачу только в
+выбранный маршрут: получение исходного звука и batch-конвейер одинаковы, а
+профиль определяет STT, перевод и финальную озвучку. Для VPS, HTTPS и токена
+доступа следуйте [инструкции](docs/PERSONAL_DEPLOY.md).
 
 ## Лицензия
 

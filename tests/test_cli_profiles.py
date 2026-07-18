@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
         ("free-vps", "edge"),
         ("free-quality", "edge"),
         ("cloud-fast", "openai"),
+        ("cloud-eleven", "elevenlabs"),
         ("cloud-quality", "openai"),
         ("cloud", "openai"),
     ],
@@ -72,6 +73,13 @@ def test_free_quality_is_an_opt_in_serial_local_llm_profile():
 def test_legacy_mode_is_normalized_to_honest_voiceover():
     args = _build_parser().parse_args(["run", "--mode", "replace"])
     assert _overrides(args)["mode"] == "voiceover"
+
+
+def test_personal_server_command_has_three_distinct_default_ports(monkeypatch):
+    for name in ("UVT_FREE_PORT", "UVT_CLOUD_PORT", "UVT_ELEVEN_PORT"):
+        monkeypatch.delenv(name, raising=False)
+    args = _build_parser().parse_args(["serve-personal"])
+    assert (args.free_port, args.gpt_port, args.eleven_port) == (8765, 8766, 8767)
 
 
 def test_profiles_command_explains_edge_network_route(capsys):

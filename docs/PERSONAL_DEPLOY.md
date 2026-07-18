@@ -1,15 +1,15 @@
-# Личный VPS: Free + GPT Cloud одновременно
+# Личный VPS: Free + GPT + ElevenLabs одновременно
 
-Это запуск для одного личного пользователя, а не публичный SaaS. Он поднимает
-два процесса UVT и не выводит OpenAI-ключ за пределы VPS.
+Это запуск для одного личного пользователя, а не публичный SaaS. Одна команда
+поднимает три маршрута UVT и не выводит API-ключи за пределы VPS.
 
 ## Что нужно
 
 - Linux VPS: для Oracle Always Free достаточно Ampere A1 с 2 OCPU / 12 GB RAM
   и 50+ GB диска; `free-vps` обрабатывает только одну задачу одновременно.
-- Домен с двумя поддоменами, например `free.uvt.example` и
-  `cloud.uvt.example`, если браузер будет обращаться к VPS по HTTPS.
-- Учётная запись OpenAI только для cloud-версии.
+- Домен с тремя поддоменами, например `free.uvt.example`, `cloud.uvt.example`
+  и `eleven.uvt.example`, если браузер будет обращаться к VPS по HTTPS.
+- Учётная запись OpenAI для GPT-маршрутов и ElevenLabs для третьего TTS.
 
 `free-vps` не является полностью офлайн: Edge TTS отправляет текст Microsoft.
 MLX Whisper намеренно не используется, поскольку он предназначен для Apple
@@ -33,22 +33,24 @@ cp .env.example .env
 
 ```dotenv
 OPENAI_API_KEY=sk-...
+ELEVENLABS_API_KEY=sk_...
 UVT_API_TOKEN=длинный-случайный-секрет
 ```
 
 Запуск и проверка:
 
 ```bash
-bash scripts/serve-personal.sh
+uvt serve-personal
 curl -H 'X-UVT-Token: длинный-случайный-секрет' http://127.0.0.1:8765/meta
 curl -H 'X-UVT-Token: длинный-случайный-секрет' http://127.0.0.1:8766/meta
+curl -H 'X-UVT-Token: длинный-случайный-секрет' http://127.0.0.1:8767/meta
 ```
 
-Не публикуйте порты 8765 и 8766 через firewall: они остаются на loopback.
+Не публикуйте порты 8765–8767 через firewall: они остаются на loopback.
 
 ## HTTPS reverse proxy
 
-Поставьте Caddy и направьте два поддомена на loopback-порты:
+Поставьте Caddy и направьте три поддомена на loopback-порты:
 
 Скопируйте [`deploy/Caddyfile.personal.example`](../deploy/Caddyfile.personal.example)
 в `/etc/caddy/Caddyfile`, замените домены и перезагрузите Caddy.
@@ -56,13 +58,15 @@ curl -H 'X-UVT-Token: длинный-случайный-секрет' http://127
 После выпуска сертификатов замените в начале `browser/uvt.user.js` только URL:
 
 ```js
-free:  { url: "https://free.uvt.example",  label: "Бесплатный — Whisper + Qwen" },
-cloud: { url: "https://cloud.uvt.example", label: "GPT Cloud — OpenAI" },
+free: { url: "https://free.uvt.example", label: "Бесплатный — Whisper + Qwen", shortLabel: "Free" },
+cloud: { url: "https://cloud.uvt.example", label: "GPT Cloud — OpenAI", shortLabel: "GPT" },
+eleven: { url: "https://eleven.uvt.example", label: "GPT + ElevenLabs", shortLabel: "ElevenLabs" },
 const UVT_API_TOKEN = "то-же-значение-что-на-VPS";
 ```
 
-Не добавляйте `OPENAI_API_KEY` в userscript. Переключатель «Модель» выбирает
-маршрут до нажатия «перевести»; начатая задача остаётся на исходном сервере.
+Не добавляйте `OPENAI_API_KEY` или `ELEVENLABS_API_KEY` в userscript.
+Переключатель «Модель» выбирает маршрут до нажатия «перевести»; начатая задача
+остаётся на исходном сервере.
 
 ## Автозапуск
 

@@ -1,4 +1,4 @@
-# Replace the two domains before copying this file to /etc/caddy/Caddyfile.
+# Replace the three domains before copying this file to /etc/caddy/Caddyfile.
 # Caddy obtains and renews TLS certificates; UVT itself stays on loopback.
 free.uvt.example {
     reverse_proxy 127.0.0.1:8765
@@ -6,4 +6,8 @@ free.uvt.example {
 
 cloud.uvt.example {
     reverse_proxy 127.0.0.1:8766
+}
+
+eleven.uvt.example {
+    reverse_proxy 127.0.0.1:8767
 }

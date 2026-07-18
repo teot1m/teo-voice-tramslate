@@ -31,9 +31,10 @@ Web Audio (например, MSE/blob), оригинал приглушаетс�
 
 ```bash
 cd ~/Documents/голос && source .venv/bin/activate
-bash scripts/serve-personal.sh
-# Free:  http://127.0.0.1:8765 (Whisper + Qwen + Edge TTS)
-# Cloud: http://127.0.0.1:8766 (OpenAI STT + GPT + OpenAI TTS)
+uvt serve-personal
+# Free:       http://127.0.0.1:8765 (Whisper + Qwen + Edge TTS)
+# GPT:        http://127.0.0.1:8766 (OpenAI STT + GPT + OpenAI TTS)
+# ElevenLabs: http://127.0.0.1:8767 (OpenAI STT + GPT + ElevenLabs TTS)
 ```
 
 Откройте страницу с видео → на плеере появится кнопка **UVT · перевести** →
@@ -45,7 +46,7 @@ bash scripts/serve-personal.sh
 Кнопка меняется на **UVT · выключить**; повторное нажатие выключает только
 дорожку UVT. Крестик отменяет подготовку.
 
-Рядом с кнопкой **UVT · перевести** виден селектор **Free / GPT Cloud**:
+Рядом с кнопкой **UVT · перевести** виден селектор **Free / GPT / ElevenLabs**:
 выберите нужный результат до запуска. Выбор фиксируется для уже запущенной
 задачи, поэтому опрос статуса, отмена и дорожка не попадут на другой сервер.
 Кнопка с парой языков открывает настройки исходного/целевого языка, тембра
@@ -69,6 +70,7 @@ Edge TTS, Google-free и OpenAI-совместимые URL вне `localhost` о
 - `local`: STT, Ollama и Piper на устройстве (после установки моделей);
 - `free`: локальные STT/перевод, но Edge TTS передаёт текст Microsoft;
 - `cloud-fast` / `cloud-quality`: аудио и текст уходят выбранному cloud-провайдеру.
+- `cloud-eleven`: распознавание и перевод выполняет OpenAI, озвучку — ElevenLabs.
 
 Список и подробности: `uvt profiles`.
 

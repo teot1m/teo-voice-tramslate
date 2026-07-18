@@ -35,7 +35,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
-from uvt.config import AppConfig
+from uvt.config import AppConfig, load_config
 from uvt.dub import render_dub_track
 from uvt.fallback import ApprovalGate
 
@@ -622,7 +622,7 @@ class DubServer:
         }
         cloud_engines = {
             "translation": {"google-free"},
-            "tts": {"edge", "openai"},
+            "tts": {"edge", "openai", "elevenlabs"},
         }
         if engine in local_engines.get(kind, set()):
             scope = "local"
@@ -1107,7 +1107,13 @@ class DubServer:
         return web.FileResponse(path, headers={"Content-Type": "audio/mp4"})
 
 
-async def run_server(cfg: AppConfig, host: str = "127.0.0.1", port: int = 8765) -> None:
+async def run_server(
+    cfg: AppConfig,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    *,
+    stop_event: asyncio.Event | None = None,
+) -> None:
     from aiohttp import web
 
     server = DubServer(cfg)
@@ -1121,13 +1127,71 @@ async def run_server(cfg: AppConfig, host: str = "127.0.0.1", port: int = 8765) 
         "и нажимайте кнопку UVT на видео; Ctrl+C — остановка", host, port,
     )
 
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        with contextlib.suppress(NotImplementedError, RuntimeError):
-            loop.add_signal_handler(sig, stop_event.set)
+    own_stop_event = stop_event is None
+    stop_event = stop_event or asyncio.Event()
+    installed_signals: list[signal.Signals] = []
+    if own_stop_event:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError, RuntimeError):
+                loop.add_signal_handler(sig, stop_event.set)
+                installed_signals.append(sig)
     try:
         await stop_event.wait()
     finally:
         await runner.cleanup()
-        log.info("сервер остановлен")
+        if own_stop_event:
+            loop = asyncio.get_running_loop()
+            for sig in installed_signals:
+                with contextlib.suppress(NotImplementedError, RuntimeError):
+                    loop.remove_signal_handler(sig)
+        log.info("сервер http://%s:%d остановлен", host, port)
+
+
+async def run_personal_servers(
+    host: str = "127.0.0.1",
+    free_port: int = 8765,
+    gpt_port: int = 8766,
+    eleven_port: int = 8767,
+) -> None:
+    """Поднимает три batch-маршрута для одного userscript и останавливает вместе."""
+    routes = (
+        ("Free", "free-vps", free_port),
+        ("GPT", "cloud-fast", gpt_port),
+        ("ElevenLabs", "cloud-eleven", eleven_port),
+    )
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    installed_signals: list[signal.Signals] = []
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError, RuntimeError):
+            loop.add_signal_handler(sig, stop_event.set)
+            installed_signals.append(sig)
+
+    for label, profile, port in routes:
+        log.info(
+            "маршрут %-11s http://%s:%d (профиль %s)",
+            label,
+            host,
+            port,
+            profile,
+        )
+
+    tasks = [
+        asyncio.create_task(
+            run_server(load_config(profile), host, port, stop_event=stop_event),
+            name=f"uvt-{profile}",
+        )
+        for _label, profile, port in routes
+    ]
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        stop_event.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for sig in installed_signals:
+            with contextlib.suppress(NotImplementedError, RuntimeError):
+                loop.remove_signal_handler(sig)

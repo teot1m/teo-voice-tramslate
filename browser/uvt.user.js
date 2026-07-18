@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         UVT — закадровый перевод видео
 // @namespace    uvt
-// @version      0.12.0
-// @description  Пакетный закадровый перевод видео через личные UVT-серверы: free или GPT Cloud, не live-перевод
+// @version      0.13.0
+// @description  Пакетный закадровый перевод через личный UVT: Free, GPT или ElevenLabs, не live-перевод
 // @match        *://*/*
 // @grant        none
 // @run-at       document-idle
@@ -12,17 +12,24 @@
   "use strict";
 
   // --- настройки ---
-  // Два независимых процесса `uvt serve`. Для удалённого личного VPS замените
-  // только URL: free и cloud должны указывать на разные reverse-proxy routes.
-  // Не вставляйте OPENAI_API_KEY в userscript: он остаётся только на сервере.
+  // `uvt serve-personal` поднимает три маршрута. Для удалённого личного VPS
+  // замените только URL: каждый маршрут указывает на свой reverse proxy.
+  // API-ключи OpenAI/ElevenLabs остаются только на сервере.
   const SERVERS = Object.freeze({
     free: {
       url: "http://127.0.0.1:8765",
       label: "Бесплатный — Whisper + Qwen",
+      shortLabel: "Free",
     },
     cloud: {
       url: "http://127.0.0.1:8766",
       label: "GPT Cloud — OpenAI",
+      shortLabel: "GPT",
+    },
+    eleven: {
+      url: "http://127.0.0.1:8767",
+      label: "GPT-перевод + озвучка ElevenLabs",
+      shortLabel: "ElevenLabs",
     },
   });
   // Задайте тот же секрет, что и UVT_API_TOKEN на удалённом сервере. Для
@@ -627,7 +634,7 @@
     for (const [value, server] of Object.entries(SERVERS)) {
       const option = document.createElement("option");
       option.value = value;
-      option.textContent = value === "cloud" ? "GPT Cloud" : "Free";
+      option.textContent = server.shortLabel;
       option.title = server.label;
       if (value === prefs.route) option.selected = true;
       select.appendChild(option);

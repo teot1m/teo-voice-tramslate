@@ -64,6 +64,7 @@ _CURATED_PROFILES = (
     ("Local Private — всё на этом устройстве", "local"),
     ("Free — без оплаты, Edge TTS через сеть", "free"),
     ("Cloud Fast — меньше задержка", "cloud-fast"),
+    ("Cloud ElevenLabs — другой провайдер озвучки", "cloud-eleven"),
     ("Cloud Quality — для пакетного дубляжа", "cloud-quality"),
     ("Live — системный звук через виртуальный вход", "live"),
 )
@@ -105,6 +106,8 @@ def _privacy_summary(cfg: AppConfig) -> tuple[str, str]:
         local.append("озвучка")
     elif cfg.tts.engine == "edge":
         remote.append("текст для Microsoft Edge TTS")
+    elif cfg.tts.engine == "elevenlabs":
+        remote.append("текст для ElevenLabs TTS")
     else:
         remote.append("текст для озвучки")
 

@@ -1,4 +1,4 @@
-"""CLI: uvt run | dub | serve | devices | profiles | gui | version."""
+"""CLI: uvt run | dub | serve | serve-personal | devices | profiles | gui."""
 from __future__ import annotations
 
 import argparse
@@ -44,6 +44,7 @@ _PROFILE_OVERVIEW = (
     ("free-vps", "Linux VPS: CPU Whisper + Ollama Qwen 3B последовательно + Edge TTS"),
     ("free-quality", "Apple Silicon: MLX Whisper large + Qwen 3B последовательно + Edge TTS"),
     ("cloud-fast", "облачные STT/перевод/TTS с упором на минимальную задержку"),
+    ("cloud-eleven", "OpenAI STT/GPT-перевод + естественная озвучка ElevenLabs"),
     ("cloud-quality", "облачный пакетный дубляж с упором на качество"),
     ("live", "системный звук через виртуальный вход + бесплатный Edge TTS через сеть"),
     ("cloud", "устаревшее совместимое имя cloud-fast"),
@@ -98,6 +99,22 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--target-lang")
     serve.add_argument("--source-lang")
     serve.add_argument("--debug", action="store_true")
+
+    personal = sub.add_parser(
+        "serve-personal",
+        help="одной командой поднять Free, GPT и ElevenLabs для userscript",
+    )
+    personal.add_argument("--host", default=os.environ.get("UVT_HOST", "127.0.0.1"))
+    personal.add_argument(
+        "--free-port", type=int, default=int(os.environ.get("UVT_FREE_PORT", "8765"))
+    )
+    personal.add_argument(
+        "--gpt-port", type=int, default=int(os.environ.get("UVT_CLOUD_PORT", "8766"))
+    )
+    personal.add_argument(
+        "--eleven-port", type=int, default=int(os.environ.get("UVT_ELEVEN_PORT", "8767"))
+    )
+    personal.add_argument("--debug", action="store_true")
 
     sub.add_parser("devices", help="список аудиоустройств (вход/выход, виртуальные помечены)")
     sub.add_parser("profiles", help="показать готовые профили и их маршрут данных")
@@ -229,6 +246,27 @@ def main(argv: list[str] | None = None) -> int:
 
         try:
             asyncio.run(run_server(cfg, host=args.host, port=args.port))
+        except KeyboardInterrupt:
+            pass
+        return 0
+
+    if args.command == "serve-personal":
+        try:
+            import aiohttp  # noqa: F401
+        except ImportError:
+            print('серверу нужен aiohttp — установите: pip install "uvt[server]"', file=sys.stderr)
+            return 1
+        from uvt.server import run_personal_servers
+
+        try:
+            asyncio.run(
+                run_personal_servers(
+                    host=args.host,
+                    free_port=args.free_port,
+                    gpt_port=args.gpt_port,
+                    eleven_port=args.eleven_port,
+                )
+            )
         except KeyboardInterrupt:
             pass
         return 0

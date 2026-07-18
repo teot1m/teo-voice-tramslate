@@ -1,0 +1,54 @@
+# Cloud ElevenLabs: тот же быстрый OpenAI STT + GPT-перевод, что cloud-fast,
+# но финальная озвучка создаётся ElevenLabs. Требуются два API-ключа:
+# OPENAI_API_KEY и ELEVENLABS_API_KEY.
+mode: voiceover
+source_lang: auto
+target_lang: ru
+
+vad:
+  engine: silero
+
+stt:
+  engine: openai-compatible
+  base_url: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  model: gpt-4o-mini-transcribe
+  fallback:
+    engine: faster-whisper
+    model: small
+    device: auto
+    compute_type: auto
+
+translation:
+  engine: openai-compatible
+  base_url: https://api.openai.com/v1
+  api_key_env: OPENAI_API_KEY
+  model: gpt-4o-mini
+  temperature: 0.2
+  fallback:
+    engine: openai-compatible
+    base_url: http://127.0.0.1:11434/v1
+    api_key_env: UVT_OLLAMA_API_KEY
+    model: qwen2.5:3b
+    temperature: 0.2
+    timeout_s: 90
+
+tts:
+  engine: elevenlabs
+  base_url: https://api.elevenlabs.io/v1
+  api_key_env: ELEVENLABS_API_KEY
+  model: eleven_multilingual_v2
+  output_format: mp3_44100_128
+  voice: auto
+  concurrency: 2
+
+output:
+  target_delay_s: 2.0
+  max_backlog_s: 2.0
+  latest_wins: true
+
+latency:
+  preset: ultra
+
+history:
+  enabled: false
