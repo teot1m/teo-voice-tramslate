@@ -1,15 +1,10 @@
-# Качественный бесплатный маршрут для Apple Silicon: точнее и естественнее,
-# чем `free`, но медленнее. Ничего не скачивается самим UVT.
+# Оптимальный private-local маршрут для Apple Silicon с 8 ГБ unified memory.
+# Тяжёлые стадии выполняются последовательно в одном UVT-процессе:
+# MLX Whisper → NLLB INT8 → Piper. Ollama и внешние API не нужны.
 #
-# MLX Whisper large-v3-turbo занимает около 1.5 ГБ, Qwen 3B — около 1.9 ГБ.
-# До запуска убедитесь, что они уже доступны локально:
-#   pip install -e ".[mlx]"
-#   ollama pull qwen2.5:3b
-#   brew services start ollama
-#
-# Edge Neural — лучший доступный бесплатный RU TTS по естественности и
-# интонации, но это сеть: текст отправляется Microsoft. Для полного offline
-# используйте `local` с заранее настроенным Piper — он обычно менее выразителен.
+# Однократная подготовка:
+#   pip install -e ".[mac-local,server,web]"
+#   uvt setup-mac-local --preset all
 mode: voiceover
 source_lang: auto
 target_lang: ru
@@ -20,21 +15,36 @@ vad:
 stt:
   engine: mlx-whisper
   model: large-v3-turbo
+  revision: a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb
+  allow_download: false
 
 translation:
-  engine: openai-compatible
-  base_url: http://127.0.0.1:11434/v1
-  model: qwen2.5:3b
-  temperature: 0.15
-  timeout_s: 120
-  # 3B увереннее сохраняет формат и смысл в коротких последовательных пачках.
-  batch_size: 4
+  engine: nllb-ct2
+  model: OpenNMT/nllb-200-distilled-1.3B-ct2-int8
+  revision: 70f572adafa4794890ce7826156a4209717855af
+  allow_download: false
+  compute_type: int8
+  threads: 4
+  batch_size: 32
   concurrency: 1
+  beam_size: 1
 
 tts:
-  engine: edge
-  voice: auto
-  rate: "+0%"
+  engine: piper
+  voice_dir: ~/.local/share/uvt/piper
+  voice_models:
+    "uk:male": uk_UA-mykyta-high.onnx
+    "uk:female": uk_UA-tetiana-high.onnx
+    "ru:male": ru_RU-dmitri-medium.onnx
+    "ru:female": ru_RU-irina-medium.onnx
+  # Эмпирическая длительность этих голосов: позволяет сразу выбрать темп,
+  # вместо повторного синтеза сотен не поместившихся в таймкод реплик.
+  duration_per_char:
+    "uk:male": 0.082
+    "uk:female": 0.065
+    "ru:male": 0.055
+    "ru:female": 0.067
+  concurrency: 2
 
 latency:
   preset: accuracy

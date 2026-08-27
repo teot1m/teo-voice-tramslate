@@ -21,23 +21,44 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import hmac
+import html
+import io
+import ipaddress
+import json
 import logging
 import os
 import re
 import signal
+import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
+import webbrowser
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from uvt.config import AppConfig, load_config
+from uvt import registry
 from uvt.dub import render_dub_track
-from uvt.fallback import ApprovalGate
+from uvt.fallback import ApprovalGate, create_stt_engine
+from uvt.interfaces import STTEngine
+from uvt.server_settings import (
+    PARAKEET_LANGUAGE_IDS,
+    ServerSettingsStore,
+    SettingsConflictError,
+    apply_settings,
+    effective_settings,
+    normalize_settings,
+    route_key as settings_route_key,
+    settings_catalog,
+    settings_kind,
+)
 
 log = logging.getLogger("uvt.server")
 
@@ -51,12 +72,152 @@ _YT_DLP_AUDIO_SELECTOR = (
     "/bestaudio[acodec!=none]/bestaudio/worst[acodec!=none]"
     "/best[acodec!=none]/best"
 )
+_YT_DLP_YOUTUBE_ANDROID_ARGS = ["--extractor-args", "youtube:player_client=android"]
+_LOCAL_PROFILE_LABELS = {
+    "local-fast": "Быстро",
+    "local-balanced": "Сбалансированный",
+    "local-quality": "Качество",
+}
+_VOICE_LABELS = {
+    "ru_RU-dmitri-medium": "Дмитрий",
+    "ru_RU-irina-medium": "Ирина",
+    "uk_UA-mykyta-high": "Микита",
+    "uk_UA-tetiana-high": "Тетяна",
+}
+_VOICE_GENDERS = {"auto", "male", "female"}
+_PREVIEW_MAX_CHARS = 240
+_PREVIEW_TIMEOUT_S = 30.0
+_BROWSER_OPEN_TIMEOUT_S = 5.0
 
 # Download is a short, separate phase before render_dub_track's 0–100% work.
 # Keeping it in a small prefix makes the externally visible progress monotonic.
 _DOWNLOAD_PROGRESS_SHARE = 0.08
 _ProgressCallback = Callable[[float | None, str], None]
 _MAX_BROWSER_MEDIA_CANDIDATES = 6
+_SOURCE_CACHE_MAX_AGE_DAYS = 7.0
+_TRACKING_QUERY_KEYS = {
+    "fbclid",
+    "gclid",
+    "dclid",
+    "msclkid",
+    "mc_cid",
+    "mc_eid",
+}
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Accept localhost and every textual spelling of an IP loopback address."""
+    normalized = host.strip().lower()
+    if normalized.startswith("[") and normalized.endswith("]"):
+        normalized = normalized[1:-1]
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _dashboard_url(host: str, port: int) -> str:
+    """Return a browser-friendly URL for a locally bound dashboard."""
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("порт UVT должен быть от 1 до 65535")
+    normalized = host.strip()
+    if normalized in {"", "0.0.0.0"}:
+        browser_host = "127.0.0.1"
+    elif normalized in {"::", "[::]"}:
+        browser_host = "::1"
+    else:
+        browser_host = normalized
+    if ":" in browser_host and not browser_host.startswith("["):
+        browser_host = f"[{browser_host}]"
+    return f"http://{browser_host}:{port}/"
+
+
+def _configured_dashboard_url(env_name: str, fallback: str) -> tuple[str, bool]:
+    """Validate an optional public route URL used by the cross-route dashboard."""
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return fallback, False
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{env_name}: некорректный URL") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise ValueError(
+            f"{env_name}: укажите только origin, например https://free.uvt.example"
+        )
+    if parsed.scheme != "https" and not _is_loopback_host(parsed.hostname):
+        raise ValueError(f"{env_name}: для сетевого адреса требуется https://")
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    default_port = 443 if parsed.scheme == "https" else 80
+    port_suffix = f":{port}" if port and port != default_port else ""
+    return f"{parsed.scheme}://{host}{port_suffix}/", True
+
+
+async def _open_dashboard_in_browser(url: str) -> None:
+    """Best-effort browser launch; never stop an otherwise healthy server."""
+    try:
+        opened = await asyncio.wait_for(
+            asyncio.to_thread(webbrowser.open_new_tab, url),
+            timeout=_BROWSER_OPEN_TIMEOUT_S,
+        )
+    except TimeoutError:
+        log.warning(
+            "браузер не ответил за %.0f с; панель UVT доступна по адресу %s",
+            _BROWSER_OPEN_TIMEOUT_S,
+            url,
+        )
+        return
+    except Exception as exc:  # noqa: BLE001 - OS browser integration varies
+        log.warning("не удалось открыть панель UVT в браузере: %s", exc)
+        return
+    if not opened:
+        log.warning("браузер не подтвердил открытие панели UVT: %s", url)
+    else:
+        log.info("панель UVT открыта в браузере: %s", url)
+
+
+def _dashboard_open_block_reason(host: str) -> str | None:
+    """Explain why an explicit browser-open request is unsafe in this session."""
+    if not _is_loopback_host(host):
+        return "сервер слушает не loopback-адрес"
+
+    truthy = {"1", "true", "yes", "on"}
+    if os.environ.get("UVT_HEADLESS", "").strip().lower() in truthy:
+        return "задан UVT_HEADLESS"
+    if os.environ.get("CI", "").strip().lower() in truthy:
+        return "запуск в CI без интерактивного браузера"
+    if any(
+        os.environ.get(name, "").strip()
+        for name in ("SSH_CONNECTION", "SSH_TTY", "INVOCATION_ID", "JOURNAL_STREAM")
+    ):
+        return "удалённая или systemd-сессия без локального браузера"
+    if (
+        sys.platform != "darwin"
+        and os.name != "nt"
+        and not os.environ.get("DISPLAY", "").strip()
+        and not os.environ.get("WAYLAND_DISPLAY", "").strip()
+    ):
+        return "графическая сессия не обнаружена"
+    return None
+
+
+# Three personal servers live in one event loop and share the on-disk source
+# cache. The keyed lock ensures that two routes cannot download the same media
+# concurrently before the first atomic cache write is complete.
+_SOURCE_CACHE_LOCKS: dict[str, asyncio.Lock] = {}
 
 # Это именно стадии подготовки готовой дорожки. Они не означают потоковый
 # перевод: браузер получает результат только после завершения всей задачи.
@@ -80,6 +241,36 @@ def _cache_dir() -> Path:
     path = Path(root).expanduser() / "serve"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _canonical_source_url(value: str) -> str:
+    """Drop tracking-only URL parts without losing parameters needed by a page."""
+    try:
+        parsed = urlsplit(value.strip())
+    except ValueError:
+        return value.strip()
+    if not parsed.scheme or not parsed.netloc:
+        return value.strip()
+    query = urlencode(
+        [
+            (key, item)
+            for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+            if not key.lower().startswith("utm_") and key.lower() not in _TRACKING_QUERY_KEYS
+        ],
+        doseq=True,
+    )
+    return urlunsplit(
+        (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", query, "")
+    )
+
+
+def _source_cache_key(data: dict) -> str | None:
+    """Stable shared key for a browser source; local files need no copied cache."""
+    raw = data.get("page_url") or data.get("media_url")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    identity = _canonical_source_url(raw)
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
 
 
 async def _kill_process(proc: asyncio.subprocess.Process) -> None:
@@ -178,13 +369,22 @@ def _ffmpeg_progress_parser(
     return on_line
 
 
-def _yt_dlp_progress_parser(progress: _ProgressCallback) -> Callable[[str], None]:
-    """Read the explicit marker emitted by yt-dlp's progress template."""
+def _yt_dlp_progress_parser(
+    progress: _ProgressCallback,
+    diagnostics: list[str] | None = None,
+) -> Callable[[str], None]:
+    """Read progress and retain a short yt-dlp diagnostic tail on failure."""
     pattern = re.compile(r"UVT_PROGRESS:\s*([0-9]+(?:[.,][0-9]+)?)%")
+    ansi = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
     def on_line(line: str) -> None:
         match = pattern.search(line)
         if match is None:
+            if diagnostics is not None:
+                clean = ansi.sub("", line).strip()
+                if clean:
+                    diagnostics.append(clean[:800])
+                    del diagnostics[:-8]
             return
         try:
             percent = float(match.group(1).replace(",", "."))
@@ -283,7 +483,7 @@ async def _download_page(
     page_url: str, dest_dir: Path, *, progress: _ProgressCallback | None = None
 ) -> Path:
     """Скачивает ролик по адресу страницы через yt-dlp (асинхронно, убиваемо)."""
-    from uvt.dub import _find_ytdlp
+    from uvt.dub import _find_ytdlp, _ytdlp_js_args
 
     ytdlp = _find_ytdlp()
     if ytdlp is None:
@@ -291,33 +491,87 @@ async def _download_page(
     log.info("скачиваю ролик через yt-dlp…")
     if progress is not None:
         progress(0.0, "подключаюсь к странице через yt-dlp…")
-    cmd = [
-        ytdlp,
-        # Серверу нужен только звук: сначала отдельная original-дорожка, затем
-        # любой audio-only формат. Если у сайта только muxed-видео, берём
-        # наименьший аудио-содержащий вариант, а не максимальное качество.
-        "--no-playlist",
-        "--no-color",
-        "-f", _YT_DLP_AUDIO_SELECTOR,
-        "--progress-delta", "3",
-    ]
-    if progress is not None:
-        cmd += ["--progress-template", "download:UVT_PROGRESS:%(progress._percent_str)s"]
-    cmd += [
-        "-o", str(dest_dir / "%(title).80s.%(ext)s"), page_url,
-    ]
+    def build_command(extra_args: list[str] | None = None) -> list[str]:
+        cmd = [
+            ytdlp,
+            "--ignore-config",
+            *_ytdlp_js_args(),
+            *(extra_args or []),
+            # Серверу нужен только звук: сначала отдельная original-дорожка,
+            # затем любой audio-only формат. Если у сайта только muxed-видео,
+            # берём наименьший аудио-содержащий вариант.
+            "--no-playlist",
+            "--no-color",
+            "-f", _YT_DLP_AUDIO_SELECTOR,
+            "--progress-delta", "3",
+        ]
+        if progress is not None:
+            cmd += ["--progress-template", "download:UVT_PROGRESS:%(progress._percent_str)s"]
+        cmd += ["-o", str(dest_dir / "%(title).80s.%(ext)s"), page_url]
+        return cmd
+
+    async def run_attempt(
+        diagnostics: list[str], extra_args: list[str] | None = None
+    ) -> None:
+        callback = progress or (lambda _fraction, _detail: None)
+        await _run_process(
+            build_command(extra_args),
+            1800,
+            "yt-dlp",
+            on_line=_yt_dlp_progress_parser(callback, diagnostics),
+        )
+
+    files_before = set(dest_dir.iterdir())
+    diagnostics: list[str] = []
+    failure: RuntimeError | None = None
     try:
-        if progress is None:
-            await _run_process(cmd, 1800, "yt-dlp")
-        else:
-            await _run_process(cmd, 1800, "yt-dlp", on_line=_yt_dlp_progress_parser(progress))
+        await run_attempt(diagnostics)
     except RuntimeError as exc:
+        failure = exc
+
+    diagnostic_text = "\n".join(diagnostics).lower()
+    host = (urlsplit(page_url).hostname or "").lower()
+    is_youtube = (
+        host in {"youtu.be", "youtube.com", "youtube-nocookie.com"}
+        or host.endswith(".youtube.com")
+        or host.endswith(".youtube-nocookie.com")
+    )
+    retry_android = failure is not None and is_youtube and any(
+        marker in diagnostic_text
+        for marker in ("http error 403", "unable to download video data", "sabr")
+    )
+    if retry_android:
+        for path in dest_dir.iterdir():
+            if path not in files_before and (path.is_file() or path.is_symlink()):
+                path.unlink(missing_ok=True)
+        log.info(
+            "YouTube не отдал отдельный аудиопоток — повторяю через совместимый android-клиент"
+        )
+        if progress is not None:
+            progress(0.0, "YouTube не отдал отдельный звук; пробую совместимый поток…")
+        diagnostics = []
+        try:
+            await run_attempt(diagnostics, _YT_DLP_YOUTUBE_ANDROID_ARGS)
+            failure = None
+        except RuntimeError as exc:
+            failure = exc
+
+    if failure is not None:
+        reason = next(
+            (line for line in reversed(diagnostics) if "ERROR:" in line),
+            diagnostics[-1] if diagnostics else "",
+        )
+        detail = f" Причина yt-dlp: {reason}" if reason else ""
         raise RuntimeError(
-            f"yt-dlp не поддержал или не смог скачать {page_url}. UVT не обходит "
+            f"yt-dlp не поддержал или не смог скачать {page_url}.{detail} UVT не обходит "
             "авторизацию, DRM и ограничения сайта; используйте законно сохранённый "
             "локальный файл или публичную ссылку поддерживаемого сервиса."
-        ) from exc
-    files = sorted(dest_dir.iterdir(), key=lambda p: p.stat().st_size, reverse=True)
+        ) from failure
+    files = sorted(
+        (path for path in dest_dir.iterdir() if path.is_file()),
+        key=lambda p: p.stat().st_size,
+        reverse=True,
+    )
     if not files:
         raise RuntimeError("yt-dlp ничего не скачал")
     if progress is not None:
@@ -408,18 +662,87 @@ class Job:
     # резерв (или упасть, если пользователь откажет).
     approval_kind: str | None = None
     approval_cause: str | None = None
+    profile_name: str = ""
+    engines: dict[str, str] = field(default_factory=dict)
 
 
 class DubServer:
-    def __init__(self, cfg: AppConfig) -> None:
-        self.cfg = cfg
+    def __init__(
+        self,
+        cfg: AppConfig,
+        *,
+        route_label: str = "UVT",
+        profile_name: str = "configured",
+        listen_port: int | None = None,
+        selectable_profiles: dict[str, AppConfig] | None = None,
+        dashboard_routes: list[dict[str, object]] | None = None,
+        settings_store: ServerSettingsStore | None = None,
+        settings_key: str | None = None,
+    ) -> None:
+        self._base_cfg = cfg.model_copy(deep=True)
+        self.route_label = route_label
+        self._base_profile_name = profile_name
+        self.listen_port = listen_port
+        self.dashboard_routes = [dict(item) for item in (dashboard_routes or [])]
+        self._profile_configs = {
+            str(name): profile.model_copy(deep=True)
+            for name, profile in (selectable_profiles or {}).items()
+        }
+        self._profile_configs.setdefault(profile_name, cfg.model_copy(deep=True))
+        self.settings_store = settings_store or ServerSettingsStore.memory()
+        self.settings_key = settings_key or settings_route_key(route_label)
+        self._settings_kind = settings_kind(
+            self._base_cfg, selectable_profiles=bool(selectable_profiles)
+        )
+        settings_entry = self.settings_store.get_entry(self.settings_key)
+        self._settings_revision = int(settings_entry["revision"])
+        self._settings_saved = bool(settings_entry["saved"])
+        self._settings_load_error = self.settings_store.load_error
+        persisted = settings_entry.get("settings")
+        if isinstance(persisted, dict):
+            try:
+                persisted = normalize_settings(
+                    persisted,
+                    current=effective_settings(
+                        self._base_cfg,
+                        kind=self._settings_kind,
+                        profile_name=self._base_profile_name,
+                    ),
+                    kind=self._settings_kind,
+                    profile_ids=set(self._profile_configs),
+                    local_voices=self._voice_catalog(self._base_cfg),
+                )
+            except ValueError as exc:
+                self._settings_saved = False
+                self._settings_load_error = f"сохранённые настройки не применены: {exc}"
+                persisted = None
+        self.cfg, self.profile_name = apply_settings(
+            self._base_cfg,
+            persisted if isinstance(persisted, dict) else None,
+            kind=self._settings_kind,
+            base_profile_name=self._base_profile_name,
+            profiles=self._profile_configs,
+        )
+        if self._settings_saved and isinstance(persisted, dict):
+            try:
+                self._validate_piper_voice_support(self.cfg)
+                self._validate_stt_language_support(self.cfg)
+            except ValueError as exc:
+                self.cfg = self._base_cfg.model_copy(deep=True)
+                self.profile_name = self._base_profile_name
+                self._settings_saved = False
+                self._settings_load_error = (
+                    f"сохранённые настройки не применены: {exc}"
+                )
         # Пустое значение сохраняет localhost DX без обязательной настройки.
         # На удалённом личном сервере задайте UVT_API_TOKEN: тогда API нельзя
         # вызвать с чужой страницы без токена из userscript.
         self.api_token = os.environ.get("UVT_API_TOKEN", "").strip()
         self.jobs: dict[str, Job] = {}
+        self._job_configs: dict[str, AppConfig] = {}
         self.audio_dir = _cache_dir()
         self._lock = asyncio.Lock()
+        self._settings_lock = asyncio.Lock()
         # (источник, языки) → id задачи: повторное нажатие кнопки не пересчитывает
         self._job_cache: dict[tuple, str] = {}
         self._tasks: dict[str, asyncio.Task] = {}
@@ -437,14 +760,260 @@ class DubServer:
         self._download_last_log_at: dict[str, float] = {}
         # Открытые запросы апрува на переход к локальному резерву, по job id.
         self._approval_gates: dict[str, ApprovalGate] = {}
+        self._preview_cache: dict[tuple[str, ...], bytes] = {}
+        self._provider_voice_cache: tuple[float, list[dict[str, str]]] | None = None
+        # Shipped Apple-Silicon routes preload only their first heavy stage.
+        # Translation remains lazy so two GPU models are never resident during
+        # the same dubbing stage on a 16 GB machine.
+        local_stt = str(self.cfg.stt.engine) in {"parakeet-mlx", "mlx-whisper"}
+        self._model_readiness: dict[str, object] = {
+            "status": "pending" if local_stt else "not-applicable",
+            "detail": (
+                "локальная модель распознавания ещё не загружена"
+                if local_stt
+                else "для этого маршрута локальный MLX STT не используется"
+            ),
+        }
+        self._prepared_stt: STTEngine | None = None
+        self._prepare_stt_task: asyncio.Task | None = None
+        self._prepare_stt_lock = asyncio.Lock()
+        self._local_preflight_done = False
+        self._profile_setup_readiness: dict[str, dict[str, object]] = {}
         # Аудио запрашивается тегом <audio>, куда нельзя положить заголовок.
         # Поэтому готовая дорожка получает отдельный непредсказуемый токен;
         # основной API-токен в URL дорожки не попадает.
         self._audio_access_tokens: dict[str, str] = {}
         self._cleanup_audio_cache()
 
+    def _record_local_preflight(self, report: dict[str, object]) -> None:
+        """Derive per-profile installed state from one offline ``all`` check."""
+        from uvt.setup_local import LOCAL_SETUP_PRESETS, preset_for_profile
+
+        model_statuses = dict(report.get("models", {}) or {})
+        piper_status = dict(report.get("piper", {}) or {})
+        report_ready = bool(report.get("ready"))
+        piper_ready = bool(piper_status.get("ready", report_ready))
+        for name, cfg in self._profile_configs.items():
+            preset_name = preset_for_profile(cfg)
+            if preset_name is None:
+                continue
+            required = LOCAL_SETUP_PRESETS[preset_name].model_keys
+            if model_statuses:
+                missing = [
+                    key
+                    for key in required
+                    if not bool(dict(model_statuses.get(key, {}) or {}).get("ready"))
+                ]
+                installed = piper_ready and not missing
+                if not piper_ready:
+                    missing.append("piper")
+            else:
+                # Small plugin/test reports may only expose the aggregate bit.
+                installed = report_ready
+                missing = [] if installed else [preset_name]
+            self._profile_setup_readiness[name] = {
+                "installed": installed,
+                "preset": preset_name,
+                "missing": missing,
+                "detail": (
+                    "модели установлены"
+                    if installed
+                    else "не установлено: " + ", ".join(missing)
+                ),
+            }
+
+    def _require_profile_ready(self, profile_name: str) -> None:
+        readiness = self._profile_setup_readiness.get(profile_name)
+        prepare_task = self._prepare_stt_task
+        if readiness is None and prepare_task is not None and not prepare_task.done():
+            raise ValueError(
+                f"профиль '{profile_name}' ещё проверяет локальные модели; "
+                "дождитесь статуса 'готов' и повторите"
+            )
+        readiness_status = str(self._model_readiness.get("status") or "")
+        readiness_phase = str(self._model_readiness.get("phase") or "")
+        if readiness is None and readiness_status == "error":
+            raise ValueError(
+                f"профиль '{profile_name}' не прошёл локальную проверку: "
+                f"{self._model_readiness.get('detail') or 'неизвестная ошибка'}"
+            )
+        if readiness is not None and readiness.get("installed") is False:
+            preset = str(readiness.get("preset") or profile_name.removeprefix("local-"))
+            raise ValueError(
+                f"профиль '{profile_name}' не подготовлен: "
+                f"{readiness.get('detail')}; выполните "
+                f"uvt setup-mac-local --preset {preset} и перезапустите сервер"
+            )
+        selected = self._profile_configs.get(profile_name)
+        if (
+            readiness_status == "error"
+            and readiness_phase == "preload"
+            and selected is not None
+            and self._stt_signature(selected) == self._stt_signature(self.cfg)
+        ):
+            raise ValueError(
+                f"профиль '{profile_name}' не загрузил локальное распознавание: "
+                f"{self._model_readiness.get('detail') or 'неизвестная ошибка'}"
+            )
+
+    async def prepare_local_models(self) -> None:
+        """Offline-preflight the route and keep its first STT model warm."""
+        if str(self.cfg.stt.engine) not in {"parakeet-mlx", "mlx-whisper"}:
+            return
+
+        async with self._prepare_stt_lock:
+            if self._prepared_stt is not None:
+                return
+            self._model_readiness = {
+                "status": "checking",
+                "detail": "проверяю pinned-модели и локальные голоса без сети",
+            }
+
+            error_phase = "preflight"
+            try:
+                from uvt.setup_local import (
+                    format_setup_report,
+                    preflight_mac_local,
+                    preset_for_profile,
+                )
+
+                if not self._local_preflight_done:
+                    preset = preset_for_profile(self.cfg)
+                    if preset is not None:
+                        selectable_presets = {
+                            preset_for_profile(profile)
+                            for profile in self._profile_configs.values()
+                        }
+                        check_preset = "all" if len(selectable_presets - {None}) > 1 else preset
+                        report = await asyncio.to_thread(
+                            preflight_mac_local, check_preset
+                        )
+                        self._record_local_preflight(report)
+                        self._local_preflight_done = True
+                        current = self._profile_setup_readiness.get(self.profile_name)
+                        if current is not None and current.get("installed") is False:
+                            raise RuntimeError(str(current.get("detail")))
+                        if current is None and not report.get("ready"):
+                            raise RuntimeError(format_setup_report(report))
+                    self._local_preflight_done = True
+
+                error_phase = "preload"
+                self._model_readiness = {
+                    "status": "loading",
+                    "detail": f"загружаю {self.cfg.stt.engine} в Metal",
+                }
+                engine = create_stt_engine(self.cfg)
+                try:
+                    await engine.warmup()
+                except BaseException:
+                    await engine.close()
+                    raise
+            except asyncio.CancelledError:
+                self._model_readiness = {
+                    "status": "cancelled",
+                    "detail": "подготовка локальной модели остановлена",
+                }
+                raise
+            except Exception as exc:  # noqa: BLE001 - visible startup readiness
+                detail = " ".join(str(exc).split())
+                self._model_readiness = {
+                    "status": "error",
+                    "phase": error_phase,
+                    "detail": detail,
+                }
+                log.error(
+                    "локальный маршрут %s/%s не готов: %s",
+                    self.route_label,
+                    self.profile_name,
+                    detail,
+                )
+                return
+
+            self._prepared_stt = engine
+            self._model_readiness = {
+                "status": "ready",
+                "detail": f"{self.cfg.stt.engine} загружен; остальные модели включатся по этапам",
+            }
+            log.info(
+                "локальный маршрут %s/%s готов: %s",
+                self.route_label,
+                self.profile_name,
+                self._model_readiness["detail"],
+            )
+
+    def schedule_local_model_prepare(self) -> None:
+        """Re-warm STT while the server is idle after a completed job."""
+        if str(self.cfg.stt.engine) not in {"parakeet-mlx", "mlx-whisper"}:
+            return
+        if self._prepared_stt is not None:
+            return
+        if self._model_readiness.get("status") == "error":
+            return
+        if any(
+            job.status in {"queued", "running", "awaiting_approval"}
+            for job in self.jobs.values()
+        ):
+            return
+        if self._prepare_stt_task is not None and not self._prepare_stt_task.done():
+            return
+        self._prepare_stt_task = asyncio.create_task(
+            self.prepare_local_models(),
+            name=f"uvt-preload-{self.profile_name}",
+        )
+
+    @staticmethod
+    def _stt_signature(cfg: AppConfig) -> tuple[str, str, str]:
+        return (
+            str(cfg.stt.engine),
+            str(getattr(cfg.stt, "model", "") or ""),
+            str(getattr(cfg.stt, "revision", "") or ""),
+        )
+
+    async def take_prepared_stt(self, cfg: AppConfig | None = None) -> STTEngine | None:
+        """Transfer the idle preloaded STT engine to one render stage."""
+        task = self._prepare_stt_task
+        if task is not None and not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - prepare records its own error
+                pass
+        async with self._prepare_stt_lock:
+            engine = self._prepared_stt
+            requested_cfg = cfg or self.cfg
+            if engine is not None and self._stt_signature(requested_cfg) != self._stt_signature(self.cfg):
+                # M4/16 GB: do not retain the default Parakeet while a quality
+                # job loads Whisper. The default model is warmed again later.
+                self._prepared_stt = None
+                await engine.close()
+                self._model_readiness = {
+                    "status": "on-demand",
+                    "detail": f"{requested_cfg.stt.engine} загрузится для выбранного профиля",
+                }
+                return None
+            if engine is not None:
+                self._prepared_stt = None
+                self._model_readiness = {
+                    "status": "in-use",
+                    "detail": f"{requested_cfg.stt.engine} распознаёт текущую задачу",
+                }
+            return engine
+
+    async def close_prepared_models(self) -> None:
+        """Drain startup worker and release an idle preloaded model on shutdown."""
+        task = self._prepare_stt_task
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        async with self._prepare_stt_lock:
+            engine = self._prepared_stt
+            self._prepared_stt = None
+            if engine is not None:
+                await engine.close()
+
     def _cleanup_audio_cache(self, max_age_days: float = 7.0) -> None:
-        """Дорожки старше недели из ~/.cache/uvt/serve удаляются при старте."""
+        """Remove old rendered tracks and shared browser sources on startup."""
         cutoff = time.time() - max_age_days * 86400
         removed = 0
         for file in self.audio_dir.glob("*.m4a"):
@@ -457,18 +1026,431 @@ class DubServer:
                 continue
         if removed:
             log.info("кэш дорожек: удалено %d старых файлов", removed)
+        source_removed = 0
+        source_dir = self.audio_dir / "sources"
+        if source_dir.is_dir():
+            for file in source_dir.iterdir():
+                try:
+                    if file.is_file() and file.stat().st_mtime < cutoff:
+                        file.unlink()
+                        source_removed += 1
+                except OSError:
+                    continue
+        if source_removed:
+            log.info("кэш исходного звука: удалено %d старых файлов", source_removed)
 
-    def _cache_key(self, data: dict) -> tuple:
+    def _cached_source(self, cache_key: str) -> Path | None:
+        source_dir = self.audio_dir / "sources"
+        if not source_dir.is_dir():
+            return None
+        for path in source_dir.glob(f"{cache_key}.*"):
+            try:
+                if path.is_file() and path.stat().st_size > 0:
+                    os.utime(path, None)
+                    return path
+            except OSError:
+                continue
+        return None
+
+    def _store_cached_source(self, cache_key: str, source: Path) -> Path:
+        """Atomically persist one downloaded source for every personal route."""
+        source_dir = self.audio_dir / "sources"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        suffix = source.suffix.lower()
+        if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
+            suffix = ".media"
+        destination = source_dir / f"{cache_key}{suffix}"
+        temporary = source_dir / f".{cache_key}-{uuid.uuid4().hex}.part"
+        try:
+            shutil.copy2(source, temporary)
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return destination
+
+    @staticmethod
+    def _voice_catalog(cfg: AppConfig) -> list[dict[str, object]]:
+        voice_models = dict(getattr(cfg.tts, "voice_models", {}) or {})
+        voice_dir = Path(
+            str(getattr(cfg.tts, "voice_dir", "") or "~/.local/share/uvt/piper")
+        ).expanduser()
+        voices: list[dict[str, object]] = []
+        for raw_key, raw_model in voice_models.items():
+            key = str(raw_key).lower()
+            if ":" not in key:
+                continue
+            language, gender = key.split(":", 1)
+            if gender not in {"male", "female"}:
+                continue
+            model_path = Path(str(raw_model)).expanduser()
+            if not model_path.is_absolute():
+                model_path = voice_dir / model_path
+            voice_id = model_path.stem
+            quality = voice_id.rsplit("-", 1)[-1]
+            voices.append(
+                {
+                    "id": voice_id,
+                    "label": _VOICE_LABELS.get(voice_id, voice_id),
+                    "language": language,
+                    "gender": gender,
+                    "quality": quality,
+                    "engine": str(cfg.tts.engine),
+                    "installed": model_path.is_file() and Path(f"{model_path}.json").is_file(),
+                }
+            )
+        return sorted(voices, key=lambda item: (str(item["language"]), str(item["gender"])))
+
+    @classmethod
+    def _compatible_voices(cls, cfg: AppConfig) -> list[dict[str, object]]:
+        target_root = str(cfg.target_lang or "").replace("_", "-").split("-", 1)[0].lower()
+        return [
+            voice
+            for voice in cls._voice_catalog(cfg)
+            if voice["language"] == target_root and voice["installed"] is True
+        ]
+
+    @classmethod
+    def _validate_piper_voice_support(cls, cfg: AppConfig) -> None:
+        if str(cfg.tts.engine) != "piper":
+            return
+        catalog = cls._voice_catalog(cfg)
+        # Legacy/custom single-model Piper configs do not have the structured
+        # language:gender catalog and keep their existing runtime validation.
+        if not catalog:
+            return
+        compatible = cls._compatible_voices(cfg)
+        requested_voice = str(getattr(cfg.tts, "voice_id", "") or "")
+        if requested_voice:
+            if not any(voice["id"] == requested_voice for voice in compatible):
+                raise ValueError(f"голос '{requested_voice}' не установлен")
+            return
+        gender = str(getattr(cfg.tts, "voice_gender", "auto") or "auto")
+        required = {"male", "female"} if gender == "auto" else {gender}
+        available = {str(voice["gender"]) for voice in compatible}
+        missing = sorted(required - available)
+        if missing:
+            target = str(cfg.target_lang or "").lower()
+            raise ValueError(
+                f"для языка '{target}' нет установленного Piper-голоса "
+                f"({', '.join(missing)}); добавьте его в tts.voice_models "
+                "или выберите GPT/ElevenLabs"
+            )
+
+    @staticmethod
+    def _validate_stt_language_support(cfg: AppConfig) -> None:
+        if str(cfg.stt.engine) != "parakeet-mlx":
+            return
+        source = (
+            str(cfg.source_lang or "auto")
+            .replace("_", "-")
+            .split("-", 1)[0]
+            .lower()
+        )
+        if source not in PARAKEET_LANGUAGE_IDS:
+            raise ValueError(
+                "Parakeet не поддерживает выбранный язык; выберите один из 25 "
+                "европейских языков или профиль «Качество» (Whisper)"
+            )
+
+    def _config_for_request(self, data: dict) -> tuple[AppConfig, str]:
+        mode = str(data.get("settings_mode") or "legacy").strip().lower()
+        if mode not in {"legacy", "server", "override"}:
+            raise ValueError("settings_mode должен быть server или override")
+        # A saved dashboard choice is authoritative for old userscript builds
+        # too.  Explicit per-video overrides remain possible in v0.15+.
+        if mode == "server" or (mode == "legacy" and self._settings_saved):
+            return self.cfg.model_copy(deep=True), self.profile_name
+
+        requested_profile = str(
+            data.get("profile_id") or data.get("profile") or self.profile_name
+        )
+        if self._settings_kind != "local":
+            requested_profile = self.profile_name
+        base = self._profile_configs.get(requested_profile)
+        if self._settings_kind != "local":
+            base = self.cfg
+        elif base is None:
+            allowed = ", ".join(self._profile_configs)
+            raise ValueError(
+                f"профиль '{requested_profile}' недоступен; выберите: {allowed}"
+            )
+
+        cfg = base.model_copy(deep=True)
+        if data.get("source_lang"):
+            cfg.source_lang = str(data["source_lang"])
+        if data.get("target_lang"):
+            cfg.target_lang = str(data["target_lang"])
+
+        gender = str(data.get("voice_gender") or cfg.tts.voice_gender or "auto").lower()
+        if gender not in _VOICE_GENDERS:
+            raise ValueError("voice_gender должен быть auto, male или female")
+        cfg.tts.voice_gender = gender
+
+        if self._settings_kind == "local":
+            requested_voice = (
+                str(data.get("voice_id") or "").strip()
+                if "voice_id" in data
+                else str(getattr(cfg.tts, "voice_id", "") or "").strip()
+            ) or None
+            cfg.tts.voice_id = requested_voice
+            if requested_voice:
+                voice = next(
+                    (item for item in self._voice_catalog(cfg) if item["id"] == requested_voice),
+                    None,
+                )
+                if voice is None:
+                    raise ValueError(f"голос '{requested_voice}' недоступен")
+                if voice["installed"] is not True:
+                    raise ValueError(f"голос '{requested_voice}' не установлен")
+                target_root = cfg.target_lang.replace("_", "-").split("-", 1)[0].lower()
+                if voice["language"] != target_root:
+                    raise ValueError(
+                        f"голос '{requested_voice}' не подходит для языка '{cfg.target_lang}'"
+                    )
+                cfg.tts.voice_gender = str(voice["gender"])
+        elif self._settings_kind in {"openai", "elevenlabs"}:
+            setting_fields = {
+                name: data[name]
+                for name in (
+                    "source_lang",
+                    "target_lang",
+                    "voice_gender",
+                    "stt_model",
+                    "translation_model",
+                    "tts_model",
+                    "tts_voice",
+                )
+                if name in data
+            }
+            normalized = normalize_settings(
+                setting_fields,
+                current=effective_settings(
+                    cfg, kind=self._settings_kind, profile_name=self.profile_name
+                ),
+                kind=self._settings_kind,
+                profile_ids=set(self._profile_configs),
+                local_voices=[],
+            )
+            cfg, _ = apply_settings(
+                cfg,
+                normalized,
+                kind=self._settings_kind,
+                base_profile_name=self.profile_name,
+                profiles=self._profile_configs,
+            )
+        return cfg, requested_profile
+
+    def _profile_catalog(self) -> list[dict[str, object]]:
+        catalog: list[dict[str, object]] = []
+        for name, cfg in self._profile_configs.items():
+            engines = {
+                "stt": str(cfg.stt.engine),
+                "translation": str(cfg.translation.engine),
+                "tts": str(cfg.tts.engine),
+            }
+            catalog.append(
+                {
+                    "id": name,
+                    "label": _LOCAL_PROFILE_LABELS.get(name, name),
+                    "engines": engines,
+                    "loaded": (
+                        self._stt_signature(cfg) == self._stt_signature(self.cfg)
+                        and self._model_readiness.get("status") == "ready"
+                    ),
+                    "stt_loaded": (
+                        self._stt_signature(cfg) == self._stt_signature(self.cfg)
+                        and self._model_readiness.get("status") == "ready"
+                    ),
+                    "installed": self._profile_setup_readiness.get(name, {}).get(
+                        "installed"
+                    ),
+                    "setup_preset": self._profile_setup_readiness.get(name, {}).get(
+                        "preset"
+                    ),
+                    "source_languages": (
+                        sorted(PARAKEET_LANGUAGE_IDS)
+                        if str(cfg.stt.engine) == "parakeet-mlx"
+                        else []
+                    ),
+                }
+            )
+        return catalog
+
+    def _has_active_jobs(self) -> bool:
+        return self._lock.locked() or any(
+            job.status in {"queued", "running", "awaiting_approval"}
+            for job in self.jobs.values()
+        )
+
+    def _provider_status(self, cfg: AppConfig | None = None) -> list[dict[str, object]]:
+        cfg = cfg or self.cfg
+        providers: list[dict[str, object]] = []
+        seen: set[str] = set()
+        sections: list[tuple[str, object]] = []
+        if str(cfg.stt.engine) == "openai-compatible" and not self._is_local_endpoint(
+            str(getattr(cfg.stt, "base_url", "") or "")
+        ):
+            sections.append(("OpenAI STT", cfg.stt))
+        if (
+            str(cfg.translation.engine) == "openai-compatible"
+            and not self._is_local_endpoint(
+                str(getattr(cfg.translation, "base_url", "") or "")
+            )
+        ):
+            sections.append(("OpenAI / GPT", cfg.translation))
+        if str(cfg.tts.engine) in {"openai", "elevenlabs"}:
+            sections.append(
+                (
+                    "OpenAI TTS"
+                    if str(cfg.tts.engine) == "openai"
+                    else "ElevenLabs",
+                    cfg.tts,
+                )
+            )
+        for label, section in sections:
+            env_name = str(getattr(section, "api_key_env", "") or "").strip()
+            if not env_name or env_name in seen:
+                continue
+            seen.add(env_name)
+            providers.append(
+                {
+                    "label": label,
+                    "env": env_name,
+                    "configured": bool(os.environ.get(env_name, "").strip()),
+                }
+            )
+        return providers
+
+    def _settings_payload(self) -> dict[str, object]:
+        voices = self._voice_catalog(self.cfg) if self._settings_kind == "local" else []
+        profiles = self._profile_catalog() if self._settings_kind == "local" else []
+        effective = effective_settings(
+            self.cfg, kind=self._settings_kind, profile_name=self.profile_name
+        )
+        defaults = effective_settings(
+            self._base_cfg,
+            kind=self._settings_kind,
+            profile_name=self._base_profile_name,
+        )
+        return {
+            "api_version": 1,
+            "route": {
+                "id": self.settings_key,
+                "label": self.route_label,
+                "kind": self._settings_kind,
+                "profile": self.profile_name,
+                "port": self.listen_port,
+            },
+            "revision": self._settings_revision,
+            "saved": self._settings_saved,
+            "effective": effective,
+            "defaults": defaults,
+            "catalog": settings_catalog(
+                self.cfg,
+                kind=self._settings_kind,
+                profiles=profiles,
+                voices=voices,
+            ),
+            "engines": {
+                "stt": str(self.cfg.stt.engine),
+                "translation": str(self.cfg.translation.engine),
+                "tts": str(self.cfg.tts.engine),
+            },
+            "provider_status": self._provider_status(),
+            "can_save": not self._has_active_jobs(),
+            "warning": (
+                "файл сохранённых настроек не применён; подробности в терминале"
+                if self._settings_load_error
+                else None
+            ),
+            "notice": "изменения применятся к следующему переводу",
+        }
+
+    def _dashboard_request_allowed(self, request) -> bool:
+        if self.api_token:
+            return self._request_has_api_token(request)
+        remote = str(request.remote or "").strip()
+        if remote and not _is_loopback_host(remote):
+            return False
+        origin = request.headers.get("Origin")
+        if not origin:
+            return True
+        try:
+            parsed = urlparse(origin)
+        except ValueError:
+            return False
+        return (
+            parsed.scheme in {"http", "https"}
+            and bool(parsed.hostname)
+            and _is_loopback_host(str(parsed.hostname))
+        )
+
+    async def _apply_effective_settings(
+        self, settings: dict[str, object] | None
+    ) -> None:
+        cfg, profile_name = apply_settings(
+            self._base_cfg,
+            settings,
+            kind=self._settings_kind,
+            base_profile_name=self._base_profile_name,
+            profiles=self._profile_configs,
+        )
+        self._validate_piper_voice_support(cfg)
+        self._validate_stt_language_support(cfg)
+        stt_changed = self._stt_signature(cfg) != self._stt_signature(self.cfg)
+        if stt_changed:
+            try:
+                await self.close_prepared_models()
+            except Exception as exc:  # noqa: BLE001 - settings must stay disk/runtime consistent
+                log.warning(
+                    "не удалось корректно закрыть прежнюю STT-модель: %s",
+                    type(exc).__name__,
+                )
+            self._prepare_stt_task = None
+        self.cfg = cfg
+        self.profile_name = profile_name
+        self._preview_cache.clear()
+        if stt_changed and str(cfg.stt.engine) in {"parakeet-mlx", "mlx-whisper"}:
+            self._model_readiness = {
+                "status": "pending",
+                "detail": f"готовлю {cfg.stt.engine} для новых задач",
+            }
+            self.schedule_local_model_prepare()
+
+    @staticmethod
+    def _expected_revision(payload: dict[str, object]) -> int:
+        value = payload.get("revision")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("передайте целочисленную revision из GET /settings")
+        return value
+
+    def _cache_key(
+        self,
+        data: dict,
+        resolved: tuple[AppConfig, str] | None = None,
+    ) -> tuple:
         source = data.get("page_url") or data.get("media_url") or data.get("file") or ""
         # Отсутствующий выбор должен значить текущий auto/manual маршрут
         # профиля, а не старый неявный male. Иначе запрос без voice_gender
         # мог получить из кэша дорожку, созданную с явным male voice.
-        voice_gender = data.get("voice_gender") or self.cfg.tts.voice_gender or "auto"
+        cfg, profile_name = resolved or self._config_for_request(data)
+        self._require_profile_ready(profile_name)
+        self._validate_piper_voice_support(cfg)
+        self._validate_stt_language_support(cfg)
         return (
             str(source),
-            str(data.get("source_lang") or "auto"),
-            str(data.get("target_lang") or self.cfg.target_lang),
-            str(voice_gender),
+            str(cfg.source_lang),
+            str(cfg.target_lang),
+            str(cfg.stt.engine),
+            str(getattr(cfg.stt, "model", "") or ""),
+            str(cfg.translation.engine),
+            str(getattr(cfg.translation, "model", "") or ""),
+            str(cfg.tts.engine),
+            str(getattr(cfg.tts, "model", "") or ""),
+            str(getattr(cfg.tts, "voice", "") or ""),
+            str(cfg.tts.voice_gender),
+            str(cfg.tts.voice_id or ""),
+            profile_name,
         )
 
     def _request_has_api_token(self, request) -> bool:
@@ -616,8 +1598,14 @@ class DubServer:
             else None
         )
         local_engines = {
-            "stt": {"faster-whisper", "mlx-whisper", "dummy"},
-            "translation": {"none", "passthrough", "dummy"},
+            "stt": {"faster-whisper", "mlx-whisper", "parakeet-mlx", "dummy"},
+            "translation": {
+                "nllb-ct2",
+                "translategemma-mlx",
+                "none",
+                "passthrough",
+                "dummy",
+            },
             "tts": {"kokoro", "piper", "dummy", "none"},
         }
         cloud_engines = {
@@ -638,8 +1626,11 @@ class DubServer:
             item["endpoint"] = endpoint
         return item
 
-    def _metadata(self, cfg: AppConfig | None = None) -> dict:
+    def _metadata(
+        self, cfg: AppConfig | None = None, profile_name: str | None = None
+    ) -> dict:
         cfg = cfg or self.cfg
+        selected_profile = profile_name or self.profile_name
         engines = [
             self._engine_metadata("stt", cfg.stt),
             self._engine_metadata("translation", cfg.translation),
@@ -656,23 +1647,70 @@ class DubServer:
             profile_kind = "unknown"
         else:
             profile_kind = "local"
-        local_host = self.listen_host in {"localhost", "127.0.0.1", "::1"}
+        local_host = _is_loopback_host(self.listen_host)
+        compatible_voices = self._compatible_voices(cfg)
+        installed_voice_languages = sorted(
+            {
+                str(voice["language"])
+                for voice in self._voice_catalog(cfg)
+                if voice["installed"] is True
+            }
+        )
+        tts_engine = str(cfg.tts.engine)
+        selectable_tts = bool(compatible_voices) if tts_engine == "piper" else tts_engine in {
+            "openai",
+            "elevenlabs",
+        }
+        selected_setup = self._profile_setup_readiness.get(selected_profile)
+        if selected_setup is not None and selected_setup.get("installed") is False:
+            selected_readiness: dict[str, object] = {
+                "status": "missing",
+                "detail": (
+                    f"{selected_setup.get('detail')}; выполните "
+                    f"uvt setup-mac-local --preset {selected_setup.get('preset')}"
+                ),
+            }
+        elif self._stt_signature(cfg) == self._stt_signature(self.cfg):
+            selected_readiness = dict(self._model_readiness)
+        else:
+            selected_readiness = {
+                "status": "on-demand",
+                "detail": f"{cfg.stt.engine} загрузится при запуске этого профиля",
+            }
         return {
-            "api_version": 1,
+            "api_version": 2,
             "mode": "batch",
             "capabilities": {
                 "batch_dubbing": True,
                 "live_translation": False,
                 "streaming_audio": False,
+                "profile_selection": len(self._profile_configs) > 1,
+                "voice_selection": selectable_tts,
+                "tts_preview": selectable_tts,
             },
             "profile": {
-                # Имя YAML-профиля до AppConfig не доходит, поэтому не
-                # угадываем free/cloud: показываем реальную конфигурацию.
-                "name": "configured",
+                "name": selected_profile,
                 "kind": profile_kind,
                 "source_lang": cfg.source_lang,
                 "target_lang": cfg.target_lang,
                 "engines": {item["kind"]: item["engine"] for item in engines},
+            },
+            "route": {
+                "label": self.route_label,
+                "profile": selected_profile,
+                "port": self.listen_port,
+            },
+            "model_readiness": selected_readiness,
+            "defaults": {
+                "profile_id": self.profile_name,
+                "voice_gender": str(self.cfg.tts.voice_gender or "auto"),
+                "voice_id": getattr(self.cfg.tts, "voice_id", None),
+            },
+            "profiles": self._profile_catalog(),
+            "voices": self._voice_catalog(cfg),
+            "limits": {
+                "preview_text_chars": _PREVIEW_MAX_CHARS,
+                "local_tts_languages": installed_voice_languages,
             },
             "privacy": {
                 "server_scope": "localhost" if local_host else "network",
@@ -691,14 +1729,8 @@ class DubServer:
 
     def _metadata_for_request(self, data: dict) -> dict:
         """Отражает выбранные языки конкретной кнопки, не только дефолт сервера."""
-        cfg = self.cfg.model_copy(deep=True)
-        if data.get("source_lang"):
-            cfg.source_lang = str(data["source_lang"])
-        if data.get("target_lang"):
-            cfg.target_lang = str(data["target_lang"])
-        if data.get("voice_gender"):
-            cfg.tts.voice_gender = str(data["voice_gender"])
-        return self._metadata(cfg)
+        cfg, profile_name = self._config_for_request(data)
+        return self._metadata(cfg, profile_name)
 
     def _queue_stats(self, job: Job) -> tuple[int | None, int, float | None]:
         """(позиция, задач впереди, оценка до готовности в секундах)."""
@@ -739,10 +1771,16 @@ class DubServer:
         queue_position, queue_ahead, eta_seconds = self._queue_stats(job)
         elapsed_from = job.started_at or job.created_at
         payload = asdict(job)
+        job_cfg = self._job_configs.get(
+            job.id, self._profile_configs.get(job.profile_name, self.cfg)
+        )
+        job_meta = self._metadata(job_cfg, job.profile_name or self.profile_name)
         payload.update(
             {
                 "mode": "batch",
                 "is_live": False,
+                "route": job_meta["route"],
+                "engines": job.engines or job_meta["profile"]["engines"],
                 "queue_position": queue_position,
                 "queue_ahead": queue_ahead,
                 "eta_seconds": eta_seconds,
@@ -856,7 +1894,56 @@ class DubServer:
             raise last_error
         raise RuntimeError("не передан ни адрес страницы, ни ссылка на поток, ни файл")
 
-    async def _run_job(self, job: Job, data: dict) -> None:
+    async def _resolve_cached_source(
+        self,
+        data: dict,
+        workdir: Path,
+        *,
+        progress: _ProgressCallback | None = None,
+    ) -> Path:
+        """Reuse downloaded source audio across Free, GPT and ElevenLabs jobs."""
+        cache_key = _source_cache_key(data)
+        if cache_key is None:
+            return await self._resolve_source(data, workdir, progress=progress)
+
+        cached = self._cached_source(cache_key)
+        if cached is not None:
+            detail = "исходный звук взят из общего кэша — повторно не скачиваю"
+            log.info("кэш исходного звука: использую %s", cached.name)
+            if progress is not None:
+                progress(1.0, detail)
+            return cached
+
+        lock = _SOURCE_CACHE_LOCKS.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            # Another route may have completed the download while this job was
+            # waiting for the shared key.
+            cached = self._cached_source(cache_key)
+            if cached is not None:
+                detail = "исходный звук взят из общего кэша — повторно не скачиваю"
+                log.info("кэш исходного звука: использую %s", cached.name)
+                if progress is not None:
+                    progress(1.0, detail)
+                return cached
+
+            source = await self._resolve_source(data, workdir, progress=progress)
+            cached = self._store_cached_source(cache_key, source)
+            log.info(
+                "исходный звук сохранён в общий кэш: %s (%.1f МБ)",
+                cached.name,
+                cached.stat().st_size / 1e6,
+            )
+            return cached
+
+    async def _run_job(
+        self,
+        job: Job,
+        data: dict,
+        cfg_snapshot: AppConfig | None = None,
+        profile_snapshot: str | None = None,
+    ) -> None:
+        handed_stt: STTEngine | None = None
+        stt_stage_started = False
         try:
             async with self._lock:  # по одной задаче: Whisper не параллелим
                 now = time.time()
@@ -864,13 +1951,12 @@ class DubServer:
                 job.started_at = now
                 job.updated_at = now
                 self._set_stage(job, "download")
-                cfg = self.cfg.model_copy(deep=True)
-                if data.get("target_lang"):
-                    cfg.target_lang = str(data["target_lang"])
-                if data.get("source_lang"):
-                    cfg.source_lang = str(data["source_lang"])  # "auto" — автоопределение
-                if data.get("voice_gender"):
-                    cfg.tts.voice_gender = str(data["voice_gender"])  # male | female
+                if cfg_snapshot is None:
+                    cfg, selected_profile = self._config_for_request(data)
+                else:
+                    cfg = cfg_snapshot.model_copy(deep=True)
+                    selected_profile = profile_snapshot or job.profile_name
+                job.profile_name = selected_profile
 
                 def on_progress(done: int, total: int) -> None:
                     self._set_render_progress(job, done, total)
@@ -884,7 +1970,7 @@ class DubServer:
                 self._approval_gates[job.id] = approval
 
                 with tempfile.TemporaryDirectory(prefix="uvt-serve-") as td:
-                    source = await self._resolve_source(
+                    source = await self._resolve_cached_source(
                         data,
                         Path(td),
                         progress=on_download_progress,
@@ -893,10 +1979,17 @@ class DubServer:
                     # for plugin/local sources that only return a path.
                     self._set_download_progress(job, 1.0, "исходный звук получен")
                     self._set_stage(job, "transcribe")
+                    stt_stage_started = True
+                    handed_stt = await self.take_prepared_stt(cfg)
                     # Для браузера — только голос перевода: оригинал играет сам
                     # плеер на странице (приглушённо), иначе звук двоится.
                     mixed, entries = await render_dub_track(
-                        cfg, source, progress=on_progress, mix_original=False, approval=approval
+                        cfg,
+                        source,
+                        progress=on_progress,
+                        mix_original=False,
+                        approval=approval,
+                        stt_engine=handed_stt,
                     )
 
                     import soundfile as sf
@@ -939,13 +2032,46 @@ class DubServer:
         except Exception as exc:  # noqa: BLE001 — статус уходит клиенту
             job.status = "error"
             job.finished_at = time.time()
-            self._set_stage(job, "error", detail=str(exc), stage_progress=1.0)
+            # Keep the selected route in the browser-visible error as well as
+            # in the terminal log. This matters when several personal servers
+            # share one userscript: a paid 402 must never look like a Free
+            # route failure.
+            route_context = f"{self.route_label}/{job.profile_name or self.profile_name}"
+            error_detail = f"маршрут {route_context}: {exc}"
+            self._set_stage(job, "error", detail=error_detail, stage_progress=1.0)
             if isinstance(exc, (RuntimeError, FileNotFoundError)):
                 # ожидаемые сбои (не скачалось, нет речи) — без простыни traceback
-                log.error("задача %s провалилась: %s", job.id, exc)
+                log.error("задача %s [%s] провалилась: %s", job.id, route_context, exc)
             else:
-                log.exception("задача %s провалилась", job.id)
+                log.exception("задача %s [%s] провалилась", job.id, route_context)
         finally:
+            if handed_stt is not None:
+                # Normally released by the STT stage; the second idempotent
+                # close also covers decode errors before transcription starts.
+                await asyncio.gather(handed_stt.close(), return_exceptions=True)
+                if job.status == "cancelled":
+                    # Cancellation must become truly idle. Do not immediately
+                    # start a well-intentioned preload that looks exactly like
+                    # the ghost Metal worker the user just stopped.
+                    self._model_readiness = {
+                        "status": "cancelled",
+                        "detail": "задача отменена; фоновых MLX-вычислений нет",
+                    }
+                elif self._model_readiness.get("status") != "error":
+                    self._model_readiness = {
+                        "status": "idle",
+                        "detail": "задача завершена; повторно прогреваю STT в фоне",
+                    }
+                    self.schedule_local_model_prepare()
+            elif stt_stage_started and job.status == "cancelled" and str(self.cfg.stt.engine) in {
+                "parakeet-mlx", "mlx-whisper"
+            }:
+                self._model_readiness = {
+                    "status": "cancelled",
+                    "detail": "задача отменена; фоновых MLX-вычислений нет",
+                }
+            elif job.status != "cancelled":
+                self.schedule_local_model_prepare()
             if self._tasks.get(job.id) is asyncio.current_task():
                 self._tasks.pop(job.id, None)
             self._download_log_buckets.pop(job.id, None)
@@ -967,7 +2093,9 @@ class DubServer:
                 except web.HTTPException as exc:
                     response = exc
             response.headers["Access-Control-Allow-Origin"] = "*"
-            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Access-Control-Allow-Methods"] = (
+                "GET, POST, PUT, DELETE, OPTIONS"
+            )
             response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-UVT-Token"
             if isinstance(response, web.HTTPException):
                 raise response
@@ -978,7 +2106,12 @@ class DubServer:
             # Дорожка проверяет короткоживущий URL-токен в _get_audio: HTMLAudio
             # не позволяет передать X-UVT-Token. OPTIONS остаётся доступным для
             # корректного preflight userscript.
-            if request.method != "OPTIONS" and not request.path.startswith("/audio/"):
+            public_dashboard = request.method == "GET" and request.path == "/"
+            if (
+                request.method != "OPTIONS"
+                and not public_dashboard
+                and not request.path.startswith("/audio/")
+            ):
                 if not self._request_has_api_token(request):
                     raise web.HTTPUnauthorized(text="нужен заголовок X-UVT-Token")
             return await handler(request)
@@ -990,7 +2123,12 @@ class DubServer:
         app.router.add_route("OPTIONS", "/{tail:.*}", options)
         app.router.add_get("/", self._index)
         app.router.add_get("/meta", self._get_meta)
+        app.router.add_get("/settings", self._get_settings)
+        app.router.add_put("/settings", self._put_settings)
+        app.router.add_delete("/settings", self._delete_settings)
+        app.router.add_get("/provider/voices", self._get_provider_voices)
         app.router.add_post("/dub", self._post_dub)
+        app.router.add_post("/tts/preview", self._post_tts_preview)
         app.router.add_get("/job/{jid}", self._get_job)
         app.router.add_post("/job/{jid}/cancel", self._cancel_job)
         app.router.add_post("/job/{jid}/approve", self._approve_job)
@@ -1000,17 +2138,1009 @@ class DubServer:
     async def _index(self, request):
         from aiohttp import web
 
-        lines = [f"UVT server: перевод {self.cfg.target_lang}, задач: {len(self.jobs)}"]
-        for job in self.jobs.values():
-            lines.append(
-                f"  {job.id}: {job.status}/{job.stage} {job.progress:.0%} {job.detail}"
+        forwarded_host = request.headers.get("X-Forwarded-Host", "").split(",", 1)[0].strip()
+        visible_host = forwarded_host or request.host
+        forwarded_scheme = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip()
+        visible_scheme = forwarded_scheme if forwarded_scheme in {"http", "https"} else request.scheme
+        try:
+            request_hostname = urlsplit(f"//{visible_host}").hostname or self.listen_host
+        except ValueError:
+            request_hostname = self.listen_host
+        current_url = f"{visible_scheme}://{visible_host.rstrip('/')}/"
+        routes = self.dashboard_routes or [
+            {
+                "label": self.route_label,
+                "profile": self.profile_name,
+                "url": current_url,
+                "engines": {
+                    "stt": str(self.cfg.stt.engine),
+                    "translation": str(self.cfg.translation.engine),
+                    "tts": str(self.cfg.tts.engine),
+                },
+            }
+        ]
+        readiness = dict(self._model_readiness)
+        readiness_status = str(readiness.get("status") or "pending")
+        protected_shell = bool(self.api_token)
+        server_ready = readiness_status in {"ready", "not-applicable", "idle", "in-use"}
+        server_error = readiness_status in {"error", "missing", "cancelled"}
+        if server_error:
+            server_label = "Есть проблемы"
+            server_state_class = "error"
+        elif server_ready:
+            server_label = "Сервер готов"
+            server_state_class = "ready"
+        else:
+            server_label = "Сервер запускается"
+            server_state_class = "pending"
+        if protected_shell:
+            server_label = "Требуется вход"
+            server_state_class = "pending"
+
+        def readiness_presentation(value: str) -> tuple[str, str]:
+            return {
+                "ready": ("Модели готовы", "ok"),
+                "not-applicable": ("Маршрут готов", "ok"),
+                "idle": ("Маршрут готов", "ok"),
+                "in-use": ("Модель занята задачей", "ok"),
+                "on-demand": ("Загрузится по запросу", "pending"),
+                "pending": ("Ожидает подготовки", "pending"),
+                "checking": ("Проверяю модели", "pending"),
+                "loading": ("Загружаю модель", "pending"),
+                "error": ("Ошибка модели", "error"),
+                "missing": ("Модели не установлены", "error"),
+                "cancelled": ("Подготовка остановлена", "error"),
+            }.get(value, ("Состояние неизвестно", "pending"))
+
+        route_rows: list[str] = []
+        settings_routes: list[dict[str, object]] = []
+        for route_number, item in enumerate(routes, start=1):
+            label = html.escape(str(item.get("label") or "UVT"))
+            profile = html.escape(str(item.get("profile") or "configured"))
+            configured_url = str(item.get("url") or current_url)
+            try:
+                route_port = urlsplit(configured_url).port or self.listen_port or 8765
+            except ValueError:
+                route_port = self.listen_port or 8765
+            route_url = (
+                configured_url
+                if item.get("public_url") is True
+                else _dashboard_url(request_hostname, int(route_port))
             )
-        return web.Response(text="\n".join(lines))
+            route_url_escaped = html.escape(route_url, quote=True)
+            meta_url = html.escape(f"{route_url.rstrip('/')}/meta", quote=True)
+            engines = dict(item.get("engines") or {})
+            engine_chain = " → ".join(
+                str(engines.get(kind) or "?") for kind in ("stt", "translation", "tts")
+            )
+            if protected_shell:
+                profile = "—"
+                engine_chain = "доступно после входа"
+            is_current = (
+                str(item.get("label") or "").casefold() == self.route_label.casefold()
+            )
+            settings_routes.append(
+                {
+                    "id": settings_route_key(str(item.get("label") or "uvt")),
+                    "label": str(item.get("label") or "UVT"),
+                    "port": int(route_port),
+                    "url": route_url.rstrip("/"),
+                }
+            )
+            if is_current:
+                status_text, status_class = readiness_presentation(readiness_status)
+                status_detail = str(readiness.get("detail") or "")
+                row_state = readiness_status
+            else:
+                status_text = "Проверяю маршрут"
+                status_class = "pending"
+                status_detail = ""
+                row_state = "checking"
+            if protected_shell:
+                status_text, status_class = "Нужен токен", "pending"
+                status_detail = ""
+                row_state = "pending"
+            route_rows.append(
+                f"""
+                <tr data-route data-route-port="{int(route_port)}" data-state="{html.escape(row_state, quote=True)}" data-meta-url="{meta_url}">
+                  <td data-label="Маршрут">
+                    <a class="route-link" href="{route_url_escaped}">
+                      <span>{route_number}. {label}</span>
+                      <svg aria-hidden="true" viewBox="0 0 20 20"><path d="m7 4 6 6-6 6"/></svg>
+                    </a>
+                  </td>
+                  <td data-label="Профиль"><code data-profile>{profile}</code></td>
+                  <td data-label="Движок"><code data-engines>{html.escape(engine_chain)}</code></td>
+                  <td data-label="Состояние">
+                    <span class="route-state {status_class}">
+                      <svg class="status-icon" aria-hidden="true" viewBox="0 0 20 20">
+                        <circle cx="10" cy="10" r="8"/>
+                        <path class="status-check" d="m6.2 10.1 2.4 2.5 5.2-5.5"/>
+                        <path class="status-error-mark" d="m7.1 7.1 5.8 5.8m0-5.8-5.8 5.8"/>
+                      </svg>
+                      <span data-status>{status_text}</span>
+                    </span>
+                    <small data-detail>{html.escape(status_detail)}</small>
+                  </td>
+                  <td data-label="Действия">
+                    <button class="configure-link" type="button" data-configure-route="{html.escape(settings_route_key(str(item.get('label') or 'uvt')), quote=True)}">
+                      Настроить
+                    </button>
+                    <a class="meta-link secondary" href="{meta_url}">
+                      <svg aria-hidden="true" viewBox="0 0 20 20">
+                        <path d="M11 3h6v6M17 3l-8 8M8 5H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-4"/>
+                      </svg>
+                      Открыть /meta
+                    </a>
+                  </td>
+                </tr>
+                """
+            )
+
+        active_jobs = [
+            job
+            for job in self.jobs.values()
+            if job.status in {"queued", "running", "awaiting_approval"}
+        ]
+        if protected_shell:
+            active_jobs = []
+        if active_jobs:
+            job_items = []
+            for job in active_jobs:
+                progress = min(100, max(0, round(float(job.progress) * 100)))
+                job_items.append(
+                    f"""
+                    <li class="job-row">
+                      <div><strong>{html.escape(job.id)}</strong>
+                        <span>{html.escape(job.status)} · {html.escape(job.stage)}</span></div>
+                      <div class="job-progress" aria-label="Прогресс {progress}%">
+                        <span style="width:{progress}%"></span></div>
+                      <div>{progress}%</div>
+                      <small>{html.escape(job.detail)}</small>
+                    </li>
+                    """
+                )
+            jobs_html = f'<ul class="job-list">{"".join(job_items)}</ul>'
+        else:
+            jobs_html = f"""
+                <div class="empty-jobs">
+                  <svg aria-hidden="true" viewBox="0 0 32 32">
+                    <path d="M5 13.5 10 6h12l5 7.5V25H5Z"/>
+                    <path d="M5 16h7l2 3h4l2-3h7"/>
+                  </svg>
+                  <span>{"Данные задач доступны после входа" if protected_shell else "Активных задач нет"}</span>
+                </div>
+            """
+
+        settings_routes_json = json.dumps(
+            settings_routes, ensure_ascii=False, separators=(",", ":")
+        ).replace("</", "<\\/")
+
+        page = (
+            "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<title>UVT · Локальная панель</title>"
+            """
+            <style>
+              :root { color-scheme: dark; --bg:#080d13; --surface:#0d141d;
+                --border:#2a3441; --text:#f4f7fb; --muted:#9aa6b5;
+                --blue:#6593ff; --green:#79c85a; --amber:#d8a84e; }
+              * { box-sizing:border-box; }
+              body { margin:0; min-height:100vh; background:var(--bg); color:var(--text);
+                font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+              a { color:inherit; }
+              a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,
+              textarea:focus-visible { outline:2px solid var(--blue); outline-offset:3px; }
+              .shell { width:min(1586px,100%); margin:0 auto; min-height:100vh;
+                border-inline:1px solid var(--border); display:flex; flex-direction:column; }
+              header { display:flex; justify-content:space-between; align-items:center;
+                gap:24px; padding:34px 46px; border-bottom:1px solid var(--border); }
+              .brand { display:flex; align-items:center; gap:22px; min-width:0; }
+              h1 { margin:0; font-size:42px; line-height:1; letter-spacing:.02em; }
+              .subtitle { color:var(--muted); font-size:20px; border-left:1px solid #46505d;
+                padding-left:22px; white-space:nowrap; }
+              .server-state { display:flex; align-items:center; gap:10px; color:var(--green);
+                font-size:19px; white-space:nowrap; }
+              .server-icon { width:24px; height:24px; fill:currentColor; stroke:#07100a;
+                stroke-width:2.2; stroke-linecap:round; stroke-linejoin:round; }
+              .server-state.pending { color:var(--amber); }
+              .server-state.error { color:#ef7777; }
+              main { padding:28px 48px 34px; flex:1; }
+              .routes { width:100%; border-collapse:collapse; table-layout:fixed; }
+              .routes th { color:var(--muted); font-weight:600; text-align:left;
+                padding:14px 10px; border-bottom:1px solid var(--border); }
+              .routes td { padding:22px 10px; border-bottom:1px solid var(--border);
+                vertical-align:middle; overflow-wrap:anywhere; }
+              .routes th:nth-child(1){width:17%}.routes th:nth-child(2){width:16%}
+              .routes th:nth-child(3){width:35%}.routes th:nth-child(4){width:20%}
+              .routes th:nth-child(5){width:12%}
+              code { color:#c6d1e0; font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+              .route-link { display:inline-flex; align-items:center; gap:10px; color:var(--blue);
+                font-size:23px; font-weight:700; text-decoration-thickness:1px;
+                text-underline-offset:5px; }
+              .route-link svg { width:20px; height:20px; fill:none; stroke:currentColor;
+                stroke-width:2.2; stroke-linecap:round; stroke-linejoin:round; }
+              .route-state { display:flex; align-items:center; gap:8px; color:var(--amber); font-weight:650; }
+              .route-state.ok { color:var(--green); }
+              .route-state.error { color:#ef7777; }
+              .status-icon { width:20px; height:20px; flex:0 0 auto; fill:none;
+                stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
+              .status-error-mark { display:none; }
+              .route-state.error .status-check { display:none; }
+              .route-state.error .status-error-mark { display:block; }
+              .route-state.pending .status-check,.route-state.pending .status-error-mark { display:none; }
+              td small { display:block; color:var(--muted); margin-top:3px; line-height:1.35; }
+              .meta-link { display:inline-flex; justify-content:center; min-height:36px;
+                align-items:center; gap:8px; padding:8px 12px; border:1px solid #4874d5;
+                border-radius:7px; color:var(--blue); text-decoration:none;
+                font-weight:650; white-space:nowrap; }
+              .meta-link svg { width:19px; height:19px; fill:none; stroke:currentColor;
+                stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+              .meta-link:hover { background:#101d34; }
+              .configure-link,.route-tab,.action-button { min-height:44px; border:1px solid #4874d5;
+                border-radius:8px; background:#132241; color:#dce7ff; padding:9px 14px;
+                font:inherit; font-weight:700; cursor:pointer; }
+              .configure-link:hover,.route-tab:hover,.action-button:hover { background:#1a2e55; }
+              .meta-link.secondary { margin-top:7px; border-color:transparent; color:var(--muted);
+                font-size:13px; padding:4px 0; min-height:28px; }
+              .settings-panel { margin-top:26px; padding:26px 30px; border:1px solid var(--border);
+                border-radius:11px; background:var(--surface); }
+              .settings-heading { display:flex; align-items:flex-start; justify-content:space-between;
+                gap:20px; margin-bottom:18px; }
+              .settings-heading h2 { margin:0 0 4px; font-size:25px; }
+              .settings-heading p,.field-help,.settings-notice,.provider-status { margin:0; color:var(--muted); }
+              .route-tabs { display:flex; flex-wrap:wrap; gap:9px; margin:18px 0 22px; }
+              .route-tab[aria-selected="true"] { background:var(--blue); border-color:var(--blue);
+                color:#07101f; }
+              .settings-form[aria-busy="true"] { opacity:.62; pointer-events:none; }
+              .settings-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:17px 22px; }
+              .field { display:flex; flex-direction:column; gap:7px; min-width:0; }
+              .field.full { grid-column:1/-1; }
+              .field label { font-weight:700; }
+              .field select,.field input,.field textarea { width:100%; min-height:44px; border:1px solid #3a4758;
+                border-radius:8px; background:#080e16; color:var(--text); padding:10px 12px; font:inherit; }
+              .field textarea { min-height:88px; resize:vertical; }
+              .engine-chain { min-height:44px; display:flex; align-items:center; padding:10px 12px;
+                border:1px solid var(--border); border-radius:8px; color:#c6d1e0; overflow-wrap:anywhere; }
+              [data-cloud-fields][hidden],[data-local-fields][hidden],[hidden] { display:none!important; }
+              .settings-actions { display:flex; flex-wrap:wrap; align-items:center; gap:10px;
+                margin-top:22px; padding-top:20px; border-top:1px solid var(--border); }
+              .action-button.primary { background:var(--blue); border-color:var(--blue); color:#07101f; }
+              .action-button.ghost { background:transparent; border-color:#485464; color:#c2ccd8; }
+              .action-button:disabled { opacity:.45; cursor:not-allowed; }
+              .settings-status { min-height:24px; margin-left:auto; color:var(--muted); }
+              .settings-status.ok { color:var(--green); }.settings-status.error { color:#ef7777; }
+              .preview-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:10px; align-items:end; }
+              .preview-row .field { min-width:0; }.preview-note { color:var(--amber); font-size:14px; }
+              .auth-box { margin:0 0 22px; padding:18px; border:1px solid var(--amber);
+                border-radius:9px; background:#211a0e; }
+              .auth-row { display:flex; gap:10px; margin-top:12px; }
+              .auth-row input { flex:1; min-height:44px; border:1px solid #66522e; border-radius:8px;
+                background:#0c0e12; color:var(--text); padding:10px 12px; font:inherit; }
+              .instruction { min-height:126px; margin-top:26px; padding:24px 30px;
+                border:1px solid var(--border); border-radius:11px; background:var(--surface);
+                display:flex; align-items:center; gap:24px; }
+              .instruction > svg { width:52px; height:52px; flex:0 0 auto; fill:none;
+                stroke:var(--blue); stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round;
+                border-right:1px solid var(--border); padding-right:20px; box-sizing:content-box; }
+              .instruction h2,.jobs h2 { margin:0 0 7px; font-size:19px; }
+              .instruction p { margin:0; color:#b5bfcc; }
+              .jobs { min-height:214px; margin-top:18px; padding:26px 30px;
+                border:1px solid var(--border); border-radius:11px; }
+              .empty-jobs { margin-top:18px; min-height:116px; display:flex; align-items:center;
+                justify-content:center; gap:16px;
+                color:#7f8997; border:1px dashed #3a4552; border-radius:8px; }
+              .empty-jobs svg { width:34px; height:34px; fill:none; stroke:currentColor;
+                stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+              .job-list { list-style:none; margin:16px 0 0; padding:0; }
+              .job-row { display:grid; grid-template-columns:minmax(220px,1fr) minmax(140px,2fr) 50px;
+                gap:12px; align-items:center; padding:13px 0; border-top:1px solid var(--border); }
+              .job-row div:first-child { display:flex; flex-direction:column; }
+              .job-row span,.job-row small { color:var(--muted); }
+              .job-row small { grid-column:1/-1; }
+              .job-progress { height:6px; background:#202a36; border-radius:10px; overflow:hidden; }
+              .job-progress span { display:block; height:100%; background:var(--blue); }
+              footer { display:flex; justify-content:space-between; gap:20px; padding:24px 48px;
+                border-top:1px solid var(--border); color:#7f8997; }
+              footer a { color:var(--blue); text-decoration:none; font-family:ui-monospace,monospace; }
+              @media (max-width:820px) {
+                .shell { border:0; } header,main,footer { padding-inline:18px; }
+                header { align-items:flex-start; } .brand { gap:12px; flex-wrap:wrap; }
+                h1 { font-size:28px; }.subtitle { font-size:15px; padding-left:12px; }
+                .server-state { font-size:14px; }
+                .routes thead { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
+                .routes,.routes tbody,.routes tr,.routes td { display:block; width:100%; }
+                .routes tr { padding:14px 0; border-bottom:1px solid var(--border); }
+                .routes td { display:grid; grid-template-columns:92px minmax(0,1fr); gap:10px;
+                  padding:5px 0; border:0; }
+                .routes td::before { content:attr(data-label); color:var(--muted); font-size:12px; }
+                .meta-link { justify-self:start; }.job-row { grid-template-columns:1fr 42px; }
+                .job-row div:first-child,.job-row small { grid-column:1/-1; }
+                .instruction { align-items:flex-start; min-height:0; padding:20px; }
+                .instruction > svg { width:34px; height:34px; padding-right:12px; }
+                footer { flex-direction:column; }
+                .settings-panel { padding:20px 16px; }.settings-heading { flex-direction:column; }
+                .settings-grid { grid-template-columns:1fr; }.field.full { grid-column:auto; }
+                .preview-row { grid-template-columns:1fr; }.settings-actions { align-items:stretch; }
+                .settings-actions .action-button { flex:1 1 100%; }.settings-status { margin-left:0; }
+                .auth-row { flex-direction:column; }
+              }
+              @media (prefers-reduced-motion:reduce) { * { scroll-behavior:auto!important; } }
+            </style></head><body><div class="shell">
+            """
+            f"""
+            <header><div class="brand"><h1>UVT</h1><div class="subtitle">Локальная панель</div></div>
+              <div class="server-state {server_state_class}" role="status">
+                <svg class="server-icon" aria-hidden="true" viewBox="0 0 24 24">
+                  <circle cx="12" cy="12" r="10"/><path d="m7.5 12 3 3 6-7"/>
+                </svg><span data-server-label>{server_label}</span>
+              </div>
+            </header><main>
+              <table class="routes"><thead><tr><th>Маршрут</th><th>Профиль</th>
+                <th>Движок (цепочка)</th><th>Состояние</th><th>Действия</th></tr></thead>
+                <tbody>{''.join(route_rows)}</tbody></table>
+              <section class="settings-panel" id="settings" aria-labelledby="settings-title">
+                <div class="settings-heading"><div><h2 id="settings-title">Настройки обработки</h2>
+                  <p>Выбор здесь станет значением по умолчанию для следующих видео.</p></div>
+                  <span class="provider-status" data-saved-state></span></div>
+                <div class="auth-box" data-auth-box hidden>
+                  <strong>Сервер защищён UVT_API_TOKEN</strong>
+                  <div class="field-help">Введите токен из окружения сервера. Он хранится только до закрытия вкладки.</div>
+                  <div class="auth-row"><input type="password" autocomplete="off" data-token-input aria-label="UVT API token">
+                    <button class="action-button" type="button" data-token-submit>Войти</button></div>
+                </div>
+                <div class="route-tabs" role="tablist" aria-label="Маршрут обработки" data-settings-tabs></div>
+                <form class="settings-form" data-settings-form aria-busy="true">
+                  <div class="settings-grid">
+                    <div class="field"><label for="setting-source">Язык оригинала</label>
+                      <select id="setting-source" name="source_lang"></select></div>
+                    <div class="field"><label for="setting-target">Язык перевода</label>
+                      <select id="setting-target" name="target_lang"></select></div>
+                    <div class="field" data-local-field><label for="setting-profile">Локальный профиль</label>
+                      <select id="setting-profile" name="profile_id"></select>
+                      <span class="field-help">Для M4 / 16 ГБ рекомендуется «Сбалансированный».</span></div>
+                    <div class="field" data-local-field><label>Цепочка движков</label>
+                      <div class="engine-chain" data-engine-chain></div></div>
+                    <div class="field"><label for="setting-gender">Тембр / пол голоса</label>
+                      <select id="setting-gender" name="voice_gender"></select></div>
+                    <div class="field" data-local-field><label for="setting-local-voice">Точный Piper-голос</label>
+                      <select id="setting-local-voice" name="voice_id"></select></div>
+                    <div class="field" data-cloud-field><label for="setting-stt-model">Модель распознавания</label>
+                      <select id="setting-stt-model" name="stt_model"></select></div>
+                    <div class="field" data-cloud-field><label for="setting-translation-model">Модель перевода</label>
+                      <select id="setting-translation-model" name="translation_model"></select></div>
+                    <div class="field" data-cloud-field><label for="setting-tts-model">Модель озвучки</label>
+                      <select id="setting-tts-model" name="tts_model"></select></div>
+                    <div class="field" data-openai-voice><label for="setting-openai-voice">Голос OpenAI</label>
+                      <select id="setting-openai-voice" name="openai_voice"></select></div>
+                    <div class="field" data-eleven-voice><label for="setting-eleven-voice">Голос ElevenLabs</label>
+                      <input id="setting-eleven-voice" name="eleven_voice" list="eleven-voice-list" autocomplete="off" placeholder="auto или Voice ID">
+                      <datalist id="eleven-voice-list"></datalist>
+                      <span class="field-help" data-eleven-help>Загружаю голоса аккаунта…</span></div>
+                    <div class="field full"><label>Ключи провайдеров</label>
+                      <div class="provider-status" data-provider-status>—</div></div>
+                    <div class="field full"><label for="preview-text">Проба озвучки</label>
+                      <div class="preview-row"><div class="field"><textarea id="preview-text" maxlength="240">Привет! Это проба голоса для перевода видео.</textarea></div>
+                        <button class="action-button" type="button" data-preview-play>▶ Прослушать</button>
+                        <button class="action-button ghost" type="button" data-preview-stop disabled>■ Стоп</button></div>
+                      <span class="preview-note" data-preview-note></span>
+                      <audio data-preview-audio preload="none"></audio></div>
+                  </div>
+                  <div class="settings-actions">
+                    <button class="action-button primary" type="submit" data-save>Сохранить</button>
+                    <button class="action-button ghost" type="button" data-reset-form>Отменить правки</button>
+                    <button class="action-button ghost" type="button" data-restore>Вернуть YAML по умолчанию</button>
+                    <span class="settings-status" role="status" aria-live="polite" data-settings-status></span>
+                  </div>
+                </form>
+              </section>
+              <section class="instruction">
+                <svg aria-hidden="true" viewBox="0 0 40 40"><circle cx="20" cy="20" r="16"/>
+                  <path d="M20 18v10m0-16h.01"/></svg>
+                <div><h2>Как запустить перевод</h2>
+                <p>Оставьте этот терминал запущенным, откройте страницу с видео и нажмите <strong>UVT · перевести</strong>.</p></div>
+              </section>
+              <section class="jobs"><h2>Текущие задачи · {html.escape(self.route_label)}</h2>{jobs_html}</section>
+            </main><script type="application/json" id="uvt-settings-routes">{settings_routes_json}</script>
+              <footer><a href="{html.escape(current_url, quote=True)}">{html.escape(current_url)}</a>
+              <span>UVT — персональный сервер перевода видео</span></footer>
+            """
+            """
+            </div><script>
+              const tokenStorageKey = "uvt-dashboard-token";
+              let apiToken = "";
+              try { apiToken = window.sessionStorage.getItem(tokenStorageKey) || ""; } catch (_) {}
+              function showAuth(message) {
+                const box = document.querySelector("[data-auth-box]");
+                box.hidden = false;
+                setSettingsStatus(message || "Нужен UVT_API_TOKEN", "error");
+              }
+              async function dashboardFetch(url, options = {}) {
+                const headers = new Headers(options.headers || {});
+                if (apiToken) headers.set("X-UVT-Token", apiToken);
+                const response = await fetch(url, {...options, headers, cache:"no-store"});
+                if (response.status === 401) {
+                  showAuth("Неверный или отсутствующий UVT_API_TOKEN");
+                }
+                return response;
+              }
+              const readinessViews = {
+                "ready": ["Модели готовы", "ok", false],
+                "not-applicable": ["Маршрут готов", "ok", false],
+                "idle": ["Маршрут готов", "ok", false],
+                "in-use": ["Модель занята задачей", "ok", true],
+                "on-demand": ["Загрузится по запросу", "pending", true],
+                "pending": ["Ожидает подготовки", "pending", true],
+                "checking": ["Проверяю модели", "pending", true],
+                "loading": ["Загружаю модель", "pending", true],
+                "error": ["Ошибка модели", "error", false],
+                "missing": ["Модели не установлены", "error", false],
+                "cancelled": ["Подготовка остановлена", "error", false]
+              };
+              function setRouteState(row, label, kind, state) {
+                const statusLabel = row.querySelector("[data-status]");
+                const status = statusLabel.closest(".route-state");
+                statusLabel.textContent = label;
+                status.classList.remove("ok", "pending", "error");
+                status.classList.add(kind);
+                row.dataset.state = state;
+              }
+              function refreshServerState() {
+                const states = Array.from(document.querySelectorAll("[data-route]"),
+                  row => row.dataset.state || "checking");
+                const serverState = document.querySelector(".server-state");
+                const serverLabel = serverState.querySelector("[data-server-label]");
+                serverState.classList.remove("ready", "pending", "error");
+                if (states.some(state => ["error", "missing", "cancelled", "unavailable"].includes(state))) {
+                  serverLabel.textContent = "Есть проблемы";
+                  serverState.classList.add("error");
+                } else if (states.some(state => ["pending", "checking", "loading", "on-demand"].includes(state))) {
+                  serverLabel.textContent = "Сервер запускается";
+                  serverState.classList.add("pending");
+                } else {
+                  serverLabel.textContent = "Сервер готов";
+                  serverState.classList.add("ready");
+                }
+              }
+              async function refreshRoute(row) {
+                let retryDelay = 0;
+                try {
+                  const response = await dashboardFetch(row.dataset.metaUrl);
+                  if (!response.ok) throw new Error(String(response.status));
+                  const meta = await response.json();
+                  const profile = meta.profile || {};
+                  const engines = profile.engines || {};
+                  row.querySelector("[data-profile]").textContent = profile.name || "configured";
+                  row.querySelector("[data-engines]").textContent =
+                    [engines.stt, engines.translation, engines.tts].filter(Boolean).join(" → ");
+                  const readiness = meta.model_readiness || {};
+                  const readinessStatus = readiness.status || "unknown";
+                  const view = readinessViews[readinessStatus] || ["Состояние неизвестно", "pending", true];
+                  setRouteState(row, view[0], view[1], readinessStatus);
+                  row.querySelector("[data-detail]").textContent = readiness.detail || "";
+                  retryDelay = view[2] ? 1500 : 10000;
+                } catch (_) {
+                  setRouteState(row, "Маршрут недоступен", "error", "unavailable");
+                  row.querySelector("[data-detail]").textContent = "Повторяю проверку…";
+                  retryDelay = 3000;
+                } finally {
+                  refreshServerState();
+                  if (retryDelay) window.setTimeout(() => refreshRoute(row), retryDelay);
+                }
+              }
+              const routeDefinitions = JSON.parse(
+                document.getElementById("uvt-settings-routes").textContent
+              );
+              const form = document.querySelector("[data-settings-form]");
+              const statusNode = document.querySelector("[data-settings-status]");
+              const audio = document.querySelector("[data-preview-audio]");
+              let activeRoute = routeDefinitions[0] || null;
+              let settingsDocument = null;
+              let previewUrl = "";
+              let previewController = null;
+
+              function routeBase(route) {
+                if (route.url) return String(route.url).replace(/\\/$/, "");
+                const rawHost = window.location.hostname;
+                const host = rawHost.includes(":") ? `[${rawHost}]` : rawHost;
+                return `${window.location.protocol}//${host}:${route.port}`;
+              }
+              function setSettingsStatus(message, kind = "") {
+                if (!statusNode) return;
+                statusNode.textContent = message || "";
+                statusNode.className = `settings-status ${kind}`.trim();
+              }
+              async function responseError(response) {
+                const text = (await response.text()).trim();
+                return text || `HTTP ${response.status}`;
+              }
+              function setOptions(select, items, value, emptyLabel = "") {
+                select.replaceChildren();
+                if (emptyLabel) {
+                  const option = document.createElement("option");
+                  option.value = "";
+                  option.textContent = emptyLabel;
+                  select.append(option);
+                }
+                for (const raw of items || []) {
+                  const item = typeof raw === "string" ? {id:raw, label:raw} : raw;
+                  const option = document.createElement("option");
+                  option.value = String(item.id || "");
+                  option.textContent = String(item.label || item.id || "");
+                  option.disabled = item.installed === false;
+                  select.append(option);
+                }
+                select.value = value == null ? "" : String(value);
+                if (select.value !== String(value == null ? "" : value) && select.options.length) {
+                  select.selectedIndex = 0;
+                }
+              }
+              function setKindVisibility(kind) {
+                document.querySelectorAll("[data-local-field]").forEach(
+                  node => { node.hidden = kind !== "local"; }
+                );
+                document.querySelectorAll("[data-cloud-field]").forEach(
+                  node => { node.hidden = kind === "local"; }
+                );
+                document.querySelector("[data-openai-voice]").hidden = kind !== "openai";
+                document.querySelector("[data-eleven-voice]").hidden = kind !== "elevenlabs";
+              }
+              function updateLocalVoiceOptions(preferred) {
+                if (!settingsDocument || settingsDocument.route.kind !== "local") return;
+                const target = form.elements.target_lang.value;
+                const voices = (settingsDocument.catalog.voices || []).filter(
+                  voice => voice.language === target && voice.installed !== false
+                );
+                setOptions(
+                  form.elements.voice_id,
+                  voices,
+                  preferred == null ? form.elements.voice_id.value : preferred,
+                  "Авто по спикеру"
+                );
+              }
+              function updateOpenAIVoiceOptions(preferred) {
+                if (!settingsDocument || settingsDocument.route.kind !== "openai") return;
+                const model = form.elements.tts_model.value;
+                const voices = (settingsDocument.catalog.voices || []).filter(
+                  voice => !voice.models || voice.models.includes(model)
+                );
+                setOptions(
+                  form.elements.openai_voice,
+                  voices,
+                  preferred == null ? form.elements.openai_voice.value : preferred,
+                  "Авто по спикеру"
+                );
+              }
+              function updateEngineChain() {
+                if (!settingsDocument || settingsDocument.route.kind !== "local") return;
+                const selected = (settingsDocument.catalog.profiles || []).find(
+                  item => item.id === form.elements.profile_id.value
+                );
+                const engines = selected ? selected.engines || {} : {};
+                document.querySelector("[data-engine-chain]").textContent =
+                  [engines.stt, engines.translation, engines.tts].filter(Boolean).join(" → ") || "—";
+                const allSources = settingsDocument.catalog.all_source_languages || [];
+                const supported = selected && selected.source_languages && selected.source_languages.length
+                  ? allSources.filter(item => selected.source_languages.includes(item.id))
+                  : allSources;
+                const previousSource = form.elements.source_lang.value;
+                setOptions(form.elements.source_lang, supported, previousSource);
+              }
+              function providerStatusText(items) {
+                if (!items || !items.length) return "Все движки локальные — API-ключи не нужны";
+                return items.map(item =>
+                  `${item.env}: ${item.configured ? "настроен" : "не задан"}`
+                ).join(" · ");
+              }
+              function renderSettings(documentData) {
+                settingsDocument = documentData;
+                const current = documentData.effective || {};
+                const catalog = documentData.catalog || {};
+                const kind = documentData.route.kind;
+                setKindVisibility(kind);
+                setOptions(form.elements.source_lang, catalog.source_languages, current.source_lang);
+                setOptions(form.elements.target_lang, catalog.target_languages, current.target_lang);
+                setOptions(form.elements.voice_gender, catalog.voice_genders, current.voice_gender);
+                if (kind === "local") {
+                  setOptions(form.elements.profile_id, catalog.profiles, current.profile_id);
+                  updateLocalVoiceOptions(current.voice_id || "");
+                  updateEngineChain();
+                } else {
+                  setOptions(form.elements.stt_model, catalog.stt_models, current.stt_model);
+                  setOptions(form.elements.translation_model, catalog.translation_models, current.translation_model);
+                  setOptions(form.elements.tts_model, catalog.tts_models, current.tts_model);
+                  if (kind === "openai") {
+                    updateOpenAIVoiceOptions(current.tts_voice === "auto" ? "" : current.tts_voice);
+                  } else {
+                    form.elements.eleven_voice.value = current.tts_voice || "auto";
+                  }
+                }
+                document.querySelector("[data-provider-status]").textContent =
+                  providerStatusText(documentData.provider_status);
+                document.querySelector("[data-saved-state]").textContent = documentData.saved
+                  ? "Сохранено в web-панели"
+                  : "Значения из YAML-профиля";
+                document.querySelector("[data-preview-note]").textContent = kind === "local"
+                  ? "Проба создаётся локально."
+                  : "Проба отправит текст в облачный TTS и использует API-квоту.";
+                form.querySelector("[data-save]").disabled = !documentData.can_save;
+                form.setAttribute("aria-busy", "false");
+                setSettingsStatus(documentData.warning || documentData.notice || "", documentData.warning ? "error" : "");
+                if (kind === "elevenlabs") loadProviderVoices();
+              }
+              function collectSettings() {
+                const kind = settingsDocument.route.kind;
+                const value = {
+                  source_lang: form.elements.source_lang.value,
+                  target_lang: form.elements.target_lang.value,
+                  voice_gender: form.elements.voice_gender.value
+                };
+                if (kind === "local") {
+                  value.profile_id = form.elements.profile_id.value;
+                  value.voice_id = form.elements.voice_id.value;
+                } else {
+                  value.stt_model = form.elements.stt_model.value;
+                  value.translation_model = form.elements.translation_model.value;
+                  value.tts_model = form.elements.tts_model.value;
+                  value.tts_voice = kind === "openai"
+                    ? (form.elements.openai_voice.value || "auto")
+                    : (form.elements.eleven_voice.value.trim() || "auto");
+                }
+                return value;
+              }
+              async function loadSettings(route, focusPanel = false) {
+                activeRoute = route;
+                form.setAttribute("aria-busy", "true");
+                setSettingsStatus("Загружаю настройки…");
+                document.querySelectorAll(".route-tab").forEach(button =>
+                  button.setAttribute("aria-selected", String(button.dataset.routeId === route.id))
+                );
+                try {
+                  const response = await dashboardFetch(`${routeBase(route)}/settings`);
+                  if (!response.ok) throw new Error(await responseError(response));
+                  renderSettings(await response.json());
+                  if (focusPanel) document.getElementById("settings").scrollIntoView({behavior:"smooth", block:"start"});
+                } catch (error) {
+                  form.setAttribute("aria-busy", "false");
+                  setSettingsStatus(error.message || "Не удалось загрузить настройки", "error");
+                }
+              }
+              async function loadProviderVoices() {
+                const help = document.querySelector("[data-eleven-help]");
+                help.textContent = "Загружаю голоса вашего ElevenLabs…";
+                try {
+                  const response = await dashboardFetch(`${routeBase(activeRoute)}/provider/voices`);
+                  if (!response.ok) throw new Error(await responseError(response));
+                  const result = await response.json();
+                  const list = document.getElementById("eleven-voice-list");
+                  list.replaceChildren();
+                  for (const voice of result.voices || []) {
+                    const option = document.createElement("option");
+                    option.value = voice.id;
+                    option.label = voice.label;
+                    list.append(option);
+                  }
+                  help.textContent = result.voices.length
+                    ? `Найдено голосов: ${result.voices.length}. Можно ввести Voice ID вручную.`
+                    : "Голоса не найдены; введите Voice ID вручную.";
+                } catch (error) {
+                  help.textContent = `${error.message}. Voice ID можно ввести вручную.`;
+                }
+              }
+              function buildTabs() {
+                const tabs = document.querySelector("[data-settings-tabs]");
+                for (const route of routeDefinitions) {
+                  const button = document.createElement("button");
+                  button.type = "button";
+                  button.className = "route-tab";
+                  button.role = "tab";
+                  button.dataset.routeId = route.id;
+                  button.textContent = route.label;
+                  button.setAttribute("aria-selected", "false");
+                  button.addEventListener("click", () => loadSettings(route));
+                  tabs.append(button);
+                }
+              }
+              form.addEventListener("submit", async event => {
+                event.preventDefault();
+                if (!settingsDocument) return;
+                form.setAttribute("aria-busy", "true");
+                setSettingsStatus("Сохраняю…");
+                try {
+                  const response = await dashboardFetch(`${routeBase(activeRoute)}/settings`, {
+                    method:"PUT",
+                    headers:{"Content-Type":"application/json"},
+                    body:JSON.stringify({revision:settingsDocument.revision, settings:collectSettings()})
+                  });
+                  if (!response.ok) throw new Error(await responseError(response));
+                  const result = await response.json();
+                  renderSettings(result);
+                  setSettingsStatus(result.message || "Сохранено", "ok");
+                  document.querySelectorAll("[data-route]").forEach(refreshRoute);
+                } catch (error) {
+                  form.setAttribute("aria-busy", "false");
+                  setSettingsStatus(error.message || "Не удалось сохранить", "error");
+                }
+              });
+              form.querySelector("[data-reset-form]").addEventListener("click", () => {
+                if (settingsDocument) renderSettings(settingsDocument);
+                setSettingsStatus("Несохранённые правки отменены");
+              });
+              form.querySelector("[data-restore]").addEventListener("click", async () => {
+                if (!settingsDocument || !window.confirm("Вернуть все настройки этого маршрута к YAML-профилю?")) return;
+                form.setAttribute("aria-busy", "true");
+                try {
+                  const response = await dashboardFetch(`${routeBase(activeRoute)}/settings`, {
+                    method:"DELETE", headers:{"Content-Type":"application/json"},
+                    body:JSON.stringify({revision:settingsDocument.revision})
+                  });
+                  if (!response.ok) throw new Error(await responseError(response));
+                  const result = await response.json();
+                  renderSettings(result);
+                  setSettingsStatus(result.message || "Восстановлено", "ok");
+                } catch (error) {
+                  form.setAttribute("aria-busy", "false");
+                  setSettingsStatus(error.message || "Не удалось сбросить", "error");
+                }
+              });
+              form.elements.target_lang.addEventListener("change", () => updateLocalVoiceOptions(""));
+              form.elements.profile_id.addEventListener("change", () => {
+                updateEngineChain();
+                setSettingsStatus("Есть несохранённые изменения");
+              });
+              form.elements.tts_model.addEventListener("change", () => updateOpenAIVoiceOptions(""));
+              form.addEventListener("input", event => {
+                if (event.target.closest("#preview-text")) return;
+                setSettingsStatus("Есть несохранённые изменения");
+              });
+              form.querySelector("[data-preview-play]").addEventListener("click", async () => {
+                if (!settingsDocument) return;
+                if (previewController) previewController.abort();
+                previewController = new AbortController();
+                setSettingsStatus("Создаю пробу голоса…");
+                const button = form.querySelector("[data-preview-play]");
+                button.disabled = true;
+                try {
+                  const response = await dashboardFetch(`${routeBase(activeRoute)}/tts/preview`, {
+                    method:"POST", headers:{"Content-Type":"application/json"},
+                    body:JSON.stringify({...collectSettings(), settings_mode:"override", text:document.getElementById("preview-text").value}),
+                    signal:previewController.signal
+                  });
+                  if (!response.ok) throw new Error(await responseError(response));
+                  if (previewUrl) URL.revokeObjectURL(previewUrl);
+                  previewUrl = URL.createObjectURL(await response.blob());
+                  audio.src = previewUrl;
+                  form.querySelector("[data-preview-stop]").disabled = false;
+                  await audio.play();
+                  setSettingsStatus("Проба готова", "ok");
+                } catch (error) {
+                  if (error.name !== "AbortError") setSettingsStatus(error.message || "Ошибка пробы", "error");
+                } finally {
+                  button.disabled = false;
+                }
+              });
+              form.querySelector("[data-preview-stop]").addEventListener("click", () => {
+                if (previewController) previewController.abort();
+                audio.pause(); audio.currentTime = 0;
+                setSettingsStatus("Воспроизведение остановлено");
+              });
+              document.querySelector("[data-token-submit]").addEventListener("click", () => {
+                apiToken = document.querySelector("[data-token-input]").value.trim();
+                try { window.sessionStorage.setItem(tokenStorageKey, apiToken); } catch (_) {}
+                document.querySelector("[data-auth-box]").hidden = true;
+                document.querySelectorAll("[data-route]").forEach(refreshRoute);
+                if (activeRoute) loadSettings(activeRoute);
+              });
+              document.querySelectorAll("[data-configure-route]").forEach(button => {
+                button.addEventListener("click", () => {
+                  const route = routeDefinitions.find(item => item.id === button.dataset.configureRoute);
+                  if (route) loadSettings(route, true);
+                });
+              });
+              window.addEventListener("beforeunload", () => {
+                if (previewController) previewController.abort();
+                if (previewUrl) URL.revokeObjectURL(previewUrl);
+              });
+              buildTabs();
+              document.querySelectorAll("[data-route]").forEach(refreshRoute);
+              if (activeRoute) loadSettings(activeRoute);
+            </script></body></html>
+            """
+        )
+        return web.Response(
+            text=page,
+            content_type="text/html",
+            charset="utf-8",
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def _get_meta(self, request):
         from aiohttp import web
 
-        return web.json_response(self._metadata())
+        data = dict(request.query)
+        if not data:
+            return web.json_response(self._metadata())
+        try:
+            return web.json_response(self._metadata_for_request(data))
+        except ValueError as exc:
+            raise web.HTTPUnprocessableEntity(text=str(exc)) from None
+
+    async def _get_settings(self, request):
+        from aiohttp import web
+
+        if not self._dashboard_request_allowed(request):
+            raise web.HTTPForbidden(
+                text="настройки доступны только локальной web-панели"
+            )
+        return web.json_response(
+            self._settings_payload(), headers={"Cache-Control": "no-store"}
+        )
+
+    async def _put_settings(self, request):
+        from aiohttp import web
+
+        if not self._dashboard_request_allowed(request):
+            raise web.HTTPForbidden(
+                text="менять настройки можно только из локальной web-панели"
+            )
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001
+            raise web.HTTPBadRequest(text="ожидается JSON") from None
+        if not isinstance(payload, dict) or set(payload) - {"revision", "settings"}:
+            raise web.HTTPBadRequest(text="ожидаются revision и settings")
+        raw_settings = payload.get("settings")
+        if not isinstance(raw_settings, dict):
+            raise web.HTTPBadRequest(text="settings должен быть JSON-object")
+        try:
+            revision = self._expected_revision(payload)
+            normalized = normalize_settings(
+                raw_settings,
+                current=effective_settings(
+                    self.cfg,
+                    kind=self._settings_kind,
+                    profile_name=self.profile_name,
+                ),
+                kind=self._settings_kind,
+                profile_ids=set(self._profile_configs),
+                local_voices=self._voice_catalog(self._base_cfg),
+            )
+            if self._settings_kind == "local":
+                self._require_profile_ready(str(normalized["profile_id"]))
+            candidate, _candidate_profile = apply_settings(
+                self._base_cfg,
+                normalized,
+                kind=self._settings_kind,
+                base_profile_name=self._base_profile_name,
+                profiles=self._profile_configs,
+            )
+            self._validate_piper_voice_support(candidate)
+            self._validate_stt_language_support(candidate)
+        except ValueError as exc:
+            raise web.HTTPUnprocessableEntity(text=str(exc)) from None
+
+        async with self._settings_lock:
+            if self._has_active_jobs():
+                raise web.HTTPConflict(
+                    text="дождитесь завершения текущего перевода"
+                )
+            try:
+                entry = self.settings_store.set(
+                    self.settings_key,
+                    normalized,
+                    expected_revision=revision,
+                )
+            except SettingsConflictError as exc:
+                raise web.HTTPConflict(text=str(exc)) from None
+            except OSError as exc:
+                log.error("не удалось сохранить UVT settings: %s", exc)
+                raise web.HTTPInternalServerError(
+                    text="не удалось сохранить настройки на диск"
+                ) from None
+            self._settings_revision = int(entry["revision"])
+            self._settings_saved = True
+            self._settings_load_error = None
+            await self._apply_effective_settings(normalized)
+        response = self._settings_payload()
+        response["message"] = "сохранено; новые настройки применятся к следующему переводу"
+        return web.json_response(response, headers={"Cache-Control": "no-store"})
+
+    async def _delete_settings(self, request):
+        from aiohttp import web
+
+        if not self._dashboard_request_allowed(request):
+            raise web.HTTPForbidden(
+                text="сбрасывать настройки можно только из локальной web-панели"
+            )
+        try:
+            payload = await request.json() if request.can_read_body else {}
+        except Exception:  # noqa: BLE001
+            raise web.HTTPBadRequest(text="ожидается JSON") from None
+        if not isinstance(payload, dict) or set(payload) - {"revision"}:
+            raise web.HTTPBadRequest(text="ожидается revision")
+        try:
+            revision = self._expected_revision(payload)
+        except ValueError as exc:
+            raise web.HTTPUnprocessableEntity(text=str(exc)) from None
+        async with self._settings_lock:
+            if self._has_active_jobs():
+                raise web.HTTPConflict(
+                    text="дождитесь завершения текущего перевода"
+                )
+            try:
+                entry = self.settings_store.reset(
+                    self.settings_key, expected_revision=revision
+                )
+            except SettingsConflictError as exc:
+                raise web.HTTPConflict(text=str(exc)) from None
+            except OSError as exc:
+                log.error("не удалось сбросить UVT settings: %s", exc)
+                raise web.HTTPInternalServerError(
+                    text="не удалось сбросить настройки на диске"
+                ) from None
+            self._settings_revision = int(entry["revision"])
+            self._settings_saved = False
+            self._settings_load_error = None
+            await self._apply_effective_settings(None)
+        response = self._settings_payload()
+        response["message"] = "восстановлены значения из YAML-профиля"
+        return web.json_response(response, headers={"Cache-Control": "no-store"})
+
+    async def _get_provider_voices(self, request):
+        from aiohttp import web
+
+        if not self._dashboard_request_allowed(request):
+            raise web.HTTPForbidden(
+                text="список голосов доступен из локальной web-панели"
+            )
+        if self._settings_kind != "elevenlabs":
+            raise web.HTTPUnprocessableEntity(
+                text="голоса аккаунта доступны только для ElevenLabs"
+            )
+        now = time.time()
+        if self._provider_voice_cache and now - self._provider_voice_cache[0] < 600:
+            return web.json_response({"voices": self._provider_voice_cache[1], "cached": True})
+        env_name = str(getattr(self.cfg.tts, "api_key_env", "ELEVENLABS_API_KEY"))
+        key = os.environ.get(env_name, "").strip()
+        if not key:
+            raise web.HTTPServiceUnavailable(
+                text=f"задайте {env_name} и перезапустите сервер"
+            )
+        try:
+            import httpx
+
+            base = str(
+                getattr(self.cfg.tts, "base_url", "https://api.elevenlabs.io/v1")
+            ).rstrip("/")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    f"{base}/voices",
+                    headers={"xi-api-key": key, "Accept": "application/json"},
+                )
+                response.raise_for_status()
+                raw = response.json()
+        except Exception as exc:  # noqa: BLE001 - provider errors are sanitized
+            log.warning("ElevenLabs voice catalog unavailable: %s", type(exc).__name__)
+            raise web.HTTPBadGateway(
+                text="ElevenLabs не отдал список голосов; проверьте ключ и сеть"
+            ) from None
+        voices: list[dict[str, str]] = []
+        for item in raw.get("voices", []) if isinstance(raw, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            voice_id = str(item.get("voice_id") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{3,128}", voice_id):
+                continue
+            voices.append(
+                {
+                    "id": voice_id,
+                    "label": str(item.get("name") or voice_id)[:100],
+                    "category": str(item.get("category") or "")[:50],
+                }
+            )
+        voices.sort(key=lambda item: item["label"].casefold())
+        self._provider_voice_cache = (now, voices)
+        return web.json_response({"voices": voices, "cached": False})
 
     async def _post_dub(self, request):
         from aiohttp import web
@@ -1019,29 +3149,183 @@ class DubServer:
             data = await request.json()
         except Exception:  # noqa: BLE001
             raise web.HTTPBadRequest(text="ожидается JSON") from None
+        if not isinstance(data, dict):
+            raise web.HTTPBadRequest(text="ожидается JSON-object")
+        if self._settings_lock.locked():
+            raise web.HTTPConflict(
+                text="настройки моделей обновляются; повторите через несколько секунд"
+            )
 
-        key = self._cache_key(data)
+        try:
+            cfg_snapshot, selected_profile = self._config_for_request(data)
+            self._require_profile_ready(selected_profile)
+            self._validate_piper_voice_support(cfg_snapshot)
+            request_meta = self._metadata(cfg_snapshot, selected_profile)
+            key = self._cache_key(data, (cfg_snapshot, selected_profile))
+        except ValueError as exc:
+            raise web.HTTPUnprocessableEntity(text=str(exc)) from None
         cached_id = self._job_cache.get(key)
         if cached_id:
             cached = self.jobs.get(cached_id)
             if cached is not None and cached.status not in ("error", "cancelled"):
                 log.info("задача из кэша: %s", cached_id)
                 payload = self._job_payload(cached)
-                payload.update({"job_url": f"/job/{cached_id}", "meta": self._metadata_for_request(data)})
+                payload.update({"job_url": f"/job/{cached_id}", "meta": request_meta})
                 return web.json_response(payload)
 
-        job = Job(id=uuid.uuid4().hex[:12])
+        job = Job(
+            id=uuid.uuid4().hex[:12],
+            profile_name=str(request_meta["profile"]["name"]),
+            engines=dict(request_meta["profile"]["engines"]),
+        )
         self._set_stage(job, "queue")
         self.jobs[job.id] = job
+        self._job_configs[job.id] = cfg_snapshot.model_copy(deep=True)
         self._job_cache[key] = job.id
-        self._tasks[job.id] = asyncio.get_running_loop().create_task(self._run_job(job, data))
+        self._tasks[job.id] = asyncio.get_running_loop().create_task(
+            self._run_job(
+                job,
+                data,
+                cfg_snapshot.model_copy(deep=True),
+                selected_profile,
+            )
+        )
+        engines = request_meta["profile"]["engines"]
         log.info(
-            "новая задача %s: %s",
-            job.id, data.get("page_url") or data.get("media_url") or data.get("file"),
+            "новая задача %s [%s/%s, порт %s; STT=%s, перевод=%s, TTS=%s]: %s",
+            job.id,
+            self.route_label,
+            job.profile_name,
+            self.listen_port or "?",
+            engines["stt"],
+            engines["translation"],
+            engines["tts"],
+            data.get("page_url") or data.get("media_url") or data.get("file"),
         )
         payload = self._job_payload(job)
-        payload.update({"job_url": f"/job/{job.id}", "meta": self._metadata_for_request(data)})
+        payload.update({"job_url": f"/job/{job.id}", "meta": request_meta})
         return web.json_response(payload)
+
+    async def _post_tts_preview(self, request):
+        from aiohttp import web
+
+        try:
+            data = await request.json()
+        except Exception:  # noqa: BLE001
+            raise web.HTTPBadRequest(text="ожидается JSON") from None
+        if not isinstance(data, dict):
+            raise web.HTTPBadRequest(text="ожидается JSON-object")
+
+        text = str(data.get("text") or "").strip()
+        if not text:
+            raise web.HTTPUnprocessableEntity(text="введите текст для пробы голоса")
+        if len(text) > _PREVIEW_MAX_CHARS or len(text.encode("utf-8")) > 1024:
+            raise web.HTTPRequestEntityTooLarge(
+                max_size=_PREVIEW_MAX_CHARS,
+                actual_size=len(text),
+            )
+
+        try:
+            cfg, profile_name = self._config_for_request(data)
+            self._require_profile_ready(profile_name)
+            self._validate_piper_voice_support(cfg)
+        except ValueError as exc:
+            raise web.HTTPUnprocessableEntity(text=str(exc)) from None
+        # Local Piper preview is also used by the in-player userscript. Cloud
+        # preview can spend quota, so it is restricted to the dashboard/token.
+        if (
+            str(cfg.tts.engine) in {"openai", "elevenlabs"}
+            and not self._dashboard_request_allowed(request)
+        ):
+            raise web.HTTPForbidden(
+                text="пробу голоса можно запустить только из web-панели"
+            )
+        if (
+            str(cfg.tts.engine) == "piper"
+            and not cfg.tts.voice_id
+            and cfg.tts.voice_gender == "auto"
+        ):
+            raise web.HTTPUnprocessableEntity(
+                text="для пробы выберите мужской или женский голос"
+            )
+        if any(
+            job.status in {"queued", "running", "awaiting_approval"}
+            for job in self.jobs.values()
+        ) or self._lock.locked():
+            raise web.HTTPConflict(
+                text="сначала дождитесь завершения текущего перевода"
+            )
+
+        cache_key = (
+            self.settings_key,
+            profile_name,
+            cfg.target_lang,
+            str(cfg.tts.engine),
+            str(getattr(cfg.tts, "model", "") or ""),
+            str(getattr(cfg.tts, "voice", "") or ""),
+            str(cfg.tts.voice_gender),
+            str(cfg.tts.voice_id or ""),
+            text,
+        )
+        cached = self._preview_cache.get(cache_key)
+        if cached is None:
+            async with self._lock:
+                cached = self._preview_cache.get(cache_key)
+                if cached is None:
+                    registry.load_plugin_dirs(cfg.plugin_dirs)
+                    engine = registry.create("tts", cfg.tts.engine, cfg.tts)
+                    try:
+                        try:
+                            async with asyncio.timeout(_PREVIEW_TIMEOUT_S):
+                                await engine.warmup()
+                                samples, sample_rate = await engine.synthesize(
+                                    text, cfg.target_lang
+                                )
+                        except TimeoutError:
+                            raise web.HTTPGatewayTimeout(
+                                text=(
+                                    "голосовой движок не ответил за "
+                                    f"{_PREVIEW_TIMEOUT_S:.0f} с; попробуйте ещё раз"
+                                )
+                            ) from None
+                        except web.HTTPException:
+                            raise
+                        except Exception as exc:  # noqa: BLE001 - provider details stay in logs
+                            log.warning(
+                                "TTS preview failed [%s/%s]: %s",
+                                self.route_label,
+                                cfg.tts.engine,
+                                type(exc).__name__,
+                            )
+                            raise web.HTTPBadGateway(
+                                text=(
+                                    "не удалось создать пробу; проверьте API-ключ, "
+                                    "модель и голос"
+                                )
+                            ) from None
+                    finally:
+                        await engine.close()
+                    if len(samples) == 0:
+                        raise web.HTTPUnprocessableEntity(text="голос не создал аудио")
+                    if len(samples) / max(sample_rate, 1) > 20:
+                        raise web.HTTPUnprocessableEntity(
+                            text="пример получился длиннее 20 секунд; сократите текст"
+                        )
+
+                    import soundfile as sf
+
+                    output = io.BytesIO()
+                    sf.write(output, samples, sample_rate, format="WAV", subtype="PCM_16")
+                    cached = output.getvalue()
+                    self._preview_cache[cache_key] = cached
+                    while len(self._preview_cache) > 12:
+                        self._preview_cache.pop(next(iter(self._preview_cache)))
+
+        return web.Response(
+            body=cached,
+            content_type="audio/wav",
+            headers={"Cache-Control": "private, no-store"},
+        )
 
     async def _get_job(self, request):
         from aiohttp import web
@@ -1113,18 +3397,60 @@ async def run_server(
     port: int = 8765,
     *,
     stop_event: asyncio.Event | None = None,
+    route_label: str = "UVT",
+    profile_name: str = "configured",
+    selectable_profiles: dict[str, AppConfig] | None = None,
+    dashboard_routes: list[dict[str, object]] | None = None,
+    bound_event: asyncio.Event | None = None,
+    settings_store: ServerSettingsStore | None = None,
+    settings_key: str | None = None,
 ) -> None:
     from aiohttp import web
 
-    server = DubServer(cfg)
+    server_url = _dashboard_url(host, port)
+    if not _is_loopback_host(host) and not os.environ.get(
+        "UVT_API_TOKEN", ""
+    ).strip():
+        raise RuntimeError(
+            "сетевой UVT-сервер требует UVT_API_TOKEN; без токена используйте host 127.0.0.1"
+        )
+
+    server = DubServer(
+        cfg,
+        route_label=route_label,
+        profile_name=profile_name,
+        listen_port=port,
+        selectable_profiles=selectable_profiles,
+        dashboard_routes=dashboard_routes,
+        settings_store=settings_store,
+        settings_key=settings_key,
+    )
     server.listen_host = host
     runner = web.AppRunner(server.app())
     await runner.setup()
     site = web.TCPSite(runner, host, port)
-    await site.start()
+    try:
+        server.schedule_local_model_prepare()
+        await site.start()
+    except BaseException:
+        await server.close_prepared_models()
+        await runner.cleanup()
+        raise
+    if bound_event is not None:
+        bound_event.set()
+    if server._prepare_stt_task is not None:
+        # The socket is already reachable and /meta exposes checking/loading;
+        # the startup log below is emitted only after readiness is known.
+        try:
+            await server._prepare_stt_task
+        except BaseException:
+            await server.close_prepared_models()
+            await runner.cleanup()
+            raise
     log.info(
-        "UVT-сервер запущен: http://%s:%d — установите userscript browser/uvt.user.js "
-        "и нажимайте кнопку UVT на видео; Ctrl+C — остановка", host, port,
+        "UVT-сервер запущен: %s — установите userscript browser/uvt.user.js "
+        "и нажимайте кнопку UVT на видео; Ctrl+C — остановка",
+        server_url,
     )
 
     own_stop_event = stop_event is None
@@ -1139,13 +3465,14 @@ async def run_server(
     try:
         await stop_event.wait()
     finally:
+        await server.close_prepared_models()
         await runner.cleanup()
         if own_stop_event:
             loop = asyncio.get_running_loop()
             for sig in installed_signals:
                 with contextlib.suppress(NotImplementedError, RuntimeError):
                     loop.remove_signal_handler(sig)
-        log.info("сервер http://%s:%d остановлен", host, port)
+        log.info("сервер %s остановлен", server_url)
 
 
 async def run_personal_servers(
@@ -1153,13 +3480,51 @@ async def run_personal_servers(
     free_port: int = 8765,
     gpt_port: int = 8766,
     eleven_port: int = 8767,
+    free_profile: str = "free-vps",
+    open_browser: bool = False,
 ) -> None:
     """Поднимает три batch-маршрута для одного userscript и останавливает вместе."""
+    settings_store = ServerSettingsStore.default()
+    if settings_store.load_error:
+        log.warning("настройки web-панели не загружены: %s", settings_store.load_error)
+    local_profiles: dict[str, AppConfig] | None = None
+    if free_profile in _LOCAL_PROFILE_LABELS:
+        local_profiles = {name: load_config(name) for name in _LOCAL_PROFILE_LABELS}
     routes = (
-        ("Free", "free-vps", free_port),
-        ("GPT", "cloud-fast", gpt_port),
-        ("ElevenLabs", "cloud-eleven", eleven_port),
+        ("Free", free_profile, free_port, load_config(free_profile), local_profiles),
+        ("GPT", "cloud-fast", gpt_port, load_config("cloud-fast"), None),
+        ("ElevenLabs", "cloud-eleven", eleven_port, load_config("cloud-eleven"), None),
     )
+    public_url_env = {
+        "Free": "UVT_FREE_PUBLIC_URL",
+        "GPT": "UVT_GPT_PUBLIC_URL",
+        "ElevenLabs": "UVT_ELEVEN_PUBLIC_URL",
+    }
+    dashboard_routes: list[dict[str, object]] = []
+    public_route_flags: list[bool] = []
+    for label, profile, port, cfg, _profiles in routes:
+        route_url, is_public = _configured_dashboard_url(
+            public_url_env[label], _dashboard_url(host, port)
+        )
+        public_route_flags.append(is_public)
+        dashboard_routes.append(
+            {
+                "label": label,
+                "profile": profile,
+                "url": route_url,
+                "public_url": is_public,
+                "engines": {
+                    "stt": str(cfg.stt.engine),
+                    "translation": str(cfg.translation.engine),
+                    "tts": str(cfg.tts.engine),
+                },
+            }
+        )
+    if any(public_route_flags) and not all(public_route_flags):
+        raise ValueError(
+            "для web-панели за reverse proxy задайте все три: "
+            "UVT_FREE_PUBLIC_URL, UVT_GPT_PUBLIC_URL и UVT_ELEVEN_PUBLIC_URL"
+        )
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     installed_signals: list[signal.Signals] = []
@@ -1168,26 +3533,89 @@ async def run_personal_servers(
             loop.add_signal_handler(sig, stop_event.set)
             installed_signals.append(sig)
 
-    for label, profile, port in routes:
+    for label, profile, port, _cfg, _profiles in routes:
         log.info(
-            "маршрут %-11s http://%s:%d (профиль %s)",
+            "маршрут %-11s %s (профиль %s)",
             label,
-            host,
-            port,
+            _dashboard_url(host, port),
             profile,
         )
 
+    bound_events = [asyncio.Event() for _route in routes]
     tasks = [
         asyncio.create_task(
-            run_server(load_config(profile), host, port, stop_event=stop_event),
+            run_server(
+                cfg,
+                host,
+                port,
+                stop_event=stop_event,
+                route_label=label,
+                profile_name=profile,
+                selectable_profiles=profiles,
+                dashboard_routes=dashboard_routes,
+                bound_event=bound_event,
+                settings_store=settings_store,
+                settings_key=settings_route_key(label),
+            ),
             name=f"uvt-{profile}",
         )
-        for _label, profile, port in routes
+        for (label, profile, port, cfg, profiles), bound_event in zip(
+            routes, bound_events, strict=True
+        )
     ]
+
+    async def wait_until_all_routes_bound() -> None:
+        await asyncio.gather(*(event.wait() for event in bound_events))
+
+    bind_waiter = asyncio.create_task(
+        wait_until_all_routes_bound(), name="uvt-personal-bind-barrier"
+    )
     try:
+        done, _pending = await asyncio.wait(
+            {bind_waiter, *tasks}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if bind_waiter not in done:
+            # A route stopped before the three-port barrier. Await it to retain
+            # the original bind/startup exception (for example Errno 48).
+            stopped_task = next(task for task in tasks if task in done)
+            await stopped_task
+            raise RuntimeError(
+                f"маршрут {stopped_task.get_name()} остановился до запуска всех портов"
+            )
+        await bind_waiter
+
+        # A bound route may still fail immediately during startup cleanup. Do
+        # not open a dashboard for a set which is already incomplete.
+        stopped_tasks = [task for task in tasks if task.done()]
+        if stopped_tasks:
+            if stop_event.is_set():
+                await asyncio.gather(*tasks)
+                return
+            stopped_task = stopped_tasks[0]
+            await stopped_task
+            raise RuntimeError(
+                f"маршрут {stopped_task.get_name()} остановился сразу после bind"
+            )
+
+        dashboard_url = _dashboard_url(host, free_port)
+        log.info("панель UVT: %s", dashboard_url)
+        if open_browser:
+            block_reason = _dashboard_open_block_reason(host)
+            if block_reason is None:
+                await _open_dashboard_in_browser(dashboard_url)
+            else:
+                log.warning(
+                    "панель UVT не открыта автоматически: %s; адрес: %s",
+                    block_reason,
+                    dashboard_url,
+                )
+
         await asyncio.gather(*tasks)
     finally:
         stop_event.set()
+        if not bind_waiter.done():
+            bind_waiter.cancel()
+        await asyncio.gather(bind_waiter, return_exceptions=True)
         for task in tasks:
             if not task.done():
                 task.cancel()

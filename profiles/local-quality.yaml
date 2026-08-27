@@ -1,0 +1,41 @@
+# Highest-quality stable local route currently shipped for M4/16 GB. Qwen TTS
+# is deliberately not selected until its MLX engine and timing are verified.
+mode: voiceover
+source_lang: auto
+target_lang: ru
+vad:
+  engine: silero
+stt:
+  engine: mlx-whisper
+  model: mlx-community/whisper-large-v3-turbo
+  revision: a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb
+  allow_download: false
+  chunk_seconds: 60
+  overlap_seconds: 2
+  concurrency: 1
+translation:
+  engine: translategemma-mlx
+  model: mlx-community/translategemma-4b-it-4bit
+  revision: 5788ec08c047f3f2e17808101b8d9566ac930d58
+  allow_download: false
+  batch_size: 8
+  concurrency: 1
+  max_tokens: 128
+tts:
+  engine: piper
+  voice_dir: ~/.local/share/uvt/piper
+  voice_models:
+    "uk:male": uk_UA-mykyta-high.onnx
+    "uk:female": uk_UA-tetiana-high.onnx
+    "ru:male": ru_RU-dmitri-medium.onnx
+    "ru:female": ru_RU-irina-medium.onnx
+  duration_per_char:
+    "uk:male": 0.082
+    "uk:female": 0.065
+    "ru:male": 0.055
+    "ru:female": 0.067
+  concurrency: 2
+latency:
+  preset: accuracy
+history:
+  enabled: true

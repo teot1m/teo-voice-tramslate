@@ -1,0 +1,43 @@
+# Fast fully-local route for Apple Silicon. Install once with the matching
+# setup preset; jobs are intentionally forbidden from downloading artifacts.
+mode: voiceover
+source_lang: auto
+target_lang: ru
+vad:
+  engine: silero
+stt:
+  engine: parakeet-mlx
+  model: mlx-community/parakeet-tdt-0.6b-v3
+  revision: ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15
+  allow_download: false
+  chunk_seconds: 90
+  overlap_seconds: 15
+  concurrency: 1
+translation:
+  engine: nllb-ct2
+  model: OpenNMT/nllb-200-distilled-1.3B-ct2-int8
+  revision: 70f572adafa4794890ce7826156a4209717855af
+  allow_download: false
+  compute_type: int8
+  threads: 4
+  batch_size: 32
+  concurrency: 1
+  beam_size: 1
+tts:
+  engine: piper
+  voice_dir: ~/.local/share/uvt/piper
+  voice_models:
+    "uk:male": uk_UA-mykyta-high.onnx
+    "uk:female": uk_UA-tetiana-high.onnx
+    "ru:male": ru_RU-dmitri-medium.onnx
+    "ru:female": ru_RU-irina-medium.onnx
+  duration_per_char:
+    "uk:male": 0.082
+    "uk:female": 0.065
+    "ru:male": 0.055
+    "ru:female": 0.067
+  concurrency: 2
+latency:
+  preset: balanced
+history:
+  enabled: true

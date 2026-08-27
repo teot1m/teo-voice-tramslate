@@ -1,0 +1,41 @@
+# Recommended M4/16 GB route: fast Parakeet STT, stronger TranslateGemma MT,
+# and deterministic Piper voices. Models stay sequential in the batch pipeline.
+mode: voiceover
+source_lang: auto
+target_lang: ru
+vad:
+  engine: silero
+stt:
+  engine: parakeet-mlx
+  model: mlx-community/parakeet-tdt-0.6b-v3
+  revision: ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15
+  allow_download: false
+  chunk_seconds: 90
+  overlap_seconds: 15
+  concurrency: 1
+translation:
+  engine: translategemma-mlx
+  model: mlx-community/translategemma-4b-it-4bit
+  revision: 5788ec08c047f3f2e17808101b8d9566ac930d58
+  allow_download: false
+  batch_size: 8
+  concurrency: 1
+  max_tokens: 128
+tts:
+  engine: piper
+  voice_dir: ~/.local/share/uvt/piper
+  voice_models:
+    "uk:male": uk_UA-mykyta-high.onnx
+    "uk:female": uk_UA-tetiana-high.onnx
+    "ru:male": ru_RU-dmitri-medium.onnx
+    "ru:female": ru_RU-irina-medium.onnx
+  duration_per_char:
+    "uk:male": 0.082
+    "uk:female": 0.065
+    "ru:male": 0.055
+    "ru:female": 0.067
+  concurrency: 2
+latency:
+  preset: accuracy
+history:
+  enabled: true

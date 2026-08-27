@@ -71,6 +71,9 @@ class STTConfig(_Section):
     device: str = "auto"  # auto | cuda | cpu
     compute_type: str = "auto"
     beam_size: int = 1
+    # Batch fallback через VAD: облачные короткие сегменты можно распознавать
+    # параллельно; локальный Whisper по умолчанию остаётся последовательным.
+    concurrency: int | None = Field(default=None, ge=1)
     # Для openai-compatible (OpenAI, Groq и любые совместимые endpoint)
     base_url: str = "https://api.openai.com/v1"
     api_key_env: str = "OPENAI_API_KEY"
@@ -98,7 +101,8 @@ class TranslationFallbackConfig(_Section):
 
 
 class TranslationConfig(_Section):
-    engine: str = "openai-compatible"  # openai-compatible | none | dummy | плагин
+    # openai-compatible | nllb-ct2 | translategemma-mlx | none | dummy
+    engine: str = "openai-compatible"
     base_url: str = "http://localhost:11434/v1"  # по умолчанию — локальный Ollama
     model: str = "qwen2.5:7b-instruct"
     api_key_env: str = "OPENAI_API_KEY"
@@ -120,11 +124,17 @@ class TTSConfig(_Section):
     voice: str = "auto"  # auto → голос по целевому языку
     rate: str = "+0%"  # темп речи для edge-tts
     speed: float = 1.0  # темп для kokoro
+    # Минимальная пауза между стартами сетевых TTS-запросов. Для локальных
+    # движков остаётся 0; ElevenLabs может задать её для бесплатного тарифа.
+    request_interval_s: float = Field(default=0.0, ge=0.0)
     model_path: str | None = None
     voices_path: str | None = None
     # ``auto`` выбирается SpeakerService для каждой реплики; явное male/female
     # сохраняет прежнее ручное поведение и побеждает авто-определение.
     voice_gender: str = "auto"
+    # Необязательный идентификатор одной из моделей из ``voice_models``.
+    # Это именно allowlisted stem файла, а не путь от HTTP-клиента.
+    voice_id: str | None = None
 
 
 class SpeakerConfig(_Section):

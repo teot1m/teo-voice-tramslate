@@ -7,12 +7,13 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from uvt.config import AppConfig
+from uvt.config import AppConfig, load_config
 
 aiohttp = pytest.importorskip("aiohttp")
 from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="нужен ffmpeg")
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _cfg() -> AppConfig:
@@ -25,6 +26,473 @@ def _cfg() -> AppConfig:
     cfg.translation.engine = "dummy"
     cfg.tts.engine = "dummy"
     return cfg
+
+
+def _install_voice_stubs(cfg: AppConfig, root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    cfg.tts.voice_dir = str(root)
+    for model_name in dict(getattr(cfg.tts, "voice_models", {}) or {}).values():
+        model = root / str(model_name)
+        model.write_bytes(b"voice")
+        Path(f"{model}.json").write_text(
+            '{"audio": {"sample_rate": 22050}}', encoding="utf-8"
+        )
+
+
+def test_nllb_is_reported_as_private_local_translation():
+    from uvt.server import DubServer
+
+    cfg = _cfg()
+    cfg.stt.engine = "mlx-whisper"
+    cfg.translation.engine = "nllb-ct2"
+    cfg.tts.engine = "piper"
+    meta = DubServer(cfg)._metadata()
+
+    assert meta["profile"]["kind"] == "local"
+    assert meta["privacy"]["data_leaves_device"] is False
+
+
+def test_route_metadata_names_actual_profile_and_port():
+    from uvt.server import DubServer
+
+    server = DubServer(
+        _cfg(),
+        route_label="GPT",
+        profile_name="cloud-fast",
+        listen_port=8766,
+    )
+
+    meta = server._metadata()
+    assert meta["route"] == {
+        "label": "GPT",
+        "profile": "cloud-fast",
+        "port": 8766,
+    }
+    assert meta["profile"]["name"] == "cloud-fast"
+
+
+def test_local_server_exposes_allowlisted_profiles_and_named_voices(monkeypatch, tmp_path):
+    from uvt.server import DubServer
+
+    monkeypatch.setenv("UVT_CACHE", str(tmp_path))
+    profiles = {
+        name: load_config(str(ROOT / "profiles" / f"{name}.yaml"))
+        for name in ("local-fast", "local-balanced", "local-quality")
+    }
+    for cfg in profiles.values():
+        _install_voice_stubs(cfg, tmp_path / "voices")
+    server = DubServer(
+        profiles["local-balanced"],
+        profile_name="local-balanced",
+        selectable_profiles=profiles,
+    )
+
+    meta = server._metadata_for_request(
+        {"profile_id": "local-quality", "target_lang": "uk"}
+    )
+
+    assert meta["api_version"] == 2
+    assert meta["capabilities"]["profile_selection"] is True
+    assert meta["capabilities"]["tts_preview"] is True
+    assert meta["profile"]["name"] == "local-quality"
+    assert meta["profile"]["engines"]["stt"] == "mlx-whisper"
+    assert {item["id"] for item in meta["profiles"]} == {
+        "local-fast", "local-balanced", "local-quality"
+    }
+    assert {item["id"] for item in meta["voices"]} == {
+        "ru_RU-dmitri-medium",
+        "ru_RU-irina-medium",
+        "uk_UA-mykyta-high",
+        "uk_UA-tetiana-high",
+    }
+    assert "voice_dir" not in repr(meta)
+    assert "/Users/" not in repr(meta)
+
+
+def test_profile_and_exact_voice_are_part_of_job_cache_key(monkeypatch, tmp_path):
+    from uvt.server import DubServer
+
+    monkeypatch.setenv("UVT_CACHE", str(tmp_path))
+    profiles = {
+        name: load_config(str(ROOT / "profiles" / f"{name}.yaml"))
+        for name in ("local-fast", "local-balanced", "local-quality")
+    }
+    for cfg in profiles.values():
+        _install_voice_stubs(cfg, tmp_path / "voices")
+    server = DubServer(
+        profiles["local-balanced"],
+        profile_name="local-balanced",
+        selectable_profiles=profiles,
+    )
+    base = {
+        "page_url": "https://example.test/watch/1",
+        "target_lang": "ru",
+        "voice_gender": "female",
+    }
+
+    balanced = server._cache_key({**base, "profile_id": "local-balanced"})
+    fast = server._cache_key({**base, "profile_id": "local-fast"})
+    irina = server._cache_key(
+        {**base, "profile_id": "local-balanced", "voice_id": "ru_RU-irina-medium"}
+    )
+
+    assert balanced != fast
+    assert balanced != irina
+    with pytest.raises(ValueError, match="недоступен"):
+        server._cache_key({**base, "profile_id": "../../private-profile"})
+    with pytest.raises(ValueError, match="не подходит"):
+        server._cache_key(
+            {**base, "target_lang": "uk", "voice_id": "ru_RU-irina-medium"}
+        )
+
+
+def test_profile_default_exact_voice_is_preserved(monkeypatch, tmp_path):
+    from uvt.server import DubServer
+
+    monkeypatch.setenv("UVT_CACHE", str(tmp_path))
+    cfg = load_config(str(ROOT / "profiles" / "local-balanced.yaml"))
+    _install_voice_stubs(cfg, tmp_path / "voices")
+    cfg.tts.voice_id = "ru_RU-irina-medium"
+
+    selected, _profile = DubServer(
+        cfg, profile_name="local-balanced"
+    )._config_for_request({"target_lang": "ru"})
+
+    assert selected.tts.voice_id == "ru_RU-irina-medium"
+    assert selected.tts.voice_gender == "female"
+
+
+def test_local_piper_rejects_unsupported_target_before_job(monkeypatch, tmp_path):
+    from uvt.server import DubServer
+
+    monkeypatch.setenv("UVT_CACHE", str(tmp_path))
+    cfg = load_config(str(ROOT / "profiles" / "local-balanced.yaml"))
+    _install_voice_stubs(cfg, tmp_path / "voices")
+    server = DubServer(cfg, profile_name="local-balanced")
+
+    meta = server._metadata_for_request({"target_lang": "de"})
+    assert meta["capabilities"]["voice_selection"] is False
+    assert meta["capabilities"]["tts_preview"] is False
+    assert meta["limits"]["local_tts_languages"] == ["ru", "uk"]
+    with pytest.raises(ValueError, match="Piper-голоса"):
+        server._cache_key(
+            {
+                "page_url": "https://example.test/watch/unsupported",
+                "target_lang": "de",
+                "voice_gender": "female",
+            }
+        )
+
+
+def test_profile_catalog_disables_missing_optional_models(monkeypatch, tmp_path):
+    from uvt.server import DubServer
+
+    monkeypatch.setenv("UVT_CACHE", str(tmp_path))
+    profiles = {
+        name: load_config(str(ROOT / "profiles" / f"{name}.yaml"))
+        for name in ("local-fast", "local-balanced", "local-quality")
+    }
+    for cfg in profiles.values():
+        _install_voice_stubs(cfg, tmp_path / "voices")
+    server = DubServer(
+        profiles["local-balanced"],
+        profile_name="local-balanced",
+        selectable_profiles=profiles,
+    )
+    server._record_local_preflight(
+        {
+            "ready": False,
+            "models": {
+                "parakeet": {"ready": True},
+                "nllb": {"ready": False},
+                "translategemma": {"ready": True},
+                "whisper": {"ready": False},
+            },
+            "piper": {"ready": True},
+        }
+    )
+
+    installed = {item["id"]: item["installed"] for item in server._profile_catalog()}
+    assert installed == {
+        "local-fast": False,
+        "local-balanced": True,
+        "local-quality": False,
+    }
+    with pytest.raises(ValueError, match="setup-mac-local --preset fast"):
+        server._cache_key(
+            {
+                "page_url": "https://example.test/watch/missing-fast",
+                "profile_id": "local-fast",
+                "target_lang": "ru",
+                "voice_gender": "male",
+            }
+        )
+
+
+async def test_prepared_stt_reused_only_for_matching_profile(monkeypatch, tmp_path):
+    from uvt.server import DubServer
+
+    monkeypatch.setenv("UVT_CACHE", str(tmp_path))
+    profiles = {
+        name: load_config(str(ROOT / "profiles" / f"{name}.yaml"))
+        for name in ("local-fast", "local-balanced", "local-quality")
+    }
+
+    class FakeSTT:
+        def __init__(self):
+            self.closed = 0
+
+        async def close(self):
+            self.closed += 1
+
+    server = DubServer(
+        profiles["local-balanced"],
+        profile_name="local-balanced",
+        selectable_profiles=profiles,
+    )
+    shared = FakeSTT()
+    server._prepared_stt = shared
+    assert await server.take_prepared_stt(profiles["local-fast"]) is shared
+    assert shared.closed == 0
+
+    different = FakeSTT()
+    server._prepared_stt = different
+    assert await server.take_prepared_stt(profiles["local-quality"]) is None
+    assert different.closed == 1
+
+
+async def test_local_piper_preview_returns_cached_wav(monkeypatch, tmp_path):
+    import uvt.server as server_module
+    from uvt.server import DubServer
+
+    monkeypatch.setenv("UVT_CACHE", str(tmp_path))
+    cfg = _cfg()
+    cfg.tts.engine = "piper"
+    cfg.tts.voice_gender = "female"
+    calls: list[str] = []
+
+    class FakeTTS:
+        async def warmup(self):
+            calls.append("warmup")
+
+        async def synthesize(self, text, language):
+            calls.append(f"synthesize:{language}:{len(text)}")
+            return np.array([0.0, 0.25, -0.25], dtype=np.float32), 22050
+
+        async def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(server_module.registry, "create", lambda *_args: FakeTTS())
+    server = DubServer(cfg, profile_name="local-balanced")
+    client = TestClient(TestServer(server.app()))
+    await client.start_server()
+    payload = {
+        "text": "Так звучит локальный голос.",
+        "target_lang": "ru",
+        "voice_gender": "female",
+    }
+    try:
+        first = await client.post("/tts/preview", json=payload)
+        assert first.status == 200
+        assert first.headers["Content-Type"].startswith("audio/wav")
+        assert (await first.read()).startswith(b"RIFF")
+
+        second = await client.post("/tts/preview", json=payload)
+        assert second.status == 200
+        assert (await second.read()).startswith(b"RIFF")
+        assert calls == ["warmup", "synthesize:ru:27", "close"]
+
+        automatic = await client.post(
+            "/tts/preview",
+            json={**payload, "voice_gender": "auto"},
+        )
+        assert automatic.status == 422
+    finally:
+        await client.close()
+
+
+async def test_local_piper_preview_times_out_and_releases_lock(monkeypatch, tmp_path):
+    import uvt.server as server_module
+    from uvt.server import DubServer
+
+    monkeypatch.setenv("UVT_CACHE", str(tmp_path))
+    monkeypatch.setattr(server_module, "_PREVIEW_TIMEOUT_S", 0.01)
+    cfg = _cfg()
+    cfg.tts.engine = "piper"
+    cfg.tts.voice_gender = "female"
+    calls: list[str] = []
+
+    class StuckTTS:
+        async def warmup(self):
+            calls.append("warmup")
+
+        async def synthesize(self, _text, _language):
+            calls.append("synthesize")
+            await asyncio.Event().wait()
+
+        async def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(server_module.registry, "create", lambda *_args: StuckTTS())
+    server = DubServer(cfg, profile_name="local-balanced")
+    client = TestClient(TestServer(server.app()))
+    await client.start_server()
+    try:
+        response = await client.post(
+            "/tts/preview",
+            json={
+                "text": "Проверка таймаута.",
+                "target_lang": "ru",
+                "voice_gender": "female",
+            },
+        )
+        assert response.status == 504
+        assert "не ответил" in await response.text()
+        assert calls == ["warmup", "synthesize", "close"]
+        assert server._lock.locked() is False
+    finally:
+        await client.close()
+
+
+async def test_local_request_waits_for_startup_preflight():
+    from uvt.server import DubServer
+
+    cfg = _cfg()
+    cfg.stt.engine = "parakeet-mlx"
+    server = DubServer(cfg, profile_name="local-balanced")
+    pending = asyncio.create_task(asyncio.Event().wait())
+    server._prepare_stt_task = pending
+    try:
+        with pytest.raises(ValueError, match="ещё проверяет локальные модели"):
+            server._cache_key({"page_url": "https://example.test/watch/startup"})
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+    server._prepare_stt_task = None
+    server._model_readiness = {
+        "status": "error",
+        "phase": "preflight",
+        "detail": "offline cache damaged",
+    }
+    with pytest.raises(ValueError, match="не прошёл локальную проверку"):
+        server._cache_key({"page_url": "https://example.test/watch/failed-startup"})
+
+
+async def test_network_server_fails_closed_without_api_token(monkeypatch):
+    from uvt.server import run_server
+
+    monkeypatch.delenv("UVT_API_TOKEN", raising=False)
+    with pytest.raises(RuntimeError, match="требует UVT_API_TOKEN"):
+        await run_server(_cfg(), host="0.0.0.0", port=18765)
+
+
+async def test_local_route_preflights_and_preloads_stt(monkeypatch):
+    import uvt.server as server_module
+    import uvt.setup_local as setup_local
+    from uvt.server import DubServer
+
+    cfg = _cfg()
+    cfg.stt.engine = "parakeet-mlx"
+    cfg.translation.engine = "translategemma-mlx"
+    cfg.tts.engine = "piper"
+    calls: list[str] = []
+
+    class FakeSTT:
+        async def warmup(self):
+            calls.append("warmup")
+
+        async def close(self):
+            calls.append("close")
+
+    fake = FakeSTT()
+    monkeypatch.setattr(server_module, "create_stt_engine", lambda _cfg: fake)
+    monkeypatch.setattr(setup_local, "preset_for_profile", lambda _cfg: "balanced")
+    monkeypatch.setattr(
+        setup_local,
+        "preflight_mac_local",
+        lambda _preset: {"ready": True, "preset": "balanced"},
+    )
+
+    server = DubServer(cfg, profile_name="local-balanced")
+    assert server._metadata()["model_readiness"]["status"] == "pending"
+    await server.prepare_local_models()
+    assert calls == ["warmup"]
+    assert server._metadata()["model_readiness"]["status"] == "ready"
+
+    assert await server.take_prepared_stt() is fake
+    assert server._metadata()["model_readiness"]["status"] == "in-use"
+    await fake.close()
+    assert calls == ["warmup", "close"]
+
+
+def test_source_cache_key_ignores_tracking_but_keeps_page_parameters():
+    from uvt.server import _source_cache_key
+
+    clean = _source_cache_key(
+        {"page_url": "https://example.test/watch?id=42&chapter=3"}
+    )
+    tracked = _source_cache_key(
+        {
+            "page_url": (
+                "https://EXAMPLE.test/watch?id=42&utm_source=ad&chapter=3"
+                "&fbclid=tracking#player"
+            )
+        }
+    )
+    different_video = _source_cache_key(
+        {"page_url": "https://example.test/watch?id=43&chapter=3"}
+    )
+
+    assert tracked == clean
+    assert different_video != clean
+
+
+async def test_downloaded_source_cache_is_shared_between_personal_routes(
+    monkeypatch, tmp_path
+):
+    import uvt.server as server_module
+    from uvt.server import DubServer
+
+    downloads: list[str] = []
+
+    async def fake_download(url, dest_dir, referer=None, out_name="media.m4a", **_kwargs):
+        downloads.append(url)
+        output = dest_dir / out_name
+        output.write_bytes(b"shared source audio")
+        return output
+
+    monkeypatch.setattr(server_module, "_download_media", fake_download)
+    free = DubServer(_cfg(), route_label="Free", profile_name="free-quality")
+    cloud = DubServer(_cfg(), route_label="GPT", profile_name="cloud-fast")
+    free.audio_dir = tmp_path
+    cloud.audio_dir = tmp_path
+    first_workdir = tmp_path / "first"
+    second_workdir = tmp_path / "second"
+    first_workdir.mkdir()
+    second_workdir.mkdir()
+    first_request = {
+        "page_url": "https://example.test/watch/42?utm_source=one",
+        "media_url": "https://cdn.example.test/signed-one.m3u8",
+    }
+    second_request = {
+        "page_url": "https://example.test/watch/42?utm_source=two",
+        "media_url": "https://cdn.example.test/signed-two.m3u8",
+    }
+
+    first = await free._resolve_cached_source(first_request, first_workdir)
+    updates: list[tuple[float | None, str]] = []
+    second = await cloud._resolve_cached_source(
+        second_request,
+        second_workdir,
+        progress=lambda fraction, detail: updates.append((fraction, detail)),
+    )
+
+    assert downloads == [first_request["media_url"]]
+    assert first == second
+    assert first.parent == tmp_path / "sources"
+    assert updates == [
+        (1.0, "исходный звук взят из общего кэша — повторно не скачиваю")
+    ]
 
 
 async def test_dub_job_from_file(tmp_path):
@@ -267,13 +735,75 @@ async def test_page_download_uses_audio_first_ytdlp_selector(monkeypatch, tmp_pa
         (tmp_path / "source.webm").write_bytes(b"audio")
 
     monkeypatch.setattr(dub_module, "_find_ytdlp", lambda: "yt-dlp")
+    monkeypatch.setattr(
+        dub_module,
+        "_ytdlp_js_args",
+        lambda: ["--js-runtimes", "node:/test/node"],
+    )
     monkeypatch.setattr(server_module, "_run_process", fake_process)
     result = await server_module._download_page("https://site.example.test/watch/99", tmp_path)
 
     assert result.name == "source.webm"
     assert captured[captured.index("-f") + 1] == server_module._YT_DLP_AUDIO_SELECTOR
     assert "--no-playlist" in captured
+    assert "--ignore-config" in captured
+    assert captured[captured.index("--js-runtimes") + 1] == "node:/test/node"
     assert "--merge-output-format" not in captured
+
+
+async def test_youtube_403_retries_with_compatible_android_client(monkeypatch, tmp_path):
+    import uvt.dub as dub_module
+    import uvt.server as server_module
+
+    calls: list[list[str]] = []
+
+    async def fake_process(cmd, *_args, on_line=None, **_kwargs):
+        calls.append(cmd)
+        assert on_line is not None
+        if len(calls) == 1:
+            (tmp_path / "partial.webm.part").write_bytes(b"partial")
+            on_line("ERROR: unable to download video data: HTTP Error 403: Forbidden")
+            raise RuntimeError("yt-dlp завершился с ошибкой (код 1)")
+        (tmp_path / "source.mp4").write_bytes(b"audio")
+
+    monkeypatch.setattr(dub_module, "_find_ytdlp", lambda: "yt-dlp")
+    monkeypatch.setattr(dub_module, "_ytdlp_js_args", lambda: [])
+    monkeypatch.setattr(server_module, "_run_process", fake_process)
+
+    result = await server_module._download_page(
+        "https://www.youtube.com/watch?v=public-video",
+        tmp_path,
+        progress=lambda *_args: None,
+    )
+
+    assert result.name == "source.mp4"
+    assert len(calls) == 2
+    assert calls[1][calls[1].index("--extractor-args") + 1] == (
+        "youtube:player_client=android"
+    )
+    assert not (tmp_path / "partial.webm.part").exists()
+
+
+async def test_page_download_surfaces_original_ytdlp_error(monkeypatch, tmp_path):
+    import uvt.dub as dub_module
+    import uvt.server as server_module
+
+    async def failed_process(_cmd, *_args, on_line=None, **_kwargs):
+        assert on_line is not None
+        on_line("WARNING: JavaScript runtime is unavailable")
+        on_line("ERROR: [youtube] video is unavailable")
+        raise RuntimeError("yt-dlp завершился с ошибкой (код 1)")
+
+    monkeypatch.setattr(dub_module, "_find_ytdlp", lambda: "yt-dlp")
+    monkeypatch.setattr(dub_module, "_ytdlp_js_args", lambda: [])
+    monkeypatch.setattr(server_module, "_run_process", failed_process)
+
+    with pytest.raises(RuntimeError, match="video is unavailable"):
+        await server_module._download_page(
+            "https://site.example.test/watch/unavailable",
+            tmp_path,
+            progress=lambda *_args: None,
+        )
 
 
 async def test_direct_media_download_parses_ffmpeg_progress(monkeypatch, tmp_path):

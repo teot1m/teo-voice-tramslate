@@ -22,6 +22,7 @@ from uvt.registry import register
 log = logging.getLogger("uvt.stt.openai")
 
 _MAX_UPLOAD_BYTES = 38_000_000  # лимит Groq free — 40 МБ, оставляем запас
+_NO_VERBOSE_JSON_MODELS = {"gpt-4o-mini-transcribe", "gpt-4o-transcribe"}
 
 
 def _error_detail(response) -> str:
@@ -75,6 +76,8 @@ class OpenAICompatibleSTT(STTEngine):
         _require_key_for_remote(self._base, key, self.cfg.api_key_env)
         headers = {"Authorization": f"Bearer {key}"} if key else {}
         self._client = httpx.AsyncClient(timeout=30.0, headers=headers)
+        local = self._base.startswith(("http://127.0.0.1", "http://localhost"))
+        self.concurrency_hint = int(self.cfg.concurrency or (1 if local else 8))
 
     async def close(self) -> None:
         if hasattr(self, "_client"):
@@ -108,6 +111,18 @@ class OpenAICompatibleSTT(STTEngine):
         """Весь файл одним запросом: сегменты с таймкодами из verbose_json."""
         import soundfile as sf
 
+        model = str(self.cfg.model or "whisper-1")
+        if model.lower() in _NO_VERBOSE_JSON_MODELS:
+            # OpenAI документирует для этих моделей только json/text. Не тратим
+            # время и трафик на заведомо отклоняемую загрузку всего FLAC.
+            log.info(
+                "модель %s не отдаёт batch-таймкоды — сразу использую VAD + "
+                "%d параллельных запросов",
+                model,
+                self.concurrency_hint,
+            )
+            return None
+
         buffer = io.BytesIO()
         sf.write(buffer, samples, sample_rate, format="FLAC")
         payload = buffer.getvalue()
@@ -119,7 +134,7 @@ class OpenAICompatibleSTT(STTEngine):
             return None  # dub возьмёт путь VAD + пореплечных запросов
 
         data = {
-            "model": self.cfg.model or "whisper-1",
+            "model": model,
             "response_format": "verbose_json",
         }
         if language:

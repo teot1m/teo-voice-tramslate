@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,7 +40,7 @@ from uvt.config import PRESETS, AppConfig
 from uvt.fallback import ApprovalGate, create_stt_engine, create_translation_engine
 from uvt.gender import estimate_gender_f0
 from uvt.history import EXPORTERS, HistoryEntry
-from uvt.interfaces import STTSpan
+from uvt.interfaces import STTEngine, STTSpan
 from uvt.segmenter import Segmenter, SegmenterParams, create_vad_engine
 from uvt.services.stt import _is_junk
 from uvt.services.translate import _same_lang
@@ -52,6 +53,9 @@ RAMP_S = 0.05         # плавность приглушения, 50 мс
 BATCH_MAX_ITEMS = 20  # реплик на один запрос к LLM…
 BATCH_MAX_CHARS = 2500  # …но не больше этого объёма текста
 TTS_CONCURRENCY = 4
+_DUB_SENTENCE_END = re.compile(r"[.!?…]+[\"»')\]]*$")
+_MAX_COMPACT_SPAN_S = 12.0
+_MAX_COMPACT_GAP_S = 0.9
 
 ProgressFn = Callable[[int, int], None]
 _StageCb = Callable[[float], None]
@@ -65,6 +69,51 @@ class _SynthClip:
     source_start: float
     samples: np.ndarray
     sample_rate: int
+
+
+def _compact_stt_spans(spans: list[STTSpan]) -> list[STTSpan]:
+    """Join Whisper fragments that are really parts of one sentence.
+
+    MLX Whisper can split a long narration into several timestamp segments
+    even when there is no sentence boundary.  Synthesizing every fragment
+    separately makes Piper pay ONNX overhead hundreds of times and produces
+    choppy speech.  Keep real punctuation, long pauses, language changes, and
+    the 12-second sync guard as hard boundaries.
+    """
+    if not spans:
+        return []
+
+    compacted: list[STTSpan] = []
+    current = STTSpan(
+        spans[0].start,
+        spans[0].end,
+        " ".join(spans[0].text.split()),
+        spans[0].language,
+    )
+    for item in spans[1:]:
+        text = " ".join(item.text.split())
+        gap = max(0.0, item.start - current.end)
+        language_changed = bool(
+            current.language and item.language and current.language != item.language
+        )
+        can_join = (
+            not _DUB_SENTENCE_END.search(current.text)
+            and gap <= _MAX_COMPACT_GAP_S
+            and (item.end - current.start) <= _MAX_COMPACT_SPAN_S
+            and not language_changed
+        )
+        if can_join:
+            current = STTSpan(
+                current.start,
+                item.end,
+                f"{current.text} {text}".strip(),
+                current.language or item.language,
+            )
+            continue
+        compacted.append(current)
+        current = STTSpan(item.start, item.end, text, item.language)
+    compacted.append(current)
+    return compacted
 
 
 def _ffmpeg(args: list[str]) -> None:
@@ -108,6 +157,19 @@ def _find_ytdlp() -> str | None:
     return shutil.which("yt-dlp")
 
 
+def _ytdlp_js_args() -> list[str]:
+    """Явно включает доступный JS runtime для современных YouTube challenge.
+
+    yt-dlp включает Deno автоматически, но Node/Bun требует флага. UVT не
+    скачивает runtime сам: используем только уже установленный executable.
+    """
+    for runtime in ("deno", "node", "bun"):
+        executable = shutil.which(runtime)
+        if executable:
+            return ["--js-runtimes", f"{runtime}:{executable}"]
+    return []
+
+
 def download_url(url: str, dest_dir: Path) -> Path:
     """Скачивает ролик через yt-dlp (YouTube, Twitch VOD, Vimeo и т.д.)."""
     ytdlp = _find_ytdlp()
@@ -118,6 +180,8 @@ def download_url(url: str, dest_dir: Path) -> Path:
         subprocess.run(
             [
                 ytdlp,
+                "--ignore-config",
+                *_ytdlp_js_args(),
                 # у YouTube бывают дорожки авто-дубляжа — берём оригинальную
                 "-f", "bv*+ba[format_note*=original]/bv*+ba/b",
                 "--merge-output-format", "mkv",
@@ -161,17 +225,27 @@ async def _transcribe_all(
     source_lang: str | None,
     progress: _StageCb | None,
     approval: ApprovalGate | None = None,
+    stt_engine: STTEngine | None = None,
 ) -> list[STTSpan]:
-    stt = create_stt_engine(cfg, approval=approval)
-    await stt.warmup()
+    stt = stt_engine or create_stt_engine(cfg, approval=approval)
     try:
+        # Own the engine before loading native weights. If the job is cancelled
+        # during warm-up, ``close`` must still run before another Metal task.
+        await stt.warmup()
+
         def stt_progress(done_s: float, total_s: float) -> None:
             if progress is not None:
                 progress(done_s / max(total_s, 1e-6))
 
         spans = await stt.transcribe_long(mono16, PIPE_RATE, source_lang, progress=stt_progress)
         if spans is not None:
-            log.info("пакетное распознавание: %d реплик", len(spans))
+            raw_count = len(spans)
+            spans = _compact_stt_spans(spans)
+            log.info(
+                "пакетное распознавание: %d фрагментов → %d реплик",
+                raw_count,
+                len(spans),
+            )
             return spans
 
         # Резервный путь: движок без пакетного режима → наш VAD + по одной
@@ -188,16 +262,40 @@ async def _transcribe_all(
                 segments.append(tail)
             log.info("VAD-путь: %d реплик", len(segments))
 
-            spans = []
-            for n, seg in enumerate(segments, 1):
-                result = await stt.transcribe(seg.samples, seg.sample_rate, source_lang)
-                if progress is not None:
-                    progress(n / max(len(segments), 1))
-                if result is not None and result.text.strip():
-                    spans.append(
-                        STTSpan(seg.start_ts, seg.end_ts, result.text, result.language)
+            parallelism = max(1, int(getattr(stt, "concurrency_hint", 1)))
+            log.info(
+                "распознавание VAD-фрагментов: параллельность %d", parallelism
+            )
+            limit = asyncio.Semaphore(parallelism)
+            completed = 0
+            results: list[STTSpan | None] = [None] * len(segments)
+
+            async def transcribe_one(index: int, seg) -> None:
+                nonlocal completed
+                async with limit:
+                    result = await stt.transcribe(
+                        seg.samples, seg.sample_rate, source_lang
                     )
-            return spans
+                if result is not None and result.text.strip():
+                    results[index] = STTSpan(
+                        seg.start_ts, seg.end_ts, result.text, result.language
+                    )
+                completed += 1
+                if progress is not None:
+                    progress(completed / max(len(segments), 1))
+
+            tasks = [
+                asyncio.create_task(transcribe_one(index, seg))
+                for index, seg in enumerate(segments)
+            ]
+            try:
+                await asyncio.gather(*tasks)
+            except BaseException:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+            return [span for span in results if span is not None]
         finally:
             await vad_engine.close()
     finally:
@@ -235,8 +333,11 @@ async def _translate_all(
         return [span.text for span in spans]
 
     translator = create_translation_engine(cfg, approval=approval)
-    await translator.warmup()
     try:
+        # Keep model loading inside the same cancellation-safe lifecycle as
+        # inference and release.
+        await translator.warmup()
+
         detected = Counter(span.language or "und" for span in spans).most_common(1)[0][0]
         lang = source_lang or (None if detected == "und" else detected)
         translated: list[str | None] = [None] * len(spans)
@@ -286,6 +387,9 @@ async def _translate_all(
         except asyncio.CancelledError:
             for task in tasks:
                 task.cancel()
+            # Piper drains an already-started native phrase on cancellation.
+            # Wait for those bounded workers before closing shared voices.
+            await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
         # Допереводчик: слабые модели часть строк возвращают без изменений или
@@ -328,6 +432,92 @@ async def _translate_all(
 MAX_SPEEDUP = 1.6     # потолок ускорения озвучки
 SLOT_MARGIN_S = 0.15  # зазор до следующей реплики
 CLIP_LEAD_S = 0.15    # озвучка стартует чуть раньше оригинала — синхроннее на слух
+_FATAL_TTS_HTTP_STATUSES = {401, 402, 403}
+_RETRYABLE_TTS_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
+_TTS_PROVIDER_LABELS = {
+    "openai": "OpenAI",
+    "elevenlabs": "ElevenLabs",
+    "edge": "Microsoft Edge TTS",
+}
+
+
+def _is_fatal_tts_error(error: BaseException) -> bool:
+    """Auth/payment errors cannot be fixed by retrying every subtitle line."""
+    return _tts_http_status(error) in _FATAL_TTS_HTTP_STATUSES
+
+
+def _tts_http_status(error: BaseException) -> int | None:
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    return int(status) if isinstance(status, int) else None
+
+
+def _is_retryable_tts_error(error: BaseException) -> bool:
+    return _tts_http_status(error) in _RETRYABLE_TTS_HTTP_STATUSES
+
+
+def _tts_retry_delay(error: BaseException, attempt: int) -> float:
+    """Use provider Retry-After when present, otherwise bounded exponential backoff."""
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    raw = headers.get("retry-after") or headers.get("Retry-After")
+    try:
+        if raw is not None:
+            return min(30.0, max(0.5, float(raw)))
+    except (TypeError, ValueError):
+        pass
+    return min(30.0, max(1.0, 2.0 ** max(0, attempt - 1)))
+
+
+def _tts_failure_reason(provider: str, error: BaseException) -> str:
+    status = _tts_http_status(error)
+    if status == 429:
+        return (
+            f"{provider} временно ограничил частоту запросов (HTTP 429); "
+            "уменьшена параллельность, повторите задачу через минуту"
+        )
+    if status == 402:
+        return (
+            f"{provider} отклонил запрос по квоте/биллингу (HTTP 402): "
+            "проверьте остаток символов бесплатного тарифа и лимит аккаунта"
+        )
+    if status in (401, 403):
+        return f"{provider} отклонил ключ или доступ (HTTP {status}): проверьте API-ключ"
+    return f"{provider} отклонил запрос (HTTP {status or '?'})"
+
+
+def _fit_audio_tempo(samples: np.ndarray, sample_rate: int, factor: float) -> np.ndarray:
+    """Compress a synthesized clip with ffmpeg atempo without changing pitch."""
+    if factor <= 1.01 or len(samples) == 0:
+        return samples
+    source = np.ascontiguousarray(samples, dtype=np.float32)
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-f",
+                "f32le",
+                "-ar",
+                str(sample_rate),
+                "-ac",
+                "1",
+                "-i",
+                "pipe:0",
+                "-af",
+                f"atempo={factor:.6f}",
+                "-f",
+                "f32le",
+                "pipe:1",
+            ],
+            input=source.tobytes(),
+            capture_output=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"ffmpeg не смог скорректировать темп TTS ×{factor:.2f}") from exc
+    return np.frombuffer(proc.stdout, dtype=np.float32).copy()
 
 
 async def _synthesize_all(
@@ -339,45 +529,128 @@ async def _synthesize_all(
 ) -> list[_SynthClip]:
     # Отдельный движок на каждый нужный пол голоса (мужской/женский диалог)
     engines: dict[str, object] = {}
-    for gender in dict.fromkeys(genders):
-        tts_cfg = cfg.tts.model_copy(deep=True)
-        tts_cfg.voice_gender = gender
-        engine = registry.create("tts", cfg.tts.engine, tts_cfg)
-        await engine.warmup()
-        engines[gender] = engine
+    try:
+        for gender in dict.fromkeys(genders):
+            tts_cfg = cfg.tts.model_copy(deep=True)
+            tts_cfg.voice_gender = gender
+            engine = registry.create("tts", cfg.tts.engine, tts_cfg)
+            # Register ownership before warm-up so a partial/cancelled warm-up
+            # is released together with voices that were already ready.
+            engines[gender] = engine
+            await engine.warmup()
+    except BaseException:
+        await asyncio.gather(
+            *(engine.close() for engine in engines.values()),
+            return_exceptions=True,
+        )
+        raise
 
     limit = asyncio.Semaphore(int(getattr(cfg.tts, "concurrency", TTS_CONCURRENCY)))
-    finished = 0
+    request_interval = max(0.0, float(getattr(cfg.tts, "request_interval_s", 0.0) or 0.0))
+    request_gate = asyncio.Lock()
+    next_request_at = 0.0
+    initial_finished = 0
+    refit_finished = 0
+    fatal_error: BaseException | None = None
+    provider = _TTS_PROVIDER_LABELS.get(cfg.tts.engine, cfg.tts.engine)
 
-    async def synth(index: int, span: STTSpan, text: str, gender: str, speed: float = 1.0):
-        nonlocal finished
+    duration_rates = dict(getattr(cfg.tts, "duration_per_char", {}) or {})
+    target_root = str(cfg.target_lang or "").replace("_", "-").split("-", 1)[0].lower()
+
+    def predicted_speed(index: int, text: str, gender: str) -> float:
+        if index + 1 >= len(spans):
+            return 1.0
+        slot = spans[index + 1].start - spans[index].start - SLOT_MARGIN_S
+        if slot <= 0.5:
+            return 1.0
+        rate = float(
+            duration_rates.get(f"{target_root}:{gender}")
+            or duration_rates.get(f"{target_root}:default")
+            or duration_rates.get(gender)
+            or duration_rates.get("default")
+            or 0.0
+        )
+        if rate <= 0:
+            return 1.0
+        estimated_duration = len(text) * rate
+        if estimated_duration <= slot + 0.3:
+            return 1.0
+        return min(MAX_SPEEDUP, max(1.0, estimated_duration / slot))
+
+    initial_speeds = [
+        predicted_speed(index, text, gender)
+        for index, (text, gender) in enumerate(zip(texts, genders))
+    ]
+    predicted_count = sum(speed > 1.0 for speed in initial_speeds)
+    if predicted_count:
+        log.info(
+            "сразу ускоряю %d реплик по длительности выбранного голоса",
+            predicted_count,
+        )
+
+    async def synth(
+        index: int,
+        span: STTSpan,
+        text: str,
+        gender: str,
+        speed: float = 1.0,
+    ):
+        nonlocal fatal_error, initial_finished, next_request_at
         engine = engines[gender]
         try:
-            for attempt in (1, 2):  # сетевой TTS иногда мигает — один повтор
+            max_attempts = 4 if cfg.tts.engine == "elevenlabs" else 2
+            for attempt in range(1, max_attempts + 1):
                 try:
                     async with limit:
+                        if fatal_error is not None:
+                            return None
+                        if request_interval:
+                            async with request_gate:
+                                now = asyncio.get_running_loop().time()
+                                wait_s = max(0.0, next_request_at - now)
+                                next_request_at = max(now, next_request_at) + request_interval
+                            if wait_s:
+                                await asyncio.sleep(wait_s)
                         if speed > 1.0:
                             speech, rate = await engine.synthesize_rated(text, cfg.target_lang, speed)
                         else:
                             speech, rate = await engine.synthesize(text, cfg.target_lang)
                     break
                 except Exception as exc:  # noqa: BLE001
-                    if attempt == 2:
+                    if _is_fatal_tts_error(exc):
                         raise
-                    log.warning("озвучка @%.1f с: %s — повторяю", span.start, exc)
-                    await asyncio.sleep(1.0)
+                    if attempt == max_attempts or not _is_retryable_tts_error(exc):
+                        raise
+                    delay = _tts_retry_delay(exc, attempt)
+                    log.warning(
+                        "озвучка @%.1f с: %s — повторяю через %.1f с",
+                        span.start,
+                        exc,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
         except Exception as exc:  # noqa: BLE001 — одна реплика не валит дубляж
-            log.error("озвучка реплики @%.1f с не удалась: %s", span.start, exc)
+            if _is_fatal_tts_error(exc) or _tts_http_status(exc) == 429:
+                if fatal_error is None:
+                    fatal_error = exc
+                    log.error(
+                        "озвучка остановлена: %s",
+                        _tts_failure_reason(provider, exc),
+                    )
+            else:
+                log.error("озвучка реплики @%.1f с не удалась: %s", span.start, exc)
             return None
         finally:
-            finished += 1
             if progress is not None:
-                progress(finished / max(len(spans) * 1.2, 1))
+                initial_finished += 1
+                # Оставляем последние 18% стадии для точного tempo-fit-прохода.
+                # Так UI не показывает «сборка», пока обработка ещё идёт.
+                progress(0.82 * initial_finished / max(len(spans), 1))
         return _SynthClip(index, span.start, speech, rate) if len(speech) else None
 
     try:
         tasks = [
-            asyncio.create_task(synth(i, s, t, g))
+            asyncio.create_task(synth(i, s, t, g, initial_speeds[i]))
             for i, (s, t, g) in enumerate(zip(spans, texts, genders))
         ]
         try:
@@ -386,9 +659,14 @@ async def _synthesize_all(
             for task in tasks:
                 task.cancel()
             raise
+        if fatal_error is not None:
+            raise RuntimeError(
+                f"озвучка остановлена: {_tts_failure_reason(provider, fatal_error)}"
+            ) from fatal_error
 
-        # Укладка в тайминги: озвучка длиннее промежутка до следующей реплики
-        # сдвигала бы все последующие — пересинтезируем её быстрее.
+        # Укладка в тайминги: остаточное превышение после предсказанного темпа
+        # правим быстрым pitch-preserving atempo. Повторный прогон Piper/OpenAI
+        # здесь вдвое увеличивал время и для cloud ещё раз расходовал бы токены.
         refit: list[tuple[int, float]] = []
         for i, clip in enumerate(clips):
             if clip is None or i + 1 >= len(spans):
@@ -396,18 +674,48 @@ async def _synthesize_all(
             duration = len(clip.samples) / clip.sample_rate
             slot = spans[i + 1].start - spans[i].start - SLOT_MARGIN_S
             if slot > 0.5 and duration > slot + 0.3:
-                refit.append((i, min(MAX_SPEEDUP, duration / slot)))
+                current_speed = initial_speeds[i]
+                max_extra_factor = MAX_SPEEDUP / max(current_speed, 1.0)
+                tempo_factor = min(max_extra_factor, duration / slot)
+                if tempo_factor > 1.03:
+                    refit.append((i, tempo_factor))
         if refit:
-            log.info("ускоряю %d реплик, чтобы уложиться в тайминги оригинала", len(refit))
-            refit_tasks = [
-                asyncio.create_task(synth(i, spans[i], texts[i], genders[i], speed))
-                for i, speed in refit
-            ]
-            refit_clips = await asyncio.gather(*refit_tasks)
-            for (i, _speed), clip in zip(refit, refit_clips):
-                if clip is not None:
-                    clips[i] = clip
+            log.info(
+                "подгоняю atempo %d реплик под тайминги без повторного TTS",
+                len(refit),
+            )
 
+            async def fit_one(index: int, factor: float) -> _SynthClip:
+                nonlocal refit_finished
+                clip = clips[index]
+                assert clip is not None
+                try:
+                    async with limit:
+                        fitted = await asyncio.to_thread(
+                            _fit_audio_tempo,
+                            clip.samples,
+                            clip.sample_rate,
+                            factor,
+                        )
+                    return _SynthClip(
+                        clip.index,
+                        clip.source_start,
+                        fitted,
+                        clip.sample_rate,
+                    )
+                finally:
+                    refit_finished += 1
+                    if progress is not None:
+                        progress(0.82 + 0.18 * refit_finished / len(refit))
+
+            refit_clips = await asyncio.gather(
+                *(fit_one(index, factor) for index, factor in refit)
+            )
+            for (index, _factor), clip in zip(refit, refit_clips):
+                clips[index] = clip
+
+        if progress is not None:
+            progress(1.0)
         return [clip for clip in clips if clip is not None]
     finally:
         for engine in engines.values():
@@ -421,6 +729,7 @@ async def render_dub_track(
     progress: ProgressFn | None = None,
     mix_original: bool = True,
     approval: ApprovalGate | None = None,
+    stt_engine: STTEngine | None = None,
 ) -> tuple[np.ndarray, list[HistoryEntry]]:
     """Готовит дублированную дорожку.
 
@@ -443,8 +752,11 @@ async def render_dub_track(
             return None
         return lambda fraction: progress(int(base + span_pct * min(max(fraction, 0.0), 1.0)), 100)
 
+    total_started = time.perf_counter()
+    stage_started = total_started
     log.info("декодирую %s…", input_path.name)
     mono16 = _decode_file(input_path, PIPE_RATE, 1)
+    log.info("декодирование завершено за %.1f с", time.perf_counter() - stage_started)
     duration = len(mono16) / PIPE_RATE
     if duration > 3600:
         log.warning("файл длиннее часа — обработка идёт в памяти, следите за RAM")
@@ -453,7 +765,16 @@ async def render_dub_track(
     translating = cfg.translation.engine not in ("none", "passthrough")
 
     # 1. Реплики с таймкодами
-    spans = await _transcribe_all(cfg, mono16, source_lang, stage(0, 70), approval=approval)
+    stage_started = time.perf_counter()
+    spans = await _transcribe_all(
+        cfg,
+        mono16,
+        source_lang,
+        stage(0, 70),
+        approval=approval,
+        stt_engine=stt_engine,
+    )
+    log.info("распознавание завершено за %.1f с", time.perf_counter() - stage_started)
     spans = [
         STTSpan(s.start, s.end, " ".join(s.text.split()), s.language)
         for s in spans
@@ -501,9 +822,11 @@ async def render_dub_track(
         genders_all = [configured_gender] * len(spans)
 
     # 2. Перевод пачками (с полом говорящего)
+    stage_started = time.perf_counter()
     translated = await _translate_all(
         cfg, spans, source_lang, genders_all, stage(70, 15), approval=approval
     )
+    log.info("перевод завершён за %.1f с", time.perf_counter() - stage_started)
     kept_spans: list[STTSpan] = []
     kept_texts: list[str] = []
     kept_genders: list[str] = []
@@ -525,7 +848,9 @@ async def render_dub_track(
         log.info("[@%7.1f с] %s ⇒ %s", span.start, span.text, text)
 
     # 3. Озвучка параллельно
+    stage_started = time.perf_counter()
     clips = await _synthesize_all(cfg, kept_spans, kept_texts, kept_genders, stage(85, 12))
+    log.info("озвучка завершена за %.1f с", time.perf_counter() - stage_started)
     if not clips:
         raise RuntimeError("озвучка не удалась ни для одной реплики")
 
@@ -607,6 +932,7 @@ async def render_dub_track(
 
     if progress is not None:
         progress(100, 100)
+    log.info("дорожка подготовлена за %.1f с", time.perf_counter() - total_started)
     return track, entries
 
 

@@ -13,6 +13,7 @@ stt:
   base_url: https://api.openai.com/v1
   api_key_env: OPENAI_API_KEY
   model: gpt-4o-mini-transcribe
+  concurrency: 8
   fallback:
     engine: faster-whisper
     model: small
@@ -25,6 +26,8 @@ translation:
   api_key_env: OPENAI_API_KEY
   model: gpt-4o-mini
   temperature: 0.2
+  batch_size: 24
+  concurrency: 6
   fallback:
     engine: openai-compatible
     base_url: http://127.0.0.1:11434/v1
@@ -40,7 +43,11 @@ tts:
   model: eleven_multilingual_v2
   output_format: mp3_44100_128
   voice: auto
+  # Бесплатный тариф ElevenLabs ограничивает burst/параллельность. Две
+  # одновременные реплики и короткая пауза заметно надёжнее четырёх burst-
+  # запросов; HTTP 429 дополнительно повторяется с Retry-After.
   concurrency: 2
+  request_interval_s: 0.5
 
 output:
   target_delay_s: 2.0

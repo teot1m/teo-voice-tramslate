@@ -19,8 +19,10 @@ def test_privacy_copy_separates_local_free_and_cloud():
     free = load_config(str(ROOT / "profiles" / "free.yaml"))
     cloud = load_config(str(ROOT / "profiles" / "cloud-fast.yaml"))
     eleven = load_config(str(ROOT / "profiles" / "cloud-eleven.yaml"))
+    mac_local = load_config(str(ROOT / "profiles" / "local-balanced.yaml"))
 
     assert _privacy_summary(local)[0] == "PRIVATE LOCAL"
+    assert _privacy_summary(mac_local)[0] == "PRIVATE LOCAL"
     assert _privacy_summary(free)[0] == "HYBRID"
     assert "Microsoft Edge TTS" in _privacy_summary(free)[1]
     assert _privacy_summary(cloud)[0] == "CLOUD"

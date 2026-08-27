@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import platform
 import sys
 
 from uvt import __version__
@@ -36,13 +37,25 @@ def _load_env_file(path: str = ".env") -> None:
         pass
 
 
+def _default_personal_free_profile() -> str:
+    configured = os.environ.get("UVT_FREE_PROFILE", "").strip()
+    if configured:
+        return configured
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        return "local-balanced"
+    return "free-vps"
+
+
 _VIRTUAL_MARKERS = ("blackhole", "vb-audio", "cable", "monitor", "loopback", "virtual", "voicemeeter")
 _LEGACY_LIVE_MODES = {"replace", "dual"}
 _PROFILE_OVERVIEW = (
     ("local", "private local: Whisper + Ollama + Piper; модели и Piper нужно настроить"),
+    ("local-fast", "Apple Silicon: Parakeet + NLLB INT8 + Piper; максимум скорости"),
+    ("local-balanced", "M4/16 ГБ: Parakeet + TranslateGemma 4-bit + Piper"),
+    ("local-quality", "Apple Silicon: chunked Whisper large + TranslateGemma + Piper"),
     ("free", "без платных API: локальные STT/перевод + Microsoft Edge TTS через сеть"),
     ("free-vps", "Linux VPS: CPU Whisper + Ollama Qwen 3B последовательно + Edge TTS"),
-    ("free-quality", "Apple Silicon: MLX Whisper large + Qwen 3B последовательно + Edge TTS"),
+    ("free-quality", "Apple Silicon 8 ГБ: MLX Whisper + NLLB INT8 + Piper, всё локально"),
     ("cloud-fast", "облачные STT/перевод/TTS с упором на минимальную задержку"),
     ("cloud-eleven", "OpenAI STT/GPT-перевод + естественная озвучка ElevenLabs"),
     ("cloud-quality", "облачный пакетный дубляж с упором на качество"),
@@ -109,15 +122,40 @@ def _build_parser() -> argparse.ArgumentParser:
         "--free-port", type=int, default=int(os.environ.get("UVT_FREE_PORT", "8765"))
     )
     personal.add_argument(
+        "--free-profile",
+        default=_default_personal_free_profile(),
+        help="профиль Free-маршрута (на Apple Silicon рекомендуется local-balanced)",
+    )
+    personal.add_argument(
         "--gpt-port", type=int, default=int(os.environ.get("UVT_CLOUD_PORT", "8766"))
     )
     personal.add_argument(
         "--eleven-port", type=int, default=int(os.environ.get("UVT_ELEVEN_PORT", "8767"))
     )
+    personal.add_argument(
+        "--open-browser",
+        action="store_true",
+        help="открыть локальную панель после успешного запуска всех трёх маршрутов",
+    )
     personal.add_argument("--debug", action="store_true")
 
     sub.add_parser("devices", help="список аудиоустройств (вход/выход, виртуальные помечены)")
     sub.add_parser("profiles", help="показать готовые профили и их маршрут данных")
+    setup_local = sub.add_parser(
+        "setup-mac-local",
+        help="один раз скачать оптимальные MLX/NLLB/Piper-модели для Apple Silicon",
+    )
+    setup_local.add_argument(
+        "--preset",
+        choices=("fast", "balanced", "quality", "all"),
+        default="balanced",
+        help="набор моделей (по умолчанию balanced для M4/16 ГБ)",
+    )
+    setup_local.add_argument(
+        "--check",
+        action="store_true",
+        help="только проверить локальный кэш; ничего не скачивать",
+    )
 
     gui = sub.add_parser("gui", help="графический интерфейс: отдельные Live и Batch сценарии")
     gui.add_argument("--profile", "-p", help="профиль при старте; в GUI можно переключить маршрут")
@@ -167,7 +205,7 @@ def _print_profiles() -> int:
     for name, description in _PROFILE_OVERVIEW:
         print(f"  {name:14} {description}")
     print(
-        "\n`local` не ходит в сеть во время работы после установки моделей. "
+        "\n`local-*` не ходят в сеть во время работы после установки моделей. "
         "`free` бесплатен по цене, но Edge TTS отправляет текст в Microsoft.\n"
         "Выберите: uvt run -p <имя>, uvt dub <файл> -p <имя> или uvt gui -p <имя>."
     )
@@ -193,6 +231,25 @@ def main(argv: list[str] | None = None) -> int:
         return _print_devices()
     if args.command == "profiles":
         return _print_profiles()
+    if args.command == "setup-mac-local":
+        from uvt.setup_local import format_setup_report, setup_mac_local
+
+        try:
+            result = setup_mac_local(args.preset, dry_run=args.check)
+        except Exception as exc:  # noqa: BLE001 - concise setup error
+            if getattr(args, "debug", False):
+                raise
+            print(f"Ошибка подготовки: {exc}", file=sys.stderr)
+            return 1
+        print(format_setup_report(result))
+        if not result.get("ready"):
+            return 1
+        launch = {
+            "fast": "uvt serve-personal --free-profile local-fast",
+            "quality": "uvt serve-personal --free-profile local-quality",
+        }.get(args.preset, "uvt serve-personal")
+        print(f"Запуск: {launch}")
+        return 0
 
     if getattr(args, "mode", None) in _LEGACY_LIVE_MODES:
         print(
@@ -243,9 +300,20 @@ def main(argv: list[str] | None = None) -> int:
             print('серверу нужен aiohttp — установите: pip install "uvt[server]"', file=sys.stderr)
             return 1
         from uvt.server import run_server
+        from uvt.server_settings import ServerSettingsStore, route_key
 
         try:
-            asyncio.run(run_server(cfg, host=args.host, port=args.port))
+            asyncio.run(
+                run_server(
+                    cfg,
+                    host=args.host,
+                    port=args.port,
+                    route_label=str(args.profile or "UVT"),
+                    profile_name=str(args.profile or "configured"),
+                    settings_store=ServerSettingsStore.default(),
+                    settings_key=route_key(str(args.profile or "UVT")),
+                )
+            )
         except KeyboardInterrupt:
             pass
         return 0
@@ -265,6 +333,8 @@ def main(argv: list[str] | None = None) -> int:
                     free_port=args.free_port,
                     gpt_port=args.gpt_port,
                     eleven_port=args.eleven_port,
+                    free_profile=args.free_profile,
+                    open_browser=args.open_browser,
                 )
             )
         except KeyboardInterrupt:

@@ -37,13 +37,23 @@ dependencies = [
 [project.optional-dependencies]
 stt = ["faster-whisper>=1.0.0"]
 mlx = ["mlx-whisper>=0.4.0; sys_platform == 'darwin'"]
+mac-local = [
+    "parakeet-mlx==0.5.2; sys_platform == 'darwin'",
+    "mlx-whisper>=0.4.0; sys_platform == 'darwin'",
+    "mlx-lm==0.31.3; sys_platform == 'darwin'",
+    "langid==1.1.6",
+    "ctranslate2>=4.8.0",
+    "tokenizers>=0.21.0",
+    "huggingface-hub>=0.25.0",
+    "piper-tts>=1.4.0",
+]
 vad = ["onnxruntime>=1.17"]
 tts = ["edge-tts>=6.1.9"]
-piper = ["piper-tts>=1.2"]
+piper = ["piper-tts>=1.4.0"]
 kokoro = ["kokoro-onnx>=0.4.0"]
 webrtc = ["webrtcvad>=2.0.10"]
 server = ["aiohttp>=3.9"]
-web = ["yt-dlp>=2024.4.9"]
+web = ["yt-dlp[default]>=2026.8.19"]
 gui = ["PySide6>=6.6"]
 windows = ["PyAudioWPatch>=0.2.12; sys_platform == 'win32'"]
 # Рекомендуемый рабочий набор MVP: локальный Whisper + Silero VAD + Edge TTS

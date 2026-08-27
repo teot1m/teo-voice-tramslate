@@ -62,6 +62,9 @@ _LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 _CURATED_PROFILES = (
     ("Текущая конфигурация", None),
     ("Local Private — всё на этом устройстве", "local"),
+    ("Mac Local Fast — Parakeet + NLLB + Piper", "local-fast"),
+    ("Mac Local Balanced — Parakeet + TranslateGemma", "local-balanced"),
+    ("Mac Local Quality — Whisper + TranslateGemma", "local-quality"),
     ("Free — без оплаты, Edge TTS через сеть", "free"),
     ("Cloud Fast — меньше задержка", "cloud-fast"),
     ("Cloud ElevenLabs — другой провайдер озвучки", "cloud-eleven"),
@@ -88,14 +91,20 @@ def _privacy_summary(cfg: AppConfig) -> tuple[str, str]:
     local: list[str] = []
     remote: list[str] = []
 
-    if cfg.stt.engine in {"faster-whisper", "mlx-whisper", "dummy"}:
+    if cfg.stt.engine in {"faster-whisper", "mlx-whisper", "parakeet-mlx", "dummy"}:
         local.append("распознавание")
     elif cfg.stt.engine == "openai-compatible" and _is_local_endpoint(cfg.stt.base_url):
         local.append("распознавание")
     else:
         remote.append("аудио для распознавания")
 
-    if cfg.translation.engine in {"none", "passthrough", "dummy"}:
+    if cfg.translation.engine in {
+        "nllb-ct2",
+        "translategemma-mlx",
+        "none",
+        "passthrough",
+        "dummy",
+    }:
         local.append("перевод")
     elif _is_local_endpoint(getattr(cfg.translation, "base_url", "")):
         local.append("перевод")

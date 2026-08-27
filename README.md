@@ -20,7 +20,7 @@ UVT сознательно разделяет два разных сценари
 - **Пакетная синхронизация:** распознавание с пословными таймкодами, пофразовая раскладка TTS и ускорение слишком длинных реплик. В готовом экспорте сохраняются реальные границы TTS, а не оценка по длине текста.
 - **Честный Live-путь:** единые часы захвата, target/deadline для реплики, newest-first обработка и счётчики намеренно пропущенных фраз. GUI показывает p50 задержек, drift и drops, когда они доступны движку.
 - **Маршруты данных на выбор:** private local, free без платных API, Cloud Fast и Cloud Quality — без ложной надписи «offline» для Edge TTS.
-- **Независимые движки:** локальные/облачные STT, OpenAI-совместимый перевод, Edge/OpenAI/Piper/Kokoro TTS, plugins и ленивые зависимости.
+- **Независимые движки:** Parakeet/Whisper/облачные STT, TranslateGemma/NLLB/OpenAI-совместимый перевод, Edge/OpenAI/Piper/Kokoro TTS, plugins и ленивые зависимости.
 - **Субтитры и история:** оверлей, SRT/VTT/TXT/JSON, исходный текст и перевод.
 - **Один desktop-интерфейс:** отдельные вкладки Live и Batch, выбор входа/выхода, подсказки BlackHole/WASAPI/PipeWire, статус каждой стадии и видимая ошибка.
 
@@ -30,8 +30,8 @@ UVT сознательно разделяет два разных сценари
 
 ```bash
 git clone <ваш-репозиторий> uvt && cd uvt        # скачать репозиторий и перейти в него
-python3 -m venv .venv && source .venv/bin/activate  # создать и активировать venv
-pip install -e ".[recommended,server,web]"       # установить UVT с рекомендуемыми зависимостями
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[recommended,server,web]"
 uvt run -p demo                 # smoke test без моделей и сети
 uvt profiles                    # список честных маршрутов данных
 ```
@@ -42,6 +42,13 @@ uvt profiles                    # список честных маршрутов
 pip install -e ".[gui]"        # desktop-интерфейс
 pip install -e ".[piper]"      # локальная озвучка Piper для -p local
 pip install -e ".[mlx]"        # Apple Silicon: локальный Whisper на Metal
+pip install -e ".[mac-local,server,web]"  # M1/M2/M3/M4: весь private-local batch-маршрут
+uvt setup-mac-local --preset balanced  # M4/16 ГБ: pinned Parakeet, TranslateGemma и RU/UK Piper
+uvt setup-mac-local --preset balanced --check  # offline-проверка без скачивания
+# Либо --preset all, если нужен выбор Fast/Balanced/Quality в браузере
+uvt serve-personal
+# Web-панель статуса и настроек: http://127.0.0.1:8765/
+# Локально открыть её при старте: uvt serve-personal --open-browser
 ```
 
 ## Команды
@@ -53,9 +60,11 @@ pip install -e ".[mlx]"        # Apple Silicon: локальный Whisper на 
 | `uvt run -p <профиль>` | Live-конвейер в консоли (системный звук → перевод) | `--source-lang`, `--target-lang`, `--mode {subtitles,voiceover}`, `--debug` |
 | `uvt dub <файл\|ссылка> -p <профиль>` | Пакетный дубляж: готовая дорожка + `.srt`/`.json` | `--output/-o`, `--duck-db`, `--no-original-track`, `--debug` |
 | `uvt serve -p <профиль>` | Сервер для браузерной кнопки (userscript) | `--host`, `--port`, `--target-lang`, `--source-lang` |
+| `uvt serve-personal` | Одновременно Local/Free, GPT и ElevenLabs + web-панель | `--open-browser` (только local desktop), `--free-profile`, порты |
 | `uvt gui -p <профиль>` | Desktop-интерфейс: вкладки Live и Batch | `--debug`; профиль можно сменить прямо в окне |
 | `uvt devices` | Список аудиоустройств, виртуальные помечены `🔁` | — |
 | `uvt profiles` | Готовые профили и их маршрут данных | — |
+| `uvt setup-mac-local` | Скачать или offline-проверить закреплённые локальные модели Apple Silicon | `--preset {fast,balanced,quality,all}`, `--check` |
 | `uvt version` | Версия установленного UVT | — |
 
 `-p/--profile` принимает как имя файла из [profiles/](profiles/) (`cloud-fast`, `local`, …), так и путь к своему YAML. Примеры:
@@ -75,9 +84,12 @@ uvt serve -p free --port 8080              # сервер для браузер�
 | Профиль | Маршрут данных | Для чего | Что требуется |
 | --- | --- | --- | --- |
 | [`local`](profiles/local.yaml) | STT + Ollama + Piper локально | Чувствительный контент и offline после подготовки | Локальные модели, Ollama, `piper` и путь `tts.model_path` к голосу |
+| [`local-fast`](profiles/local-fast.yaml) | Parakeet 0.6B v3 → NLLB 1.3B INT8 → Piper | Самая быстрая полностью локальная обработка | `uvt setup-mac-local --preset fast` |
+| [`local-balanced`](profiles/local-balanced.yaml) | Parakeet 0.6B v3 → TranslateGemma 4B 4-bit → Piper | Рекомендуемый баланс для M4/16 ГБ | `uvt setup-mac-local --preset balanced` |
+| [`local-quality`](profiles/local-quality.yaml) | Chunked Whisper large-v3-turbo → TranslateGemma 4B 4-bit → Piper | Трудный звук и более устойчивое chunked-распознавание с одним определённым языком на ролик | `uvt setup-mac-local --preset quality` |
 | [`free`](profiles/free.yaml) | Whisper + Ollama локально, **Microsoft Edge TTS через сеть** | Ноль платных API и быстрый старт | Локальные модели/Ollama; ключ не нужен |
 | [`free-vps`](profiles/free-vps.yaml) | CPU Whisper + Ollama локально, **Microsoft Edge TTS через сеть** | Личный Linux VPS с одной batch-задачей | 2+ vCPU, 8+ GB RAM, Ollama Qwen 3B |
-| [`free-quality`](profiles/free-quality.yaml) | MLX Whisper large + Ollama Qwen 3B локально, **Edge TTS через сеть** | Apple Silicon: выше качество STT/структуры речи | `.[mlx]`, заранее загруженные модели; медленнее `free` |
+| [`free-quality`](profiles/free-quality.yaml) | MLX Whisper large-v3-turbo → NLLB 1.3B INT8 → Piper, полностью локально | Совместимый прежний маршрут для 8+ ГБ | `.[mac-local]` и `uvt setup-mac-local --preset all` |
 | [`cloud-fast`](profiles/cloud-fast.yaml) | Аудио/STT, текст/перевод и TTS в OpenAI | Live с меньшей ожидаемой задержкой | `OPENAI_API_KEY` |
 | [`cloud-eleven`](profiles/cloud-eleven.yaml) | OpenAI STT + GPT-перевод, озвучка в ElevenLabs | Альтернативные облачные голоса для batch-дубляжа | `OPENAI_API_KEY` + `ELEVENLABS_API_KEY` |
 | [`cloud-quality`](profiles/cloud-quality.yaml) | Облачные STT, перевод и TTS с более качественными моделями | В первую очередь batch-дубляж | `OPENAI_API_KEY` |
@@ -95,7 +107,12 @@ uvt serve -p free --port 8080              # сервер для браузер�
 
 ### Что значит «local» на практике
 
-`local` не отправляет аудио или текст наружу **во время работы**, если все модели уже установлены. При первом запуске Whisper может скачать выбранную модель; Piper и Ollama-модель UVT намеренно не скачивает сам. Это делает подготовку явной и проверяемой.
+Новые `local-fast`, `local-balanced` и `local-quality` не отправляют аудио или
+текст наружу **во время работы** и запрещают скачивание весов внутри задачи.
+Единственная точка загрузки — явная команда `uvt setup-mac-local` с immutable
+ревизиями. При старте сервер без сети проверяет кэш и голоса, загружает первый
+STT в Metal и показывает `model_readiness` в `/meta`; переводчик включается
+только после освобождения STT, чтобы не раздувать unified memory.
 
 Для Piper положите рядом с выбранной `voice.onnx` её исходный metadata-файл
 `voice.onnx.json`. UVT берёт `audio.sample_rate` только из этого локального
@@ -104,6 +121,32 @@ sidecar и остановится при отсутствии, повреждё�
 неверным темпом и высотой голоса.
 
 `free` означает «без оплаты токенов», а не «без сети»: Edge TTS бесплатен без ключа, но передаёт текст сервису Microsoft. Аналогично, `google-free` — сетевой неофициальный endpoint, а не private fallback.
+
+### Оптимальный локальный маршрут для Mac M4 с 16 ГБ
+
+```bash
+source .venv/bin/activate
+pip install -e ".[mac-local,server,web]"
+uvt setup-mac-local --preset balanced  # только при первой установке
+uvt setup-mac-local --preset balanced --check  # последующая offline-проверка
+uvt serve-personal              # поднимет Local, GPT и ElevenLabs вместе
+```
+
+На Apple Silicon команда `serve-personal` сама выбирает `local-balanced` для
+первой кнопки. Parakeet распознаёт 25 европейских языков, включая EN/RU/UK, с
+таймкодами и прогрессом по 60–120-секундным чанкам. После STT его MLX-модель и
+кэш освобождаются, TranslateGemma переводит независимые реплики через свой
+официальный structured template, затем Piper озвучивает RU/UK. Отмена ждёт
+завершения только уже активного ограниченного STT/Piper-чанка и не оставляет worker в
+фоне. `local-fast` быстрее, но NLLB переводит более буквально;
+`local-quality` оставлен для сложного звука и использует chunked Whisper.
+Готовый набор Piper включает мужской и женский голос для русского и
+украинского; для другого целевого языка добавьте соответствующую Piper-модель
+в `tts.voice_models` или выберите GPT/ElevenLabs.
+
+Для выбора всех трёх локальных профилей один раз выполните
+`uvt setup-mac-local --preset all`. При старте сервер без сети проверит каждый
+вариант; отсутствующая модель будет отключена в панели до скачивания видео.
 
 ## Пакетный дубляж: файл, ссылка и браузер
 
@@ -120,11 +163,57 @@ uvt dub файл.mp4 -p local --duck-db -18  # оригинал остаётся
 ```bash
 uvt serve -p cloud       # облачный маршрут (OpenAI), localhost:8765
 uvt serve -p free        # без платных API: локальные STT/перевод + Edge TTS через сеть
-uvt serve-personal       # сразу Free + GPT + ElevenLabs на портах 8765–8767
+uvt serve-personal       # сразу Local/Free + GPT + ElevenLabs на портах 8765–8767
+# uvt serve-personal --open-browser  # дополнительно открыть local dashboard
 # либо: uvt serve -p local    # после настройки Piper и Ollama
 ```
 
 Установите Tampermonkey и добавьте [browser/uvt.user.js](browser/uvt.user.js). Подробная инструкция — в [browser/README.md](browser/README.md).
+После обновления `uvt.user.js` сохраните его в Tampermonkey
+(или переустановите) и полностью перезагрузите открытую вкладку
+YouTube: уже открытая страница иначе продолжит выполнять старую копию скрипта.
+
+Корень Local/Free-маршрута, обычно
+[`http://127.0.0.1:8765/`](http://127.0.0.1:8765/), — это dashboard для
+мониторинга маршрутов, моделей и текущих задач, а также для настройки
+следующих переводов. Вкладки **Free**, **GPT** и **ElevenLabs** в одной
+панели управляют всеми тремя маршрутами.
+
+Во Free можно выбрать языки, `local-fast`, `local-balanced` или
+`local-quality`, а также мужской/женский или точный Piper-голос.
+Для Mac M4 с 16 ГБ рекомендуется `local-balanced`; Fast быстрее,
+а Quality требовательнее к памяти. В GPT отдельно выбираются модели
+OpenAI для STT, перевода и TTS и голос OpenAI. В ElevenLabs
+распознавание и перевод остаются на OpenAI, а для TTS можно выбрать
+модель ElevenLabs и голос из аккаунта или ввести Voice ID. Проба
+голоса до 240 символов для Free локальна; проба GPT/ElevenLabs
+отправляет текст в облачный TTS и расходует API-квоту.
+
+Кнопки **Сохранить**, **Отменить правки** и **Вернуть YAML по
+умолчанию** работают отдельно для каждого маршрута. Сохранённые
+значения применяются только к следующим новым задачам: уже запущенный
+дубляж не меняется. Они хранятся в
+`~/.config/uvt/server-settings.json`; путь можно переопределить через
+`UVT_SETTINGS_PATH`. API-ключи в этот JSON не записываются; панель
+получает только статус «задан/не задан».
+
+Userscript 0.15 по умолчанию берёт модель, языки и голос из web-панели.
+В панели на видео выберите **Свои настройки для этого видео**, если
+нужно одноразово переопределить локальный профиль, языки или голос. Кнопка
+**Вернуться к настройкам web-панели** снова включает серверные
+значения. Громкости оригинала и перевода всегда остаются локальными
+настройками браузера.
+
+`--open-browser` по умолчанию выключен и предназначен для локального desktop-запуска.
+UVT не пытается открыть вкладку на VPS/в headless-среде или при non-loopback `--host`.
+При локальном запуске с `UVT_API_TOKEN` вкладка откроется и попросит его ввести.
+В сети откройте HTTPS-адрес панели вручную и введите `UVT_API_TOKEN`
+в форме входа: панель хранит его только в `sessionStorage` до закрытия
+вкладки и добавляет к API-запросам как `X-UVT-Token`. За reverse proxy
+задайте `UVT_FREE_PUBLIC_URL`, `UVT_GPT_PUBLIC_URL` и
+`UVT_ELEVEN_PUBLIC_URL`, иначе межмаршрутные вкладки dashboard не будут
+знать HTTPS-адреса трёх поддоменов. Готовый пример есть в
+[инструкции VPS](docs/PERSONAL_DEPLOY.md).
 
 Панель возле видео показывает реальные этапы `очередь → источник → STT → перевод → TTS → сборка`. Пока задача не завершена, видео продолжает играть оригинал. После готовности script подключает подготовленную дорожку и синхронизирует паузу, перемотку и скорость с видеоплеером.
 
@@ -201,13 +290,33 @@ ollama pull qwen2.5:3b
 uvt serve-personal
 ```
 
-Обёртка `bash scripts/serve-personal.sh` запускает ту же команду. По умолчанию
-`free-vps` работает на `127.0.0.1:8765`, `cloud-fast` — на `127.0.0.1:8766`,
+Обёртка `bash scripts/serve-personal.sh` запускает ту же команду. На Linux по
+умолчанию `free-vps` работает на `127.0.0.1:8765`, `cloud-fast` — на `127.0.0.1:8766`,
 `cloud-eleven` — на `127.0.0.1:8767`. Userscript отправляет задачу только в
 выбранный маршрут: получение исходного звука и batch-конвейер одинаковы, а
 профиль определяет STT, перевод и финальную озвучку. Для VPS, HTTPS и токена
 доступа следуйте [инструкции](docs/PERSONAL_DEPLOY.md).
 
-## Лицензия
+На Mac с Apple Silicon `serve-personal` автоматически выбирает полностью
+локальный `local-balanced`. Переменная в `.env` нужна только для явного
+переопределения:
 
-MIT — см. [LICENSE](LICENSE).
+```bash
+UVT_FREE_PROFILE=local-fast
+```
+
+На Linux/VPS оставьте `free-vps`. То же можно выбрать разово:
+`uvt serve-personal --free-profile local-quality`.
+Сохранённый выбор в web-панели имеет приоритет для следующих задач;
+кнопка **Вернуть YAML по умолчанию** удаляет это переопределение.
+
+## Лицензии
+
+Код UVT — MIT, см. [LICENSE](LICENSE). Веса и голоса имеют свои upstream-условия:
+[Parakeet](https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3) — CC-BY-4.0,
+[TranslateGemma](https://huggingface.co/mlx-community/translategemma-4b-it-4bit) — Gemma Terms,
+[NLLB](https://huggingface.co/OpenNMT/nllb-200-distilled-1.3B-ct2-int8) в `local-fast` —
+CC-BY-NC-4.0, а [Piper-голоса](https://huggingface.co/rhasspy/piper-voices) могут иметь
+отдельные лицензии. Проверьте model card
+перед коммерческим использованием; `local-fast` с NLLB не является безусловно
+коммерческим маршрутом.

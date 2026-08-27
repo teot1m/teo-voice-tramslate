@@ -251,6 +251,11 @@ class FailoverSTT(STTEngine):
     def using_fallback(self) -> bool:
         return self._delegate.using_fallback
 
+    @property
+    def concurrency_hint(self) -> int:
+        active = self._delegate.active or self._delegate.primary
+        return int(getattr(active, "concurrency_hint", self.cfg.concurrency or 1))
+
     async def warmup(self) -> None:
         await self._delegate.warmup()
 
