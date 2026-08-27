@@ -53,6 +53,7 @@ _PROFILE_OVERVIEW = (
     ("local-fast", "Apple Silicon: Parakeet + NLLB INT8 + Piper; максимум скорости"),
     ("local-balanced", "M4/16 ГБ: Parakeet + TranslateGemma 4-bit + Piper"),
     ("local-quality", "Apple Silicon: chunked Whisper large + TranslateGemma + Piper"),
+    ("local-natural", "живые голоса: Demucs + Parakeet + Qwen3 с контекстом + F5 с клонированием"),
     ("free", "без платных API: локальные STT/перевод + Microsoft Edge TTS через сеть"),
     ("free-vps", "Linux VPS: CPU Whisper + Ollama Qwen 3B последовательно + Edge TTS"),
     ("free-quality", "Apple Silicon 8 ГБ: MLX Whisper + NLLB INT8 + Piper, всё локально"),
@@ -147,7 +148,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     setup_local.add_argument(
         "--preset",
-        choices=("fast", "balanced", "quality", "all"),
+        choices=("fast", "balanced", "quality", "natural", "all"),
         default="balanced",
         help="набор моделей (по умолчанию balanced для M4/16 ГБ)",
     )

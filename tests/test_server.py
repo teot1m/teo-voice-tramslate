@@ -900,3 +900,75 @@ def test_ytdlp_progress_parser_handles_marker_without_terminal_formatting():
     assert len(updates) == 1
     assert updates[0][0] == pytest.approx(0.425)
     assert updates[0][1] == "скачиваю звук со страницы: 42%"
+
+
+async def test_ready_clips_are_published_during_the_job(tmp_path):
+    """Прогрессивный дубляж: реплики доступны отдельными файлами по таймкодам."""
+    rate = 16000
+    t = np.arange(rate) / rate
+    tone = (0.3 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+    silence = np.zeros(rate // 2, dtype=np.float32)
+    src = tmp_path / "in.wav"
+    sf.write(src, np.concatenate([silence, tone, silence, tone, silence]), rate)
+
+    from uvt.server import DubServer
+
+    server = DubServer(_cfg())
+    server.audio_dir = tmp_path
+    client = TestClient(TestServer(server.app()))
+    await client.start_server()
+    try:
+        created = await (await client.post("/dub", json={"file": str(src)})).json()
+        job_id = created["id"]
+        info = None
+        for _ in range(200):
+            info = await (await client.get(f"/job/{job_id}")).json()
+            if info["status"] in ("done", "error"):
+                break
+            await asyncio.sleep(0.05)
+        assert info is not None and info["status"] == "done", info
+
+        clips = info["clips"]
+        assert len(clips) == len(info["entries"]), "публикуется каждая озвученная реплика"
+        for clip in clips:
+            # Тайминг для планировщика в браузере
+            assert clip["duration"] > 0
+            assert clip["at"] >= 0
+            assert clip["at"] <= clip["source_start"]
+            assert clip["translated"] and clip["original"]
+            assert clip["speaker"]
+            # Реплика реально отдаётся отдельным файлом
+            audio = await client.get(clip["url"])
+            assert audio.status == 200
+            assert audio.headers["Content-Type"] == "audio/wav"
+            assert len(await audio.read()) > 100
+
+        # Реплики идут в порядке таймкодов — иначе браузеру пришлось бы сортировать
+        assert [clip["at"] for clip in clips] == sorted(clip["at"] for clip in clips)
+    finally:
+        await client.close()
+
+
+async def test_clip_urls_respect_the_api_token(monkeypatch, tmp_path):
+    monkeypatch.setenv("UVT_API_TOKEN", "personal-secret")
+    from uvt.server import DubServer
+
+    server = DubServer(_cfg())
+    server.audio_dir = tmp_path
+    clips_dir = tmp_path / "clips" / "job42"
+    clips_dir.mkdir(parents=True)
+    (clips_dir / "0.wav").write_bytes(b"RIFF....WAVEfmt ")
+    server._audio_access_tokens["job42"] = "clip-secret"
+
+    client = TestClient(TestServer(server.app()))
+    await client.start_server()
+    try:
+        denied = await client.get("/clip/job42/0.wav")
+        assert denied.status == 401
+        allowed = await client.get("/clip/job42/0.wav?access=clip-secret")
+        assert allowed.status == 200
+        # Обход каталогов невозможен
+        escaped = await client.get("/clip/job42/..%2F..%2Fready.m4a?access=clip-secret")
+        assert escaped.status in (400, 404)
+    finally:
+        await client.close()

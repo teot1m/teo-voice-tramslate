@@ -72,11 +72,12 @@ def _fake_hub(tmp_path):
     return snapshots, piper_files, snapshot_download, hf_hub_download
 
 
-def test_local_manifest_has_four_pinned_presets():
+def test_local_manifest_has_five_pinned_presets():
     assert tuple(setup_local.LOCAL_SETUP_PRESETS) == (
         "fast",
         "balanced",
         "quality",
+        "natural",
         "all",
     )
     assert setup_local.LOCAL_SETUP_PRESETS["fast"].model_keys == (
@@ -90,6 +91,13 @@ def test_local_manifest_has_four_pinned_presets():
     assert setup_local.LOCAL_SETUP_PRESETS["quality"].model_keys == (
         "whisper",
         "translategemma",
+    )
+    # natural — маршрут «живого» дубляжа: контекстный перевод chat-моделью и
+    # клонирующая озвучка со своими весами вместо готового голоса
+    assert setup_local.LOCAL_SETUP_PRESETS["natural"].model_keys == (
+        "parakeet",
+        "qwen3-chat",
+        "f5-ru",
     )
     assert set(setup_local.LOCAL_SETUP_PRESETS["all"].model_keys) == set(
         setup_local.LOCAL_MODEL_MANIFEST

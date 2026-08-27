@@ -30,25 +30,31 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Callable
 
 import numpy as np
 
 from uvt import registry
-from uvt.audio import resample
+from uvt.audio import resample, to_mono
 from uvt.config import PRESETS, AppConfig
 from uvt.fallback import ApprovalGate, create_stt_engine, create_translation_engine
+from uvt.diarize import assign_speakers
 from uvt.gender import estimate_gender_f0
 from uvt.history import EXPORTERS, HistoryEntry
-from uvt.interfaces import STTEngine, STTSpan
+from uvt.interfaces import STTEngine, STTSpan, VoiceReference
 from uvt.segmenter import Segmenter, SegmenterParams, create_vad_engine
+from uvt.separate import separate_speech
 from uvt.services.stt import _is_junk
 from uvt.services.translate import _same_lang
+from uvt.text_quality import collapse_repeats, is_vocalization, sanitize_translation
+from uvt.voices import pick_references
 
 log = logging.getLogger("uvt.dub")
 
 PIPE_RATE = 16000     # частота конвейера распознавания
 MIX_RATE = 48000      # частота итоговой дорожки
+SEPARATION_RATE = 44100  # нативная частота Demucs
 RAMP_S = 0.05         # плавность приглушения, 50 мс
 BATCH_MAX_ITEMS = 20  # реплик на один запрос к LLM…
 BATCH_MAX_CHARS = 2500  # …но не больше этого объёма текста
@@ -59,6 +65,29 @@ _MAX_COMPACT_GAP_S = 0.9
 
 ProgressFn = Callable[[int, int], None]
 _StageCb = Callable[[float], None]
+
+
+@dataclass(slots=True)
+class ClipReady:
+    """Готовая озвученная реплика — публикуется сразу после укладки в слот.
+
+    Нужна для прогрессивного дубляжа: подписчик (сервер браузерной кнопки)
+    получает реплику, как только она готова, и может проиграть её в видео, не
+    дожидаясь окончания обработки всего файла.
+    """
+
+    index: int
+    source_start: float
+    source_end: float
+    original: str
+    translated: str
+    voice_style: str
+    speaker: str
+    samples: np.ndarray
+    sample_rate: int
+
+
+ClipCallback = Callable[[ClipReady], None]
 
 
 @dataclass(slots=True)
@@ -304,15 +333,34 @@ async def _transcribe_all(
 
 # --- стадия 2: перевод пачками с деградацией до пореплечного ---
 
-def _make_batches(spans: list[STTSpan], max_items: int = BATCH_MAX_ITEMS) -> list[list[int]]:
-    """Группирует индексы реплик: не больше max_items и BATCH_MAX_CHARS."""
+def _make_batches(
+    spans: list[STTSpan],
+    max_items: int = BATCH_MAX_ITEMS,
+    langs: Sequence[str | None] | None = None,
+) -> list[list[int]]:
+    """Группирует индексы реплик: не больше max_items и BATCH_MAX_CHARS.
+
+    ``langs`` — исходный язык каждой реплики. В одном ролике встречаются
+    несколько языков (английский диалог со вставками на чешском); пачка с
+    единым языком заставляла переводчик читать чешскую строку как английскую.
+    Поэтому смена языка — жёсткая граница пачки.
+    """
     batches: list[list[int]] = []
     current: list[int] = []
     chars = 0
+    current_lang: str | None = None
     for i, span in enumerate(spans):
-        if current and (len(current) >= max_items or chars + len(span.text) > BATCH_MAX_CHARS):
+        lang = langs[i] if langs is not None else None
+        lang_changed = bool(current) and langs is not None and lang != current_lang
+        if current and (
+            lang_changed
+            or len(current) >= max_items
+            or chars + len(span.text) > BATCH_MAX_CHARS
+        ):
             batches.append(current)
             current, chars = [], 0
+        if not current:
+            current_lang = lang
         current.append(i)
         chars += len(span.text)
     if current:
@@ -340,7 +388,20 @@ async def _translate_all(
 
         detected = Counter(span.language or "und" for span in spans).most_common(1)[0][0]
         lang = source_lang or (None if detected == "und" else detected)
+        # Язык каждой реплики отдельно: явный source_lang побеждает, иначе
+        # берётся язык самой реплики, а «und» подменяется доминирующим по
+        # файлу. Один язык на весь ролик ломал многоязычные диалоги.
+        span_langs: list[str | None] = [
+            lang if source_lang else ((span.language or None) or lang)
+            for span in spans
+        ]
+        distinct = sorted({value for value in span_langs if value})
+        if len(distinct) > 1:
+            log.info("в ролике несколько исходных языков: %s", ", ".join(distinct))
         translated: list[str | None] = [None] * len(spans)
+        # Реплики, где модель ответила отказом/пояснением вместо перевода:
+        # такие уходят на повторную попытку по одной.
+        rejected: set[int] = set()
         completed = 0
         # Cloud выдерживает несколько пачек, но локальная LLM сообщает hint=1:
         # на малой unified-memory машине параллельные контексты ухудшают
@@ -348,17 +409,34 @@ async def _translate_all(
         parallelism = max(1, int(getattr(translator, "concurrency_hint", 3)))
         limit = asyncio.Semaphore(parallelism)
 
+        def accept(index: int, value: str | None) -> None:
+            """Кладёт перевод после проверки: отказ модели не попадёт в TTS."""
+            gender = genders[index] if genders else "male"
+            clean = sanitize_translation(value, spans[index].text, gender)
+            if clean is None:
+                if value:
+                    rejected.add(index)
+                    log.warning(
+                        "реплика @%.1f с: модель ответила не переводом, повторю отдельно",
+                        spans[index].start,
+                    )
+                translated[index] = None
+                return
+            rejected.discard(index)
+            translated[index] = clean
+
         async def run_batch(batch: list[int]) -> None:
             nonlocal completed
             texts = [spans[i].text for i in batch]
             batch_genders = [genders[i] for i in batch] if genders else None
+            batch_lang = span_langs[batch[0]]
             try:
                 async with limit:
                     result = await translator.translate_batch_tagged(
-                        texts, lang, cfg.target_lang, batch_genders
+                        texts, batch_lang, cfg.target_lang, batch_genders
                     )
                 for idx, value in zip(batch, result):
-                    translated[idx] = value
+                    accept(idx, value)
             except Exception as exc:  # noqa: BLE001 — деградируем до пореплечного
                 log.warning(
                     "пакетный перевод %d реплик не прошёл (%s: %s) — перевожу по одной",
@@ -367,8 +445,14 @@ async def _translate_all(
                 for idx in batch:
                     try:
                         async with limit:
-                            translated[idx] = await translator.translate(
-                                spans[idx].text, lang or "und", cfg.target_lang, []
+                            accept(
+                                idx,
+                                await translator.translate(
+                                    spans[idx].text,
+                                    span_langs[idx] or "und",
+                                    cfg.target_lang,
+                                    [],
+                                ),
                             )
                     except Exception as exc2:  # noqa: BLE001
                         log.error(
@@ -381,7 +465,10 @@ async def _translate_all(
             log.info("перевод: %d/%d реплик", completed, len(spans))
 
         max_items = int(getattr(translator, "batch_hint", BATCH_MAX_ITEMS))
-        tasks = [asyncio.create_task(run_batch(batch)) for batch in _make_batches(spans, max_items)]
+        tasks = [
+            asyncio.create_task(run_batch(batch))
+            for batch in _make_batches(spans, max_items, span_langs)
+        ]
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
@@ -400,7 +487,9 @@ async def _translate_all(
         def needs_retry(index: int) -> bool:
             out = translated[index]
             if not out:
-                return False
+                # Отказ модели стоит попробовать ещё раз по одной реплике:
+                # без соседей по пачке safety-фильтр часто не срабатывает.
+                return index in rejected
             span = spans[index]
             if _same_lang(span.language, cfg.target_lang):
                 return False
@@ -415,22 +504,99 @@ async def _translate_all(
             async def retry_one(index: int) -> None:
                 try:
                     async with limit:
-                        translated[index] = await translator.translate(
-                            spans[index].text, lang or "und", cfg.target_lang, []
+                        accept(
+                            index,
+                            await translator.translate(
+                                spans[index].text,
+                                span_langs[index] or "und",
+                                cfg.target_lang,
+                                [],
+                            ),
                         )
                 except Exception as exc:  # noqa: BLE001 — остаётся как было
                     log.debug("доперевод @%.1f с не удался: %s", spans[index].start, exc)
 
             await asyncio.gather(*(retry_one(i) for i in retry))
+
+        if getattr(translator, "supports_shorten", False):
+            await _fit_texts_to_slots(cfg, spans, translated, genders, translator)
         return translated
     finally:
         await translator.close()
 
 
+def _text_budget(cfg: AppConfig, spans: list[STTSpan], index: int, gender: str) -> int | None:
+    """Сколько символов перевода уложится в слот реплики.
+
+    Оценка по той же таблице ``duration_per_char``, что используется озвучкой:
+    если движок перевода умеет сжимать текст, лучше сделать это словами до
+    синтеза, чем ускорять готовую речь после.
+    """
+    slot = _slot_seconds(spans, index)
+    if slot is None:
+        return None
+    rates = dict(getattr(cfg.tts, "duration_per_char", {}) or {})
+    root = str(cfg.target_lang or "").replace("_", "-").split("-", 1)[0].lower()
+    rate = float(
+        rates.get(f"{root}:{gender}")
+        or rates.get(f"{root}:default")
+        or rates.get(gender)
+        or rates.get("default")
+        or 0.0
+    )
+    if rate <= 0:
+        return None
+    max_compression = float(
+        getattr(cfg.tts, "max_compression", MAX_COMPRESSION) or MAX_COMPRESSION
+    )
+    return int(slot * max_compression / rate)
+
+
+async def _fit_texts_to_slots(
+    cfg: AppConfig,
+    spans: list[STTSpan],
+    translated: list[str | None],
+    genders: list[str] | None,
+    translator,
+) -> None:
+    """Просит модель переписать короче те реплики, что не влезают в тайминг."""
+    tasks: list[tuple[int, int]] = []
+    for index, text in enumerate(translated):
+        if not text:
+            continue
+        gender = genders[index] if genders else "male"
+        budget = _text_budget(cfg, spans, index, gender)
+        # 15% запаса: из-за оценки по символам нет смысла трогать почти
+        # подходящие реплики.
+        if budget and len(text) > budget * 1.15:
+            tasks.append((index, budget))
+    if not tasks:
+        return
+    log.info("укладываю %d реплик в тайминг текстом, а не темпом речи", len(tasks))
+
+    async def shorten_one(index: int, budget: int) -> None:
+        original = translated[index]
+        assert original is not None
+        try:
+            shortened = await translator.shorten(original, cfg.target_lang, budget)
+        except Exception as exc:  # noqa: BLE001 — реплика останется длинной
+            log.debug("сжатие реплики @%.1f с не удалось: %s", spans[index].start, exc)
+            return
+        gender = genders[index] if genders else "male"
+        clean = sanitize_translation(shortened, spans[index].text, gender)
+        if clean and len(clean) < len(original):
+            translated[index] = clean
+
+    await asyncio.gather(*(shorten_one(index, budget) for index, budget in tasks))
+
+
 # --- стадия 3: озвучка по таймкодам ---
 
-MAX_SPEEDUP = 1.6     # потолок ускорения озвучки
+MAX_SPEEDUP = 1.6     # потолок ускорения озвучки для движков без контроля длительности
+MAX_COMPRESSION = 1.25  # насколько быстрее естественного темпа можно просить модель
 SLOT_MARGIN_S = 0.15  # зазор до следующей реплики
+SLOT_TOLERANCE_S = 0.3  # превышение слота, которое не стоит исправлять
+MAX_EMOTION_S = 8.0   # длиннее фрагмент интонации движку не нужен
 CLIP_LEAD_S = 0.15    # озвучка стартует чуть раньше оригинала — синхроннее на слух
 _FATAL_TTS_HTTP_STATUSES = {401, 402, 403}
 _RETRYABLE_TTS_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
@@ -520,49 +686,116 @@ def _fit_audio_tempo(samples: np.ndarray, sample_rate: int, factor: float) -> np
     return np.frombuffer(proc.stdout, dtype=np.float32).copy()
 
 
+def _slot_seconds(spans: list[STTSpan], index: int) -> float | None:
+    """Сколько секунд доступно реплике до старта следующей.
+
+    None — ограничения нет (последняя реплика или слот слишком короткий,
+    чтобы говорить о укладке).
+    """
+    if index + 1 >= len(spans):
+        return None
+    slot = spans[index + 1].start - spans[index].start - SLOT_MARGIN_S
+    return slot if slot > 0.5 else None
+
+
+async def _create_tts_engines(
+    cfg: AppConfig, genders: list[str]
+) -> tuple[dict[str, object], object]:
+    """Движки озвучки: общий для клонирующих, по одному на пол для остальных.
+
+    Piper и облачные движки задают голос моделью, поэтому мужской и женский
+    нужны отдельными экземплярами. У клонирующего движка голос приходит
+    образцом, и второй экземпляр только занял бы вторую копию весов в памяти —
+    на 16 ГБ это разница между работой и свопом.
+    """
+    order = list(dict.fromkeys(genders)) or ["male"]
+    engines: dict[str, object] = {}
+    try:
+        first_cfg = cfg.tts.model_copy(deep=True)
+        first_cfg.voice_gender = order[0]
+        first = registry.create("tts", cfg.tts.engine, first_cfg)
+        # Register ownership before loading native weights: отменённая
+        # инициализация должна освободиться вместе с готовыми голосами.
+        engines[order[0]] = first
+        await first.warmup()
+        if getattr(first, "supports_reference", False):
+            return {gender: first for gender in order}, first
+        for gender in order[1:]:
+            tts_cfg = cfg.tts.model_copy(deep=True)
+            tts_cfg.voice_gender = gender
+            engine = registry.create("tts", cfg.tts.engine, tts_cfg)
+            engines[gender] = engine
+            await engine.warmup()
+        return engines, first
+    except BaseException:
+        await asyncio.gather(
+            *(engine.close() for engine in dict.fromkeys(engines.values())),
+            return_exceptions=True,
+        )
+        raise
+
+
 async def _synthesize_all(
     cfg: AppConfig,
     spans: list[STTSpan],
     texts: list[str],
     genders: list[str],
     progress: _StageCb | None,
+    references: dict[str, VoiceReference] | None = None,
+    source_audio: np.ndarray | None = None,
+    source_rate: int = PIPE_RATE,
+    labels: list[str] | None = None,
+    on_clip: ClipCallback | None = None,
 ) -> list[_SynthClip]:
-    # Отдельный движок на каждый нужный пол голоса (мужской/женский диалог)
-    engines: dict[str, object] = {}
-    try:
-        for gender in dict.fromkeys(genders):
-            tts_cfg = cfg.tts.model_copy(deep=True)
-            tts_cfg.voice_gender = gender
-            engine = registry.create("tts", cfg.tts.engine, tts_cfg)
-            # Register ownership before warm-up so a partial/cancelled warm-up
-            # is released together with voices that were already ready.
-            engines[gender] = engine
-            await engine.warmup()
-    except BaseException:
-        await asyncio.gather(
-            *(engine.close() for engine in engines.values()),
-            return_exceptions=True,
+    """Озвучивает реплики и укладывает их в тайминги оригинала.
+
+    Два разных пути укладки:
+
+    - движок умеет ``synthesize_slot`` с длительностью (F5-TTS, IndexTTS-2) —
+      реплика синтезируется сразу в доступный слот, речь остаётся живой;
+    - обычный движок (Piper, облако) — прежний путь: предсказание темпа по
+      ``duration_per_char`` и остаточный atempo.
+
+    ``references`` — образцы голоса из оригинала по метке говорящего,
+    ``source_audio`` — исходная моно-дорожка, из неё берётся звук самой
+    реплики как источник интонации для движков с переносом просодии.
+    """
+    voice_labels = list(labels) if labels is not None else list(genders)
+    engines, probe = await _create_tts_engines(cfg, genders)
+
+    duration_aware = bool(getattr(probe, "supports_duration", False))
+    use_reference = bool(getattr(probe, "supports_reference", False)) and bool(references)
+    use_emotion = (
+        bool(getattr(probe, "supports_emotion", False)) and source_audio is not None
+    )
+    if duration_aware:
+        log.info(
+            "озвучка укладывается в тайминги самим движком — atempo не применяется"
         )
-        raise
+    if use_reference:
+        log.info("голоса клонируются из оригинала: %d образцов", len(references or {}))
+    if use_emotion:
+        log.info("интонация переносится из исходных реплик")
 
     limit = asyncio.Semaphore(int(getattr(cfg.tts, "concurrency", TTS_CONCURRENCY)))
     request_interval = max(0.0, float(getattr(cfg.tts, "request_interval_s", 0.0) or 0.0))
     request_gate = asyncio.Lock()
     next_request_at = 0.0
-    initial_finished = 0
-    refit_finished = 0
+    finished = 0
+    resynthesized = 0   # уложены повторным синтезом в нужную длительность
+    retimed = 0         # уложены ускорением готового звука (движки без duration)
     fatal_error: BaseException | None = None
     provider = _TTS_PROVIDER_LABELS.get(cfg.tts.engine, cfg.tts.engine)
 
     duration_rates = dict(getattr(cfg.tts, "duration_per_char", {}) or {})
     target_root = str(cfg.target_lang or "").replace("_", "-").split("-", 1)[0].lower()
+    max_speedup = float(getattr(cfg.tts, "max_speedup", MAX_SPEEDUP) or MAX_SPEEDUP)
+    max_compression = float(
+        getattr(cfg.tts, "max_compression", MAX_COMPRESSION) or MAX_COMPRESSION
+    )
 
-    def predicted_speed(index: int, text: str, gender: str) -> float:
-        if index + 1 >= len(spans):
-            return 1.0
-        slot = spans[index + 1].start - spans[index].start - SLOT_MARGIN_S
-        if slot <= 0.5:
-            return 1.0
+    def natural_duration(text: str, gender: str) -> float | None:
+        """Оценка естественной длительности реплики по настройкам голоса."""
         rate = float(
             duration_rates.get(f"{target_root}:{gender}")
             or duration_rates.get(f"{target_root}:default")
@@ -570,33 +803,101 @@ async def _synthesize_all(
             or duration_rates.get("default")
             or 0.0
         )
-        if rate <= 0:
-            return 1.0
-        estimated_duration = len(text) * rate
-        if estimated_duration <= slot + 0.3:
-            return 1.0
-        return min(MAX_SPEEDUP, max(1.0, estimated_duration / slot))
+        return len(text) * rate if rate > 0 else None
 
-    initial_speeds = [
-        predicted_speed(index, text, gender)
-        for index, (text, gender) in enumerate(zip(texts, genders))
-    ]
-    predicted_count = sum(speed > 1.0 for speed in initial_speeds)
-    if predicted_count:
-        log.info(
-            "сразу ускоряю %d реплик по длительности выбранного голоса",
-            predicted_count,
+    def predicted_speed(index: int, text: str, gender: str) -> float:
+        slot = _slot_seconds(spans, index)
+        if slot is None:
+            return 1.0
+        estimated = natural_duration(text, gender)
+        if estimated is None or estimated <= slot + 0.3:
+            return 1.0
+        return min(max_speedup, max(1.0, estimated / slot))
+
+    def predicted_target(index: int, text: str, gender: str) -> float | None:
+        """Длительность, которую просим у движка, если реплика не влезает.
+
+        Пока реплика укладывается в слот — не ограничиваем: навязанная длина
+        растянула бы короткую фразу и звучала бы медленнее живой речи.
+        """
+        slot = _slot_seconds(spans, index)
+        if slot is None:
+            return None
+        estimated = natural_duration(text, gender)
+        if estimated is None or estimated <= slot + SLOT_TOLERANCE_S:
+            return None
+        # Сильнее max_compression не жмём: остаток выйдет за слот, сборка
+        # сдвинет следующую реплику — это слышно лучше скороговорки.
+        return max(slot, estimated / max_compression)
+
+    def emotion_reference(index: int) -> VoiceReference | None:
+        if source_audio is None:
+            return None
+        span = spans[index]
+        start = max(0, int(span.start * source_rate))
+        end = min(len(source_audio), int(span.end * source_rate))
+        if end - start < int(0.5 * source_rate):
+            return None
+        chunk = source_audio[start : min(end, start + int(MAX_EMOTION_S * source_rate))]
+        return VoiceReference(
+            samples=np.ascontiguousarray(chunk, dtype=np.float32),
+            sample_rate=source_rate,
+            label=f"emotion-{index}",
         )
 
-    async def synth(
+    initial_speeds = [1.0] * len(texts)
+    initial_targets: list[float | None] = [None] * len(texts)
+    if duration_aware:
+        initial_targets = [
+            predicted_target(index, text, gender)
+            for index, (text, gender) in enumerate(zip(texts, genders))
+        ]
+        fitted_count = sum(target is not None for target in initial_targets)
+        if fitted_count:
+            log.info("синтезирую %d реплик сразу в их тайминг", fitted_count)
+    else:
+        initial_speeds = [
+            predicted_speed(index, text, gender)
+            for index, (text, gender) in enumerate(zip(texts, genders))
+        ]
+        predicted_count = sum(speed > 1.0 for speed in initial_speeds)
+        if predicted_count:
+            log.info(
+                "сразу ускоряю %d реплик по длительности выбранного голоса",
+                predicted_count,
+            )
+
+    async def call_engine(
+        index: int,
+        text: str,
+        gender: str,
+        speed: float,
+        target: float | None,
+    ) -> tuple[np.ndarray, int]:
+        engine = engines[gender]
+        if duration_aware or use_reference or use_emotion:
+            kwargs: dict[str, object] = {}
+            if duration_aware and target is not None:
+                kwargs["target_duration"] = target
+            if use_reference:
+                kwargs["reference"] = (references or {}).get(voice_labels[index])
+            if use_emotion:
+                kwargs["emotion"] = emotion_reference(index)
+            return await engine.synthesize_slot(text, cfg.target_lang, **kwargs)
+        if speed > 1.0:
+            return await engine.synthesize_rated(text, cfg.target_lang, speed)
+        return await engine.synthesize(text, cfg.target_lang)
+
+    async def synth_once(
         index: int,
         span: STTSpan,
         text: str,
         gender: str,
-        speed: float = 1.0,
-    ):
-        nonlocal fatal_error, initial_finished, next_request_at
-        engine = engines[gender]
+        speed: float,
+        target: float | None,
+    ) -> _SynthClip | None:
+        """Один синтез с повторами на временных ошибках провайдера."""
+        nonlocal fatal_error, next_request_at
         try:
             max_attempts = 4 if cfg.tts.engine == "elevenlabs" else 2
             for attempt in range(1, max_attempts + 1):
@@ -611,10 +912,7 @@ async def _synthesize_all(
                                 next_request_at = max(now, next_request_at) + request_interval
                             if wait_s:
                                 await asyncio.sleep(wait_s)
-                        if speed > 1.0:
-                            speech, rate = await engine.synthesize_rated(text, cfg.target_lang, speed)
-                        else:
-                            speech, rate = await engine.synthesize(text, cfg.target_lang)
+                        speech, rate = await call_engine(index, text, gender, speed, target)
                     break
                 except Exception as exc:  # noqa: BLE001
                     if _is_fatal_tts_error(exc):
@@ -640,17 +938,89 @@ async def _synthesize_all(
             else:
                 log.error("озвучка реплики @%.1f с не удалась: %s", span.start, exc)
             return None
-        finally:
-            if progress is not None:
-                initial_finished += 1
-                # Оставляем последние 18% стадии для точного tempo-fit-прохода.
-                # Так UI не показывает «сборка», пока обработка ещё идёт.
-                progress(0.82 * initial_finished / max(len(spans), 1))
         return _SynthClip(index, span.start, speech, rate) if len(speech) else None
+
+    async def fit_into_slot(index: int, clip: _SynthClip) -> _SynthClip:
+        """Укладывает готовый клип в его слот.
+
+        Укладка идёт сразу после синтеза реплики, а не отдельной фазой в конце:
+        так реплику можно отдать наружу готовой (см. ``on_clip``) и включить в
+        видео, пока остальные ещё считаются.
+        """
+        nonlocal resynthesized, retimed
+        slot = _slot_seconds(spans, index)
+        if slot is None:
+            return clip
+        duration = len(clip.samples) / clip.sample_rate
+        if duration <= slot + SLOT_TOLERANCE_S:
+            return clip
+
+        if duration_aware:
+            # Пересинтез в нужную длительность: речь остаётся живой, в отличие
+            # от ускорения готового звука.
+            target = max(slot, duration / max_compression)
+            fitted = await synth_once(
+                index, spans[index], texts[index], genders[index], 1.0, target
+            )
+            if fitted is not None:
+                resynthesized += 1
+                return fitted
+            return clip
+
+        current_speed = initial_speeds[index]
+        max_extra_factor = max_speedup / max(current_speed, 1.0)
+        tempo_factor = min(max_extra_factor, duration / slot)
+        if tempo_factor <= 1.03:
+            return clip
+        async with limit:
+            samples = await asyncio.to_thread(
+                _fit_audio_tempo, clip.samples, clip.sample_rate, tempo_factor
+            )
+        retimed += 1
+        return _SynthClip(clip.index, clip.source_start, samples, clip.sample_rate)
+
+    async def synth(
+        index: int,
+        span: STTSpan,
+        text: str,
+        gender: str,
+        speed: float = 1.0,
+        target: float | None = None,
+    ) -> _SynthClip | None:
+        nonlocal finished
+        try:
+            clip = await synth_once(index, span, text, gender, speed, target)
+            if clip is not None:
+                clip = await fit_into_slot(index, clip)
+                if on_clip is not None:
+                    # Реплика готова окончательно — её уже можно проигрывать.
+                    try:
+                        on_clip(
+                            ClipReady(
+                                index=index,
+                                source_start=span.start,
+                                source_end=span.end,
+                                original=span.text,
+                                translated=text,
+                                voice_style=gender,
+                                speaker=voice_labels[index],
+                                samples=clip.samples,
+                                sample_rate=clip.sample_rate,
+                            )
+                        )
+                    except Exception:  # noqa: BLE001 — подписчик не валит дубляж
+                        log.exception("подписчик on_clip не обработал реплику %d", index)
+            return clip
+        finally:
+            finished += 1
+            if progress is not None:
+                progress(finished / max(len(spans), 1))
 
     try:
         tasks = [
-            asyncio.create_task(synth(i, s, t, g, initial_speeds[i]))
+            asyncio.create_task(
+                synth(i, s, t, g, initial_speeds[i], initial_targets[i])
+            )
             for i, (s, t, g) in enumerate(zip(spans, texts, genders))
         ]
         try:
@@ -664,61 +1034,19 @@ async def _synthesize_all(
                 f"озвучка остановлена: {_tts_failure_reason(provider, fatal_error)}"
             ) from fatal_error
 
-        # Укладка в тайминги: остаточное превышение после предсказанного темпа
-        # правим быстрым pitch-preserving atempo. Повторный прогон Piper/OpenAI
-        # здесь вдвое увеличивал время и для cloud ещё раз расходовал бы токены.
-        refit: list[tuple[int, float]] = []
-        for i, clip in enumerate(clips):
-            if clip is None or i + 1 >= len(spans):
-                continue
-            duration = len(clip.samples) / clip.sample_rate
-            slot = spans[i + 1].start - spans[i].start - SLOT_MARGIN_S
-            if slot > 0.5 and duration > slot + 0.3:
-                current_speed = initial_speeds[i]
-                max_extra_factor = MAX_SPEEDUP / max(current_speed, 1.0)
-                tempo_factor = min(max_extra_factor, duration / slot)
-                if tempo_factor > 1.03:
-                    refit.append((i, tempo_factor))
-        if refit:
+        if resynthesized:
             log.info(
-                "подгоняю atempo %d реплик под тайминги без повторного TTS",
-                len(refit),
+                "%d реплик пересинтезированы в свой тайминг вместо ускорения",
+                resynthesized,
             )
-
-            async def fit_one(index: int, factor: float) -> _SynthClip:
-                nonlocal refit_finished
-                clip = clips[index]
-                assert clip is not None
-                try:
-                    async with limit:
-                        fitted = await asyncio.to_thread(
-                            _fit_audio_tempo,
-                            clip.samples,
-                            clip.sample_rate,
-                            factor,
-                        )
-                    return _SynthClip(
-                        clip.index,
-                        clip.source_start,
-                        fitted,
-                        clip.sample_rate,
-                    )
-                finally:
-                    refit_finished += 1
-                    if progress is not None:
-                        progress(0.82 + 0.18 * refit_finished / len(refit))
-
-            refit_clips = await asyncio.gather(
-                *(fit_one(index, factor) for index, factor in refit)
-            )
-            for (index, _factor), clip in zip(refit, refit_clips):
-                clips[index] = clip
+        if retimed:
+            log.info("%d реплик подогнаны atempo под тайминги", retimed)
 
         if progress is not None:
             progress(1.0)
         return [clip for clip in clips if clip is not None]
     finally:
-        for engine in engines.values():
+        for engine in dict.fromkeys(engines.values()):
             await engine.close()
 
 
@@ -730,6 +1058,7 @@ async def render_dub_track(
     mix_original: bool = True,
     approval: ApprovalGate | None = None,
     stt_engine: STTEngine | None = None,
+    on_clip: ClipCallback | None = None,
 ) -> tuple[np.ndarray, list[HistoryEntry]]:
     """Готовит дублированную дорожку.
 
@@ -755,7 +1084,35 @@ async def render_dub_track(
     total_started = time.perf_counter()
     stage_started = total_started
     log.info("декодирую %s…", input_path.name)
-    mono16 = _decode_file(input_path, PIPE_RATE, 1)
+    # Отделение речи от фона: распознавание идёт по чистой речи, а в микс
+    # попадает полный фон — приглушать его под репликами больше не нужно.
+    background_mix: np.ndarray | None = None
+    separation = getattr(cfg, "separation", None)
+    if bool(getattr(separation, "enabled", False)):
+        source = _decode_file(input_path, SEPARATION_RATE, 2)
+        try:
+            parts = await asyncio.to_thread(
+                separate_speech,
+                source,
+                SEPARATION_RATE,
+                model_name=str(getattr(separation, "model", "htdemucs") or "htdemucs"),
+                device=str(getattr(separation, "device", "auto") or "auto"),
+                shifts=int(getattr(separation, "shifts", 0) or 0),
+                overlap=float(getattr(separation, "overlap", 0.25) or 0.25),
+            )
+        except Exception as exc:  # noqa: BLE001 — работаем по исходному звуку
+            log.warning(
+                "отделение речи не выполнено (%s: %s) — продолжаю по исходному звуку",
+                type(exc).__name__,
+                exc,
+            )
+            mono16 = resample(to_mono(source), SEPARATION_RATE, PIPE_RATE)
+        else:
+            mono16 = resample(to_mono(parts.speech), SEPARATION_RATE, PIPE_RATE)
+            background_mix = resample(parts.background, SEPARATION_RATE, MIX_RATE)
+        del source
+    else:
+        mono16 = _decode_file(input_path, PIPE_RATE, 1)
     log.info("декодирование завершено за %.1f с", time.perf_counter() - stage_started)
     duration = len(mono16) / PIPE_RATE
     if duration > 3600:
@@ -775,13 +1132,31 @@ async def render_dub_track(
         stt_engine=stt_engine,
     )
     log.info("распознавание завершено за %.1f с", time.perf_counter() - stage_started)
+    # Зацикливание STT («фраза фраза фраза…») сворачивается до одной копии:
+    # иначе оно уходит в перевод и растягивает реплику далеко за её слот.
     spans = [
-        STTSpan(s.start, s.end, " ".join(s.text.split()), s.language)
+        STTSpan(s.start, s.end, collapse_repeats(" ".join(s.text.split())), s.language)
         for s in spans
         if not _is_junk(s.text)
     ]
     if not spans:
         raise RuntimeError("в файле не найдено речи — нечего дублировать")
+
+    # Чистые вокализации («oh», «um ah um», «mm-hmm») не переводятся и не
+    # озвучиваются: на их месте в миксе остаётся оригинальный звук, и это
+    # звучит естественнее любого синтеза.
+    voiced_spans = [s for s in spans if not is_vocalization(s.text)]
+    skipped_vocal = len(spans) - len(voiced_spans)
+    if skipped_vocal:
+        log.info(
+            "%d реплик — неречевые вокализации: оставляю оригинальный звук",
+            skipped_vocal,
+        )
+    if not voiced_spans:
+        raise RuntimeError(
+            "в файле только неречевые вокализации — переводить нечего"
+        )
+    spans = voiced_spans
 
     # Реплики уже на целевом языке переводить и переозвучивать не нужно
     if translating:
@@ -798,28 +1173,31 @@ async def render_dub_track(
     # Пол голоса — ДО перевода: теги [M]/[F] дают переводчику правильный род
     # («я готова», а не «я готов»), а озвучке — мужской/женский голос.
     configured_gender = str(getattr(cfg.tts, "voice_gender", "auto") or "auto").lower()
-    if configured_gender == "auto":
-        genders_all: list[str] = []
-        last_gender = "male"
-        for span in spans:
-            segment = mono16[int(span.start * PIPE_RATE) : int(span.end * PIPE_RATE)]
-            gender, f0 = estimate_gender_f0(segment, PIPE_RATE)
-            log.debug(
-                "голос @%.1f с: F0≈%s → %s",
-                span.start,
-                f"{f0:.0f} Гц" if f0 else "—",
-                gender or f"не определился, наследую {last_gender}",
-            )
-            gender = gender or last_gender
-            genders_all.append(gender)
-            last_gender = gender
-        female_count = genders_all.count("female")
-        log.info(
-            "голоса определены: %d муж., %d жен.",
-            len(genders_all) - female_count, female_count,
+    speaker_config = getattr(cfg, "speaker", None)
+    if configured_gender == "auto" and bool(getattr(speaker_config, "enabled", True)):
+        # Реплики раскладываются по говорящим целиком по файлу, а роль голоса
+        # определяется голосованием внутри кластера. Пореплечный F0 менял голос
+        # посреди сцены и превращал диалог двух человек в десятки «спикеров».
+        layout = assign_speakers(
+            mono16,
+            PIPE_RATE,
+            spans,
+            max_speakers=max(1, int(getattr(speaker_config, "max_speakers", 8) or 8)),
         )
+        overrides = dict(getattr(speaker_config, "voice_map", {}) or {})
+        for label, role in overrides.items():
+            if str(role).lower() in {"male", "female"} and label in layout.speakers:
+                layout.speakers[label] = str(role).lower()
+        genders_all = [layout.speakers[label] for label in layout.labels]
+        speaker_labels = list(layout.labels)
+    elif configured_gender == "auto":
+        # Разделение отключено настройкой: один голос на всех, роль по F0 файла.
+        gender, _f0 = estimate_gender_f0(mono16, PIPE_RATE)
+        genders_all = [gender or "male"] * len(spans)
+        speaker_labels = ["speaker-1"] * len(spans)
     else:
         genders_all = [configured_gender] * len(spans)
+        speaker_labels = [configured_gender] * len(spans)
 
     # 2. Перевод пачками (с полом говорящего)
     stage_started = time.perf_counter()
@@ -830,14 +1208,16 @@ async def render_dub_track(
     kept_spans: list[STTSpan] = []
     kept_texts: list[str] = []
     kept_genders: list[str] = []
+    kept_labels: list[str] = []
     dropped = 0
-    for span, text, gender in zip(spans, translated, genders_all):
+    for span, text, gender, label in zip(spans, translated, genders_all, speaker_labels):
         if translating and text is None:
             dropped += 1
             continue
         kept_texts.append(text if text is not None else span.text)
         kept_spans.append(span)
         kept_genders.append(gender)
+        kept_labels.append(label)
     if dropped:
         log.warning("%d реплик без перевода — озвучены не будут, там останется оригинал", dropped)
     if not kept_spans:
@@ -849,15 +1229,42 @@ async def render_dub_track(
 
     # 3. Озвучка параллельно
     stage_started = time.perf_counter()
-    clips = await _synthesize_all(cfg, kept_spans, kept_texts, kept_genders, stage(85, 12))
+    # Клонирующему движку нужны образцы голоса из самого ролика: тембр и манера
+    # берутся у настоящего говорящего, а не у фиксированного голоса модели.
+    references: dict[str, VoiceReference] | None = None
+    try:
+        tts_class = registry.engine_class("tts", cfg.tts.engine)
+    except KeyError:
+        tts_class = None
+    if tts_class is not None and getattr(tts_class, "supports_reference", False):
+        references = pick_references(mono16, PIPE_RATE, kept_spans, kept_labels)
+    clips = await _synthesize_all(
+        cfg,
+        kept_spans,
+        kept_texts,
+        kept_genders,
+        stage(85, 12),
+        references=references,
+        source_audio=mono16,
+        source_rate=PIPE_RATE,
+        labels=kept_labels,
+        on_clip=on_clip,
+    )
     log.info("озвучка завершена за %.1f с", time.perf_counter() - stage_started)
     if not clips:
         raise RuntimeError("озвучка не удалась ни для одной реплики")
 
     # 4. Сборка дорожки
     log.info("собираю дорожку (%d реплик, режим %s)…", len(clips), "микс" if mix_original else "только голос")
-    native = _decode_file(input_path, MIX_RATE, 2) if mix_original else None
-    duck_gain = float(10 ** (duck_db / 20))
+    native: np.ndarray | None = None
+    if mix_original:
+        native = (
+            background_mix
+            if background_mix is not None
+            else _decode_file(input_path, MIX_RATE, 2)
+        )
+    # Речь уже удалена из фона — приглушать его нечего ради чего.
+    duck_gain = 1.0 if background_mix is not None else float(10 ** (duck_db / 20))
     ramp = int(RAMP_S * MIX_RATE)
     total = len(native) if native is not None else int(duration * MIX_RATE)
     tts_track = np.zeros(total, dtype=np.float32)

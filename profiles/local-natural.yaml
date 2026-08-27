@@ -1,0 +1,83 @@
+# Живые голоса вместо фиксированного Piper: озвучка клонирует тембр
+# говорящего из самого ролика и синтезируется сразу в тайминг реплики,
+# поэтому ускорение готового звука (atempo) не применяется.
+#
+# Требуется один раз: uvt setup-mac-local --preset natural
+#
+# Цена качества, замерено на M4 (F5 через torch MPS, реплика 3.1 с):
+#   nfe_step=8  → ×2.4 длительности речи (7.5 с на реплику)
+#   nfe_step=16 → ×4.9 длительности речи (15.3 с на реплику)
+#   на CPU то же самое примерно на треть медленнее
+# То есть ролик с 8 минутами речи занимает ~20 мин при nfe_step=8 и ~40 мин
+# при 16. Это профиль для качества; для скорости остаётся local-balanced.
+mode: voiceover
+source_lang: auto
+target_lang: ru
+vad:
+  engine: silero
+separation:
+  # Речь отделяется от музыки и шумов: распознавание перестаёт выдумывать
+  # текст на музыке, образцы голоса выходят чистыми, а фон в миксе играет
+  # целиком — приглушать его под репликами не нужно.
+  # Требует: pip install demucs. Добавляет минуты обработки.
+  enabled: true
+  model: htdemucs
+  device: auto
+stt:
+  engine: parakeet-mlx
+  model: mlx-community/parakeet-tdt-0.6b-v3
+  revision: ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15
+  allow_download: false
+  chunk_seconds: 90
+  overlap_seconds: 15
+  concurrency: 1
+translation:
+  # Контекстный перевод: модель видит соседние реплики, пол говорящего и
+  # глоссарий. Это лечит «Oh you are?» → «Кто вы?» и скачки ты/вы.
+  engine: mlx-chat
+  model: mlx-community/Qwen3-4B-Instruct-2507-4bit
+  revision: 50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b
+  allow_download: false
+  batch_size: 8
+  concurrency: 1
+  max_tokens: 256
+  # Сколько соседних реплик показывать модели с каждой стороны.
+  context_pairs: 3
+  # Форма обращения одинаковая во всём ролике.
+  address: ты
+  glossary:
+    - "modeling → модельный бизнес"
+    - "casting → кастинг"
+  # Модель со строгим safety-фильтром вместо перевода откровенной реплики
+  # отдаёт отказ: dub его отбракует, и реплика останется без озвучки. Если
+  # такое повторяется, укажите здесь модель без цензуры.
+tts:
+  engine: f5
+  # Имя архитектуры F5, а не репозитория: веса приходят отдельными файлами.
+  model: F5TTS_v1_Base
+  hf_repo: Misha24-10/F5-TTS_RUSSIAN
+  hf_revision: ea166adeae4c80ec5ee423a671e2bdb83906cf84
+  hf_model_file: F5TTS_v1_Base/model_240000_inference.safetensors
+  hf_vocab_file: F5TTS_v1_Base/vocab.txt
+  allow_download: false
+  device: auto          # на Apple Silicon → mps
+  # Число шагов flow-matching. Замерена только скорость: 8 примерно вдвое
+  # быстрее 16, 32 — вдвое медленнее. Качество на слух сравните сами.
+  nfe_step: 16
+  cfg_strength: 2.0
+  # Одна модель на MPS: параллельные вызовы не ускоряют, но занимают память.
+  concurrency: 1
+  # Оценка естественной длительности: нужна, чтобы понять, какая реплика не
+  # влезает в свой слот, и попросить у модели точную длину.
+  # Замерено на выходе F5 RU: 0.090–0.108 с на символ, среднее 0.096.
+  # Заниженная оценка заставляла пересинтезировать реплики второй раз.
+  duration_per_char:
+    "ru:default": 0.096
+    "uk:default": 0.100
+  # Сильнее естественного темпа речь не ускоряется: остаток выйдет за слот,
+  # и сборка сдвинет следующую реплику — это слышно лучше скороговорки.
+  max_compression: 1.25
+latency:
+  preset: accuracy
+history:
+  enabled: true

@@ -45,7 +45,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from uvt.config import AppConfig, load_config
 from uvt import registry
-from uvt.dub import render_dub_track
+from uvt.dub import CLIP_LEAD_S, render_dub_track
 from uvt.fallback import ApprovalGate, create_stt_engine
 from uvt.interfaces import STTEngine
 from uvt.server_settings import (
@@ -77,6 +77,7 @@ _LOCAL_PROFILE_LABELS = {
     "local-fast": "Быстро",
     "local-balanced": "Сбалансированный",
     "local-quality": "Качество",
+    "local-natural": "Живые голоса",
 }
 _VOICE_LABELS = {
     "ru_RU-dmitri-medium": "Дмитрий",
@@ -652,6 +653,9 @@ class Job:
     progress: float = 0.0
     audio_url: str | None = None
     entries: list = field(default_factory=list)
+    # Реплики, готовые ещё до конца обработки: браузер проигрывает их сразу,
+    # не дожидаясь полной дорожки (прогрессивный дубляж).
+    clips: list = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -1012,6 +1016,73 @@ class DubServer:
             if engine is not None:
                 await engine.close()
 
+    def _clip_token(self, job: Job) -> str:
+        """Токен доступа к дорожке задачи, выданный заранее.
+
+        Клипы отдаются во время обработки, поэтому токен нельзя создавать в
+        самом конце: он нужен уже на первой готовой реплике. Итоговая дорожка
+        затем использует этот же токен.
+        """
+        token = self._audio_access_tokens.get(job.id)
+        if not token:
+            token = uuid.uuid4().hex
+            self._audio_access_tokens[job.id] = token
+        return token
+
+    def _store_clip(self, job: Job, clip, clips_dir: Path) -> None:
+        """Сохраняет готовую реплику и публикует её в статусе задачи."""
+        import soundfile as sf
+
+        clips_dir.mkdir(parents=True, exist_ok=True)
+        path = clips_dir / f"{clip.index}.wav"
+        temporary = clips_dir / f".{clip.index}.wav.tmp"
+        # Формат задаётся явно: по расширению .tmp его не определить, а
+        # переименование нужно, чтобы браузер не забрал недописанный файл.
+        sf.write(
+            temporary, clip.samples, clip.sample_rate, subtype="PCM_16", format="WAV"
+        )
+        os.replace(temporary, path)
+
+        url = f"/clip/{job.id}/{clip.index}.wav"
+        if self.api_token:
+            url = f"{url}?access={self._clip_token(job)}"
+        duration = len(clip.samples) / max(clip.sample_rate, 1)
+        # ``at`` — то же положение, что и в итоговой дорожке: озвучка стартует
+        # чуть раньше оригинала, так закадровый звучит синхроннее.
+        item = {
+            "index": clip.index,
+            "at": round(max(0.0, clip.source_start - CLIP_LEAD_S), 3),
+            "duration": round(duration, 3),
+            "source_start": round(clip.source_start, 3),
+            "source_end": round(clip.source_end, 3),
+            "original": clip.original,
+            "translated": clip.translated,
+            "voice_style": clip.voice_style,
+            "speaker": clip.speaker,
+            "url": url,
+        }
+        # Реплики готовятся параллельно и приходят в произвольном порядке, а
+        # список отдаётся наружу — держим его упорядоченным по таймкоду.
+        position = len(job.clips)
+        while position > 0 and job.clips[position - 1]["at"] > item["at"]:
+            position -= 1
+        job.clips.insert(position, item)
+        job.updated_at = time.time()
+
+    def _drop_clips(self, job_id: str) -> None:
+        clips_dir = self.audio_dir / "clips" / job_id
+        if not clips_dir.is_dir():
+            return
+        for file in clips_dir.iterdir():
+            try:
+                file.unlink()
+            except OSError:
+                continue
+        try:
+            clips_dir.rmdir()
+        except OSError:
+            pass
+
     def _cleanup_audio_cache(self, max_age_days: float = 7.0) -> None:
         """Remove old rendered tracks and shared browser sources on startup."""
         cutoff = time.time() - max_age_days * 86400
@@ -1038,6 +1109,19 @@ class DubServer:
                     continue
         if source_removed:
             log.info("кэш исходного звука: удалено %d старых файлов", source_removed)
+        clips_root = self.audio_dir / "clips"
+        if clips_root.is_dir():
+            clip_removed = 0
+            for directory in clips_root.iterdir():
+                try:
+                    if not directory.is_dir() or directory.stat().st_mtime >= cutoff:
+                        continue
+                except OSError:
+                    continue
+                self._drop_clips(directory.name)
+                clip_removed += 1
+            if clip_removed:
+                log.info("кэш реплик: удалено %d старых задач", clip_removed)
 
     def _cached_source(self, cache_key: str) -> Path | None:
         source_dir = self.audio_dir / "sources"
@@ -1964,6 +2048,11 @@ class DubServer:
                 def on_download_progress(fraction: float | None, detail: str) -> None:
                     self._set_download_progress(job, fraction, detail)
 
+                def publish_clip(clip) -> None:
+                    # Реплика готова окончательно — публикуем сразу, чтобы
+                    # браузер начал озвучивать видео, не дожидаясь остальных.
+                    self._store_clip(job, clip, self.audio_dir / "clips" / job.id)
+
                 approval = ApprovalGate(
                     on_request=lambda kind, cause: self._request_approval(job, kind, cause)
                 )
@@ -1990,6 +2079,7 @@ class DubServer:
                         mix_original=False,
                         approval=approval,
                         stt_engine=handed_stt,
+                        on_clip=publish_clip,
                     )
 
                     import soundfile as sf
@@ -2008,8 +2098,9 @@ class DubServer:
 
                 job.entries = [asdict(e) for e in entries]
                 if self.api_token:
-                    audio_token = uuid.uuid4().hex
-                    self._audio_access_tokens[job.id] = audio_token
+                    # Тот же токен, что уже ушёл в браузер вместе с клипами:
+                    # новый сделал бы выданные ссылки недействительными.
+                    audio_token = self._clip_token(job)
                     job.audio_url = f"/audio/{job.id}.m4a?access={audio_token}"
                 else:
                     job.audio_url = f"/audio/{job.id}.m4a"
@@ -2028,6 +2119,9 @@ class DubServer:
             job.status = "cancelled"
             job.finished_at = time.time()
             self._set_stage(job, "cancelled", stage_progress=1.0)
+            # Уже озвученные реплики отменённой задачи не понадобятся.
+            job.clips = []
+            self._drop_clips(job.id)
             log.info("задача %s отменена", job.id)
         except Exception as exc:  # noqa: BLE001 — статус уходит клиенту
             job.status = "error"
@@ -2107,10 +2201,13 @@ class DubServer:
             # не позволяет передать X-UVT-Token. OPTIONS остаётся доступным для
             # корректного preflight userscript.
             public_dashboard = request.method == "GET" and request.path == "/"
+            # Дорожка и отдельные реплики прогрессивного дубляжа проверяют
+            # собственный URL-токен в своих обработчиках.
+            token_in_url = request.path.startswith(("/audio/", "/clip/"))
             if (
                 request.method != "OPTIONS"
                 and not public_dashboard
-                and not request.path.startswith("/audio/")
+                and not token_in_url
             ):
                 if not self._request_has_api_token(request):
                     raise web.HTTPUnauthorized(text="нужен заголовок X-UVT-Token")
@@ -2133,6 +2230,7 @@ class DubServer:
         app.router.add_post("/job/{jid}/cancel", self._cancel_job)
         app.router.add_post("/job/{jid}/approve", self._approve_job)
         app.router.add_get("/audio/{name}", self._get_audio)
+        app.router.add_get("/clip/{jid}/{name}", self._get_clip)
         return app
 
     async def _index(self, request):
@@ -3374,6 +3472,22 @@ class DubServer:
         )
         gate.resolve(approved)
         return web.json_response({"ok": True, "job": self._job_payload(job)})
+
+    async def _get_clip(self, request):
+        """Отдаёт одну готовую реплику прогрессивного дубляжа."""
+        from aiohttp import web
+
+        job_id = Path(request.match_info["jid"]).name  # без обхода каталогов
+        name = Path(request.match_info["name"]).name
+        if self.api_token:
+            expected = self._audio_access_tokens.get(job_id, "")
+            supplied = request.query.get("access", "")
+            if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+                raise web.HTTPUnauthorized(text="нужен корректный токен дорожки")
+        path = self.audio_dir / "clips" / job_id / name
+        if not path.is_file():
+            raise web.HTTPNotFound(text="реплика не найдена")
+        return web.FileResponse(path, headers={"Content-Type": "audio/wav"})
 
     async def _get_audio(self, request):
         from aiohttp import web

@@ -31,11 +31,14 @@ _BUILTIN_MODULES = [
     "uvt.engines.translate_google",
     "uvt.engines.translate_nllb",
     "uvt.engines.translate_mlx_translategemma",
+    "uvt.engines.translate_mlx_chat",
     "uvt.engines.tts_edge",
     "uvt.engines.tts_openai",
     "uvt.engines.tts_elevenlabs",
     "uvt.engines.tts_kokoro",
     "uvt.engines.tts_piper",
+    "uvt.engines.tts_f5",
+    "uvt.engines.tts_indextts",
     "uvt.engines.testing",
 ]
 
@@ -55,6 +58,21 @@ def register(kind: str, name: str):
 def available(kind: str) -> list[str]:
     load_builtins()
     return sorted(_REGISTRY.get(kind, {}))
+
+
+def engine_class(kind: str, name: str) -> type:
+    """Класс движка без создания экземпляра.
+
+    Нужен, чтобы заранее узнать возможности движка (например, умеет ли TTS
+    клонировать голос по образцу) и не готовить данные, которые ему не нужны.
+    """
+    load_builtins()
+    try:
+        return _REGISTRY[kind][name]
+    except KeyError:
+        raise KeyError(
+            f"движок {kind}/'{name}' не найден; доступны: {', '.join(available(kind)) or '—'}"
+        ) from None
 
 
 def create(kind: str, name: str, cfg):

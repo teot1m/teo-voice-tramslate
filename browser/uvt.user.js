@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         UVT — закадровый перевод видео
 // @namespace    uvt
-// @version      0.15.0
-// @description  Пакетный закадровый перевод через личный UVT: Free, GPT или ElevenLabs, не live-перевод
+// @version      0.17.0
+// @description  Пакетный закадровый перевод через личный UVT: реплики звучат по мере готовности; Free, GPT или ElevenLabs
 // @match        *://*/*
 // @grant        GM_getValue
 // @grant        GM_setValue
-// @run-at       document-idle
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
@@ -45,6 +45,10 @@
     "local-quality": {
       label: "Качество",
       detail: "Whisper large-v3-turbo → TranslateGemma → Piper",
+    },
+    "local-natural": {
+      label: "Живые голоса",
+      detail: "Demucs → Parakeet → Qwen3 с контекстом → F5 с клонированием (медленно)",
     },
   });
   const LOCAL_VOICES = Object.freeze([
@@ -176,7 +180,113 @@
     appearance: "none",
     lineHeight: "1.4",
     textAlign: "center",
+    pointerEvents: "auto",
   };
+
+  // --- гарантированная реакция кнопок ---
+  // Плееры вешают свои обработчики на контейнер и на document в capture-фазе и
+  // глушат события до того, как они дойдут до цели: кнопка нарисована, курсор
+  // меняется, а нажатие «не работает». Плюс поверх <video> часто лежит
+  // прозрачный оверлей, который перехватывает попадания.
+  //
+  // Поэтому: слой UVT живёт в верхнем слое документа (см. layerHost), а
+  // действие выполняется в capture-фазе на window — раньше любого обработчика
+  // сайта на document/контейнере. Обычный click остаётся для клавиатуры
+  // (Enter/Space), с защитой от двойного срабатывания.
+  const ACTION_DEDUPE_MS = 700;
+
+  function forcePointerEvents(el) {
+    el.style.setProperty("pointer-events", "auto", "important");
+  }
+
+  function actionTarget(node) {
+    for (let el = node; el instanceof Element; el = el.parentElement) {
+      if (typeof el.__uvtAction === "function") return el;
+    }
+    return null;
+  }
+
+  function runAction(el, event) {
+    if (el.disabled || el.hidden) return;
+    const now = Date.now();
+    if (el.__uvtLastAction && now - el.__uvtLastAction < ACTION_DEDUPE_MS) return;
+    el.__uvtLastAction = now;
+    try {
+      el.focus({ preventScroll: true });
+    } catch (_) { /* focus не критичен для действия */ }
+    el.__uvtAction(event);
+  }
+
+  function bindAction(el, handler) {
+    el.__uvtAction = handler;
+    forcePointerEvents(el);
+    // Клавиатурная активация и браузеры без pointer events.
+    el.addEventListener("click", (event) => {
+      event.stopPropagation();
+      event.preventDefault();
+      runAction(el, event);
+    });
+  }
+
+  window.addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    const el = actionTarget(event.target);
+    if (!el) return;
+    // Событие дальше не идёт: сайт не поставит видео на паузу и не погасит его.
+    event.stopPropagation();
+    event.preventDefault();
+    runAction(el, event);
+  }, true);
+
+  // --- верхний слой для кнопок ---
+  // В полном экране элементы вне fullscreen-узла не отображаются, поэтому слой
+  // переезжает к текущему хозяину экрана.
+  function layerHost() {
+    return (
+      document.fullscreenElement
+      || document.webkitFullscreenElement
+      || document.body
+      || document.documentElement
+    );
+  }
+
+  function syncLayerPosition(video, wrapper) {
+    const rect = video.getBoundingClientRect();
+    const offscreen = (
+      !rect.width || !rect.height
+      || rect.bottom < 0 || rect.right < 0
+      || rect.top > window.innerHeight || rect.left > window.innerWidth
+    );
+    if (offscreen) {
+      wrapper.style.visibility = "hidden";
+      return;
+    }
+    wrapper.style.visibility = "visible";
+    wrapper.style.left = Math.round(rect.left + rect.width / 2) + "px";
+    wrapper.style.top = Math.round(Math.max(rect.top + 10, 4)) + "px";
+  }
+
+  function syncLayers() {
+    const host = layerHost();
+    for (const wrapper of document.querySelectorAll(".uvt-wrap")) {
+      const video = wrapper.__uvtVideo;
+      if (!video || !video.isConnected) continue;
+      if (wrapper.parentElement !== host) host.appendChild(wrapper);
+      syncLayerPosition(video, wrapper);
+      const s = state.get(video);
+      // Панель настроек тоже должна оставаться видимой в полном экране.
+      if (s && s.settingsPanel && s.settingsPanel.isConnected
+          && s.settingsPanel.parentElement !== host) {
+        host.appendChild(s.settingsPanel);
+      }
+    }
+  }
+
+  window.addEventListener("scroll", syncLayers, { capture: true, passive: true });
+  window.addEventListener("resize", syncLayers, { passive: true });
+  for (const eventName of ["fullscreenchange", "webkitfullscreenchange"]) {
+    document.addEventListener(eventName, syncLayers, true);
+  }
 
   function nextControlId(prefix) {
     controlId += 1;
@@ -367,11 +477,17 @@
     const etaText = info.eta_is_estimate && Number.isFinite(eta)
       ? `Оценка до готовности ${formatDuration(eta)}.`
       : "";
+    const heard = s.progressive ? s.progressive.count() : 0;
+    const heardText = heard
+      ? ` Уже озвучено реплик: ${heard} — перевод звучит по мере готовности.`
+      : "";
     setButton(
       s.button,
-      `${routeLabel} · ${info.stage === "queue" ? "очередь" : `${stage} ${stagePct}%`}`,
+      heard
+        ? `${routeLabel} · слышно ${heard} · ${stagePct}%`
+        : `${routeLabel} · ${info.stage === "queue" ? "очередь" : `${stage} ${stagePct}%`}`,
       "rgba(120, 90, 0, 0.85)",
-      `Пакетный перевод: ${message} ${etaText}`.trim()
+      `Пакетный перевод: ${message} ${etaText}${heardText}`.trim()
     );
     s.button.setAttribute("aria-busy", "true");
   }
@@ -454,6 +570,210 @@
     };
   }
 
+  // --- прогрессивная озвучка: реплики звучат по мере готовности ---
+  //
+  // Пакетная обработка идёт минутами, но озвученная реплика готова
+  // окончательно (она уже уложена в свой тайминг). Поэтому сервер публикует
+  // реплики по одной, а здесь каждая планируется по своему таймкоду через Web
+  // Audio: смотреть перевод можно с первых секунд, не дожидаясь всей дорожки.
+  //
+  // Планировщик повторяет правило итоговой сборки: реплики не накладываются —
+  // если предыдущая ещё звучит, следующая начинается после неё.
+  const CLIP_LOOKAHEAD_S = 0.8;   // насколько заранее ставить реплику в очередь
+  const CLIP_LATE_LIMIT_S = 0.4;  // позже этого начинать реплику бессмысленно
+
+  function audioContextFor(video) {
+    const s = state.get(video);
+    if (!s) return null;
+    if (s.audioCtx) return s.audioCtx;
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    try {
+      s.audioCtx = new Ctx();
+    } catch (err) {
+      console.warn("[UVT] Web Audio недоступен, прогрессивная озвучка выключена:", err);
+      return null;
+    }
+    return s.audioCtx;
+  }
+
+  function createClipPlayer(video, server, ctx) {
+    const gain = ctx.createGain();
+    gain.gain.value = prefs.voiceVol;
+    gain.connect(ctx.destination);
+
+    const meta = new Map();     // index → описание реплики от сервера
+    const buffers = new Map();  // index → декодированный звук
+    const active = new Map();   // index → запущенный источник
+    const played = new Set();   // уже отыгранные в текущем проходе
+    const loading = new Set();
+    let channelFreeAt = 0;      // ctx-время, когда канал освободится
+    let stopped = false;
+
+    async function load(clip) {
+      if (buffers.has(clip.index) || loading.has(clip.index)) return;
+      loading.add(clip.index);
+      try {
+        const blob = await apiAudio(clip.url, {}, server);
+        const decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
+        if (!stopped) buffers.set(clip.index, decoded);
+      } catch (err) {
+        console.warn("[UVT] реплика", clip.index, "не загрузилась:", err);
+      } finally {
+        loading.delete(clip.index);
+      }
+    }
+
+    function cancelScheduled() {
+      for (const item of active.values()) {
+        try {
+          item.source.onended = null;
+          item.source.stop();
+        } catch (_) { /* источник мог уже закончиться */ }
+      }
+      active.clear();
+      channelFreeAt = 0;
+    }
+
+    function schedule() {
+      if (stopped || video.paused || ctx.state !== "running") return;
+      const rate = video.playbackRate || 1;
+      const now = video.currentTime;
+      for (const [index, clip] of meta) {
+        if (played.has(index) || active.has(index)) continue;
+        const buffer = buffers.get(index);
+        if (!buffer) continue;
+        const delta = clip.at - now;
+        if (delta > CLIP_LOOKAHEAD_S) continue;   // ещё рано
+        let offset = 0;
+        if (delta < 0) {
+          offset = -delta;
+          // Реплика уже началась. Догонять её с середины можно только чуть-чуть,
+          // иначе зритель услышит обрубок не к месту.
+          if (offset > CLIP_LATE_LIMIT_S || offset >= buffer.duration - 0.15) {
+            played.add(index);
+            continue;
+          }
+        }
+        let when = ctx.currentTime + Math.max(0, delta) / rate;
+        if (when < channelFreeAt) when = channelFreeAt;  // не накладываем реплики
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.playbackRate.value = rate;
+        source.connect(gain);
+        try {
+          source.start(when, offset);
+        } catch (err) {
+          console.warn("[UVT] реплика", index, "не запустилась:", err);
+          played.add(index);
+          continue;
+        }
+        channelFreeAt = when + (buffer.duration - offset) / rate;
+        active.set(index, { source, ends: channelFreeAt });
+        played.add(index);
+        source.onended = () => active.delete(index);
+      }
+    }
+
+    return {
+      addClips(list) {
+        let added = 0;
+        for (const clip of list || []) {
+          if (!clip || typeof clip.index !== "number" || meta.has(clip.index)) continue;
+          meta.set(clip.index, clip);
+          added += 1;
+          load(clip);
+        }
+        return added;
+      },
+      windows() {
+        return buildWindows(
+          [...meta.values()].map((clip) => ({
+            tts_start: clip.at,
+            tts_end: clip.at + clip.duration,
+          }))
+        );
+      },
+      schedule,
+      cancelScheduled,
+      resume() { if (ctx.state !== "running") ctx.resume(); },
+      setVolume(value) { gain.gain.value = value; },
+      onSeek() {
+        cancelScheduled();
+        // После перемотки назад реплики впереди снова актуальны.
+        for (const [index, clip] of meta) {
+          if (clip.at + clip.duration > video.currentTime) played.delete(index);
+        }
+      },
+      count() { return meta.size; },
+      ready() { return buffers.size; },
+      stop() {
+        stopped = true;
+        cancelScheduled();
+        try { gain.disconnect(); } catch (_) { /* уже отключён */ }
+      },
+    };
+  }
+
+  function attachProgressive(video, server) {
+    const s = state.get(video);
+    if (!s) return null;
+    if (s.progressive) return s.progressive;
+    const ctx = audioContextFor(video);
+    if (!ctx) return null;
+
+    const player = createClipPlayer(video, server, ctx);
+    const ducker = createDucker(video);
+    let windows = [];
+
+    const tick = () => {
+      player.schedule();
+      ducker.set(inWindow(windows, video.currentTime) ? prefs.duck : 1);
+    };
+    const handlers = {
+      play: () => { player.resume(); tick(); },
+      pause: () => player.cancelScheduled(),
+      seeked: () => { player.onSeek(); tick(); },
+      ratechange: () => { player.cancelScheduled(); tick(); },
+      timeupdate: tick,
+    };
+    for (const [event, fn] of Object.entries(handlers)) {
+      video.addEventListener(event, fn);
+    }
+    const timer = setInterval(tick, 100);
+    player.resume();
+
+    s.progressive = {
+      handlers,
+      timer,
+      player,
+      ducker,
+      addClips(list) {
+        const added = player.addClips(list);
+        if (added) windows = player.windows();
+        tick();
+        return added;
+      },
+      count() { return player.count(); },
+      setVolume(value) { player.setVolume(value); },
+    };
+    console.info("[UVT] прогрессивная озвучка включена: реплики звучат по мере готовности");
+    return s.progressive;
+  }
+
+  function detachProgressive(video) {
+    const s = state.get(video);
+    if (!s || !s.progressive) return;
+    const progressive = s.progressive;
+    clearInterval(progressive.timer);
+    for (const [event, fn] of Object.entries(progressive.handlers)) {
+      video.removeEventListener(event, fn);
+    }
+    progressive.player.stop();
+    progressive.ducker.release();
+    s.progressive = null;
+  }
+
   // --- синхронное воспроизведение готовой дорожки ---
 
   function attachAudio(video, audioUrl, entries, server) {
@@ -508,7 +828,9 @@
 
   function detachAudio(video) {
     const s = state.get(video);
-    if (!s || !s.audio) return;
+    if (!s) return;
+    detachProgressive(video);
+    if (!s.audio) return;
     // Сначала вернуть GainNode в 1, пока перевод ещё формально включён. Для
     // fallback это no-op; user-selected video.volume всегда остаётся нетронут.
     if (s.ducker) { s.ducker.release(); s.ducker = null; }
@@ -690,6 +1012,11 @@
     s.busy = true;
     s.cancelled = false;
     s.jobId = null;
+    // AudioContext создаётся здесь, внутри обработчика нажатия: созданный
+    // позже, в цикле опроса, браузер оставил бы приостановленным, и первые
+    // готовые реплики бы не зазвучали.
+    const warm = audioContextFor(video);
+    if (warm && warm.state !== "running") warm.resume();
     // Все настройки фиксируются на весь job: другая вкладка/кнопка не должна
     // менять модель, язык или голос после асинхронного поиска медиапотока.
     s.jobPrefs = snapshotPrefs(video);
@@ -760,14 +1087,26 @@
         const info = await api("/job/" + job.id, { signal }, s.server);
         if (info.status === "done") {
           if (!info.audio_url) throw new Error("сервер отметил задачу готовой, но не отдал аудиодорожку");
+          // Готова целая дорожка — она надёжнее набора реплик при перемотке
+          // в любое место, поэтому прогрессивный плеер уступает ей место.
+          detachProgressive(video);
           attachAudio(video, info.audio_url, info.entries, s.server);
           setEnabledButton(video);
           return;
         }
         if (info.status === "cancelled") {
+          detachProgressive(video);
           return;
         }
-        if (info.status === "error") throw new Error(info.detail || "ошибка сервера");
+        if (info.status === "error") {
+          detachProgressive(video);
+          throw new Error(info.detail || "ошибка сервера");
+        }
+        // Реплики звучат по мере готовности: ждать всю дорожку не нужно.
+        if (Array.isArray(info.clips) && info.clips.length) {
+          const progressive = attachProgressive(video, s.server);
+          if (progressive) progressive.addClips(info.clips);
+        }
         renderJobStatus(video, info);
       }
     } catch (err) {
@@ -1354,6 +1693,7 @@
     panel.appendChild(volLabel);
     panel.appendChild(makeSlider(0.2, 1, 0.05, prefs.voiceVol, (value) => {
       prefs.voiceVol = value;
+      if (s.progressive) s.progressive.setVolume(value);
       refreshVolLabel();
       if (s.audio) s.audio.volume = value;
     }, volumeId));
@@ -1591,7 +1931,7 @@
         const profileInfo = (meta.profiles || []).find((item) => item.id === selectedProfile);
         const engineInfo = profileInfo && profileInfo.engines ? profileInfo.engines : engines;
         localSourceRestricted = activeRoute === "free" && (
-          ["local-fast", "local-balanced", "local-quality"].includes(selectedProfile)
+          ["local-fast", "local-balanced", "local-quality", "local-natural"].includes(selectedProfile)
           || engineInfo.stt === "parakeet-mlx"
           || engineInfo.translation === "translategemma-mlx"
         );
@@ -1702,7 +2042,9 @@
         signal: s.settingsAbort.signal,
       });
     }
-    document.body.appendChild(panel);
+    // Тот же верхний слой, что и у кнопок: иначе в полном экране панель
+    // настроек не отображается.
+    layerHost().appendChild(panel);
     s.settingsPanel = panel;
     positionPanel();
     refreshMeta();
@@ -1715,15 +2057,17 @@
     if (state.has(video)) return;
     const parent = video.parentElement;
     if (!parent) return;
-    if (getComputedStyle(parent).position === "static") parent.style.position = "relative";
 
     const wrapper = document.createElement("div");
     wrapper.className = "uvt-wrap";
     wrapper.__uvtVideo = video; // для уборки кнопок исчезнувших видео (реклама)
+    // Слой не вкладывается в контейнер плеера: там его перекрывают оверлеи
+    // сайта и ограничивает чужой контекст наложения, из-за чего кнопки
+    // оказывались нерабочими. Позиция считается от прямоугольника видео.
     Object.assign(wrapper.style, {
-      position: "absolute",
-      top: "10px",
-      left: "50%",
+      position: "fixed",
+      top: "0px",
+      left: "0px",
       transform: "translateX(-50%)",
       zIndex: "2147483647",
       display: "flex",
@@ -1765,10 +2109,9 @@
     cancelBtn.title = "Отменить подготовку пакетного перевода";
     cancelBtn.setAttribute("aria-label", "Отменить подготовку пакетного перевода");
 
-    btn.addEventListener("click", (event) => {
-      event.stopPropagation();
-      event.preventDefault();
+    bindAction(btn, () => {
       const s = state.get(video);
+      if (!s) return;
       if (s.on) {
         detachAudio(video);
         closeLangPanel(s.wrapper, s.chip, false);
@@ -1778,23 +2121,19 @@
       }
     });
 
-    cancelBtn.addEventListener("click", (event) => {
-      event.stopPropagation();
-      event.preventDefault();
-      cancelJob(video);
-    });
+    bindAction(cancelBtn, () => cancelJob(video));
 
-    chip.addEventListener("click", (event) => {
-      event.stopPropagation();
-      event.preventDefault();
-      toggleLangPanel(wrapper, chip, video);
-    });
+    bindAction(chip, () => toggleLangPanel(wrapper, chip, video));
 
     wrapper.appendChild(btn);
     wrapper.appendChild(routeSelect);
     wrapper.appendChild(chip);
     wrapper.appendChild(cancelBtn);
-    parent.appendChild(wrapper);
+    for (const control of [wrapper, btn, routeSelect, chip, cancelBtn]) {
+      forcePointerEvents(control);
+    }
+    layerHost().appendChild(wrapper);
+    syncLayerPosition(video, wrapper);
     state.set(video, {
       wrapper,
       button: btn,
@@ -1817,6 +2156,9 @@
       jobAbort: null,
       settingsPanel: null,
       cleanupAutoHide: null,
+      // Прогрессивная озвучка: плеер готовых реплик и его аудиоконтекст.
+      progressive: null,
+      audioCtx: null,
     });
     setIdleButton(video);
     state.get(video).cleanupAutoHide = setupAutoHide(video, wrapper);
@@ -1856,7 +2198,7 @@
     };
     const show = () => {
       wrapper.style.opacity = "1";
-      wrapper.style.pointerEvents = "auto";
+      forcePointerEvents(wrapper);
     };
     const hide = () => {
       if (mustStay()) {
@@ -1872,7 +2214,7 @@
       // transparent overlays above <video>; disabling pointer events here made
       // the next click fall through to the player and pause the video.
       wrapper.style.opacity = "0.55";
-      wrapper.style.pointerEvents = "auto";
+      forcePointerEvents(wrapper);
     };
     const poke = () => {
       show();
@@ -1972,6 +2314,10 @@
     }
     cleanupSettingsState(wrapper);
     detachAudio(video);
+    if (s && s.audioCtx) {
+      try { s.audioCtx.close(); } catch (_) { /* уже закрыт */ }
+      s.audioCtx = null;
+    }
     state.delete(video);
     wrapper.remove();
   }
@@ -2007,8 +2353,22 @@
       removeWrapperFor(video, wrapper);
     }
     for (const video of keep) addButton(video);
+    syncLayers();
   }
 
-  scan();
-  setInterval(scan, 2000);
+  // Перехват нажатий уже зарегистрирован выше — раньше скриптов плеера.
+  // Обход DOM начинается, когда документ готов.
+  function boot() {
+    scan();
+    setInterval(scan, 2000);
+    // Плеер и страница двигают видео (раскрытие, theatre mode, липкий плеер):
+    // слой должен ехать за ним, а не оставаться на прежнем месте.
+    setInterval(syncLayers, 250);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", boot, { once: true });
+  } else {
+    boot();
+  }
 })();

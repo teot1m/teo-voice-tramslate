@@ -51,6 +51,19 @@ vad = ["onnxruntime>=1.17"]
 tts = ["edge-tts>=6.1.9"]
 piper = ["piper-tts>=1.4.0"]
 kokoro = ["kokoro-onnx>=0.4.0"]
+# Клонирующая озвучка: голос берётся образцом из самого ролика, реплика
+# синтезируется сразу в свой тайминг (без ускорения готового звука).
+f5 = ["f5-tts>=1.1.0"]
+# Отделение речи от музыки и шумов перед распознаванием и сборкой.
+separation = ["demucs>=4.0.0"]
+# Полный маршрут «живого» локального дубляжа для Apple Silicon.
+natural = [
+    "parakeet-mlx==0.5.2; sys_platform == 'darwin'",
+    "mlx-lm==0.31.3; sys_platform == 'darwin'",
+    "huggingface-hub>=0.25.0",
+    "f5-tts>=1.1.0",
+    "demucs>=4.0.0",
+]
 webrtc = ["webrtcvad>=2.0.10"]
 server = ["aiohttp>=3.9"]
 web = ["yt-dlp[default]>=2026.8.19"]

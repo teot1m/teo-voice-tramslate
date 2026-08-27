@@ -29,6 +29,9 @@ class HuggingFaceModelSpec:
     repo_id: str
     revision: str
     required_files: tuple[str, ...]
+    # Репозитории с несколькими чекпойнтами качаются точечно: полный snapshot
+    # весов F5 — это десятки гигабайт вместо нужной пары файлов.
+    allow_patterns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,19 @@ NLLB_REPO = "OpenNMT/nllb-200-distilled-1.3B-ct2-int8"
 NLLB_REVISION = "70f572adafa4794890ce7826156a4209717855af"
 MLX_WHISPER_REPO = "mlx-community/whisper-large-v3-turbo"
 MLX_WHISPER_REVISION = "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb"
+
+# Chat-модель для контекстного перевода диалогов: в отличие от TranslateGemma
+# её промпт вмещает соседние реплики, пол говорящего и глоссарий.
+QWEN_CHAT_REPO = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+QWEN_CHAT_REVISION = "50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b"
+
+# Русский файнтюн F5-TTS: базовый чекпойнт обучен на английском и китайском,
+# для ru нужен именно он. Веса и словарь берутся из одной папки репозитория —
+# несогласованная пара даёт кашу вместо речи.
+F5_RU_REPO = "Misha24-10/F5-TTS_RUSSIAN"
+F5_RU_REVISION = "ea166adeae4c80ec5ee423a671e2bdb83906cf84"
+F5_RU_MODEL_FILE = "F5TTS_v1_Base/model_240000_inference.safetensors"
+F5_RU_VOCAB_FILE = "F5TTS_v1_Base/vocab.txt"
 
 # Piper itself is installed as a Python dependency. Voice files are fetched
 # here directly from an immutable Hub commit instead of using
@@ -117,6 +133,26 @@ LOCAL_MODEL_MANIFEST: dict[str, HuggingFaceModelSpec] = {
         revision=MLX_WHISPER_REVISION,
         required_files=("config.json", "weights.safetensors"),
     ),
+    "qwen3-chat": HuggingFaceModelSpec(
+        key="qwen3-chat",
+        role="translation",
+        repo_id=QWEN_CHAT_REPO,
+        revision=QWEN_CHAT_REVISION,
+        required_files=(
+            "config.json",
+            "chat_template.jinja",
+            "model.safetensors",
+            "tokenizer.json",
+        ),
+    ),
+    "f5-ru": HuggingFaceModelSpec(
+        key="f5-ru",
+        role="tts",
+        repo_id=F5_RU_REPO,
+        revision=F5_RU_REVISION,
+        required_files=(F5_RU_MODEL_FILE, F5_RU_VOCAB_FILE),
+        allow_patterns=(F5_RU_MODEL_FILE, F5_RU_VOCAB_FILE),
+    ),
 }
 
 LOCAL_SETUP_PRESETS: dict[str, LocalSetupPreset] = {
@@ -138,9 +174,22 @@ LOCAL_SETUP_PRESETS: dict[str, LocalSetupPreset] = {
         stt_key="whisper",
         translation_key="translategemma",
     ),
+    "natural": LocalSetupPreset(
+        name="natural",
+        model_keys=("parakeet", "qwen3-chat", "f5-ru"),
+        stt_key="parakeet",
+        translation_key="qwen3-chat",
+    ),
     "all": LocalSetupPreset(
         name="all",
-        model_keys=("parakeet", "nllb", "translategemma", "whisper"),
+        model_keys=(
+            "parakeet",
+            "nllb",
+            "translategemma",
+            "whisper",
+            "qwen3-chat",
+            "f5-ru",
+        ),
         stt_key="whisper",
         translation_key="translategemma",
     ),
@@ -155,6 +204,11 @@ def preset_for_profile(cfg: Any) -> str | None:
             getattr(getattr(cfg, "translation", None), "engine", "") or ""
         ),
     )
+    tts_engine = str(getattr(getattr(cfg, "tts", None), "engine", "") or "")
+    if tts_engine == "f5":
+        # Клонирующая озвучка требует собственных весов, поэтому маршрут
+        # опознаётся по ней, а не только по паре STT+перевод.
+        return "natural"
     return {
         ("parakeet-mlx", "nllb-ct2"): "fast",
         ("parakeet-mlx", "translategemma-mlx"): "balanced",
@@ -204,13 +258,14 @@ def _model_status(
         "error": None,
     }
     try:
-        path = Path(
-            snapshot_download(
-                repo_id=spec.repo_id,
-                revision=spec.revision,
-                local_files_only=local_only,
-            )
-        )
+        kwargs: dict[str, Any] = {
+            "repo_id": spec.repo_id,
+            "revision": spec.revision,
+            "local_files_only": local_only,
+        }
+        if spec.allow_patterns:
+            kwargs["allow_patterns"] = list(spec.allow_patterns)
+        path = Path(snapshot_download(**kwargs))
         _validate_snapshot(spec, path)
     except Exception as exc:  # noqa: BLE001 - report missing/corrupt artifact
         status["error"] = str(exc)

@@ -156,6 +156,21 @@ class SpeakerConfig(_Section):
     fallback_voice_roles: list[str] = Field(default_factory=lambda: ["female", "male"])
 
 
+class SeparationConfig(_Section):
+    """Отделение речи от фона (Demucs) перед распознаванием и сборкой.
+
+    Тяжёлый шаг: он резко снижает галлюцинации STT на музыке и позволяет не
+    приглушать фон под репликами, но добавляет минуты обработки. Поэтому
+    включается профилем качества, а не по умолчанию.
+    """
+
+    enabled: bool = False
+    model: str = "htdemucs"
+    device: str = "auto"          # auto → mps на Apple Silicon
+    overlap: float = 0.25
+    shifts: int = 0               # >0 точнее и во столько же раз дольше
+
+
 class OutputConfig(_Section):
     backend: str = "sounddevice"  # sounddevice | null
     device: int | str | None = None  # наушники, VB-Cable, BlackHole → OBS/Discord
@@ -202,6 +217,7 @@ class AppConfig(_Section):
     translation: TranslationConfig = Field(default_factory=TranslationConfig)
     tts: TTSConfig = Field(default_factory=TTSConfig)
     speaker: SpeakerConfig = Field(default_factory=SpeakerConfig)
+    separation: SeparationConfig = Field(default_factory=SeparationConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     overlay: OverlayConfig = Field(default_factory=OverlayConfig)
     history: HistoryConfig = Field(default_factory=HistoryConfig)
