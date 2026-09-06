@@ -1,11 +1,16 @@
 async (page) => {
   const check = (condition, message) => { if (!condition) throw new Error(message); };
   const results = [];
+  const showOverlay = async () => {
+    await page.waitForTimeout(720); // allow the userscript's click debounce
+    await page.locator('video').hover({position:{x:10,y:10}});
+  };
+  await showOverlay();
   await page.getByRole('button', {name:'Настройки пакетного перевода: Настройки',exact:true}).click();
   await page.waitForFunction(() => document.querySelector('[id^="uvt-target"]').value === 'uk');
   check(await page.locator('[id^="uvt-source"]').inputValue() === 'en', 'Server source is shown');
   check(await page.locator('[id^="uvt-voice-model"]').inputValue() === 'uk_UA-tetiana-high', 'Server exact voice is shown');
-  check(await page.locator('[id^="uvt-local-profile"] option[value="unknown"]').isDisabled(), 'Unverified profiles remain unavailable');
+  check(!(await page.locator('[id^="uvt-local-profile"] option[value="unknown"]').isDisabled()), 'Unverified profiles can be selected before readiness is known');
   check(await page.locator('[id^="uvt-local-profile"] option[value="local-quality"]').isDisabled(), 'Missing model is unavailable');
   check(await page.locator('details[open]').count() === 0, 'Advanced sections start collapsed');
   results.push('server defaults, exact voice, unavailable models, progressive disclosure');
@@ -14,6 +19,7 @@ async (page) => {
   await page.keyboard.press('Escape');
   check(await page.locator('.uvt-panel').count() === 0, 'Escape closes panel');
   check(await page.evaluate(() => document.activeElement.getAttribute('aria-haspopup') === 'dialog'), 'Escape restores trigger focus');
+  await showOverlay();
   await page.getByRole('button', {name:'Подготовить пакетный перевод и синхронную аудиодорожку',exact:true}).click();
   await page.waitForFunction(() => window.uvtFixture.requests.some(r => r.path === '/dub'));
   const override = await page.evaluate(() => window.uvtFixture.requests.find(r => r.path === '/dub').body);
@@ -24,10 +30,12 @@ async (page) => {
   await page.getByRole('button', {name:'Отменить подготовку пакетного перевода',exact:true}).click();
   await page.waitForFunction(() => document.querySelector('.uvt-progress').hidden);
   results.push('manual override payload, retained early manifest, progress, unchanged playback, cancel');
+  await showOverlay();
   await page.getByRole('button', {name:/Настройки пакетного перевода:/}).click();
   await page.locator('[id^="uvt-settings-mode"]').selectOption('server');
   await page.waitForFunction(() => document.querySelector('[id^="uvt-target"]').value === 'uk');
   await page.keyboard.press('Escape');
+  await showOverlay();
   await page.getByRole('button', {name:'Подготовить пакетный перевод и синхронную аудиодорожку',exact:true}).click();
   await page.waitForFunction(() => window.uvtFixture.requests.filter(r => r.path === '/dub').length === 2);
   const server = await page.evaluate(() => window.uvtFixture.requests.filter(r => r.path === '/dub')[1].body);
@@ -35,6 +43,7 @@ async (page) => {
   await page.getByRole('button', {name:'Отменить подготовку пакетного перевода',exact:true}).click();
   await page.waitForFunction(() => document.querySelector('.uvt-progress').hidden);
   results.push('return to server defaults preserves API authority');
+  await showOverlay();
   await page.getByRole('button', {name:/Настройки пакетного перевода:/}).click();
   await page.locator('[id^="uvt-local-profile"]').selectOption('local-natural');
   await page.waitForFunction(() => document.querySelector('.uvt-profile-guide').textContent.includes('Тяжёлый'));
@@ -50,7 +59,7 @@ async (page) => {
   await page.evaluate(() => {window.uvtFixture.unavailable=true;});
   await page.locator('[id^="uvt-target"]').selectOption('ru');
   await page.waitForFunction(() => document.querySelector('.uvt-panel').textContent.includes('Сервер недоступен.'));
-  check(await page.locator('[id^="uvt-local-profile"]').isDisabled(), 'Offline model selector is disabled');
-  results.push('offline recovery with unverified selector disabled');
+  check(!(await page.locator('[id^="uvt-local-profile"]').isDisabled()), 'Offline profile can be selected for the next attempt');
+  results.push('offline recovery with profile selection available');
   return {passed:results};
 }

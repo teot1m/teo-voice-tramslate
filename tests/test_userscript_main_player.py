@@ -1,4 +1,4 @@
-"""Run neutral userscript DOM fixtures in a real installed Chromium browser."""
+"""Check all-player visibility and idle controls in an installed Chromium browser."""
 from __future__ import annotations
 
 import json
@@ -21,7 +21,7 @@ def _playwright_module() -> str | None:
     return str(candidates[0].parent) if candidates else None
 
 
-def test_main_player_detection_in_real_dom():
+def test_visible_players_and_idle_controls_in_real_dom():
     if not shutil.which("node"):
         pytest.skip("Node.js is needed for the userscript browser fixtures")
     module = _playwright_module()

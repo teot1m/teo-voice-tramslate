@@ -1,4 +1,4 @@
-/* Neutral real-DOM regression fixtures; no external media or server needed. */
+/* Real DOM fixtures for all-player visibility and idle controls. No external media. */
 const assert = require("node:assert/strict");
 const { chromium } = require(process.env.UVT_PLAYWRIGHT_MODULE || "playwright");
 const script = process.argv[2];
@@ -9,6 +9,7 @@ const script = process.argv[2];
   const errors = [];
   const results = [];
   page.on("pageerror", error => errors.push(error.message));
+  page.on("console", message => { if (message.type() === "error") errors.push(message.text()); });
   let fixture = "";
   await page.route("https://uvt-preview.test/**", route => route.fulfill({
     status: 200, contentType: "text/html", body: fixture
@@ -24,8 +25,12 @@ const script = process.argv[2];
     }, expected, { timeout: 4000 });
     assert.deepEqual(await selected(), expected);
   }
+  async function opacity(value) {
+    await page.waitForFunction(value => getComputedStyle(document.querySelector(".uvt-wrap")).opacity === value,
+      value, { timeout: 5000 });
+  }
   async function scenario(name, body, expected, further = null) {
-    fixture = `<html><head><style>body{margin:0}video{display:block;background:#334155}
+    fixture = `<html><head><title>UVT neutral player test</title><style>body{margin:0}video{display:block;background:#334155}
       .uvt-wrap{font-family:sans-serif}</style></head><body>${body}</body></html>`;
     await page.goto("https://uvt-preview.test/watch/demo");
     await page.addScriptTag({ path: script });
@@ -34,66 +39,100 @@ const script = process.argv[2];
     results.push(name);
   }
   try {
-    await scenario("large linked card, even with controls", `<a href="/watch/other">${video("card")}</a>`, []);
-    await scenario("hover preview carrying a player class", `<div class="video-preview jwplayer">${video("hover")}</div>`, []);
-    await scenario("single lazy hover video in a grid", `<div class="videos-grid"><div>${video("grid", "muted autoplay loop")}</div></div>`, []);
-    await scenario("semantic feed excludes unlabelled video entries", `<section role="feed"><article>${video("feed")}</article></section>`, []);
-    await scenario("YouTube custom-element preview card", `<ytd-rich-grid-media><div id="movie_player">${video("yt-card")}</div></ytd-rich-grid-media>`, []);
-    await scenario("YouTube full watch player stays eligible", `<ytd-watch-flexy><div id="movie_player">${video("yt-main", "muted")}</div></ytd-watch-flexy>`, ["yt-main"]);
-    await scenario("semantic list with unlabelled cards", `<ul><li>${video("list")}<a href="/watch/other">Title</a></li><li><a href="/watch/another">Next</a></li></ul>`, []);
-    await scenario("CSS grid with unlabelled cards", `<div style="display:grid;grid-template-columns:1fr 1fr"><div>${video("css-grid")}<a href="/watch/other">Title</a></div><div><a href="/watch/another">Next</a></div></div>`, []);
-    await scenario("muted autoplay native main player", `<main>${video("native", "controls muted autoplay loop")}</main>`, ["native"]);
-    await scenario("hover control state is not a hover preview", `<main><div class="player hover">${video("hover-state", "muted")}</div></main>`, ["hover-state"]);
-    await scenario("generic card styling around full player", `<main><section class="card"><div class="player">${video("styled")}</div></section></main>`, ["styled"]);
-    await scenario("clickable grid cards without href links", `<div style="display:grid"><div class="card" role="link">${video("js-card")}</div><div class="card">Next</div></div>`, []);
-    await scenario("custom main player without native controls", `<main><div class="jwplayer">${video("custom", "muted")}</div></main>`, ["custom"]);
-    await scenario("proprietary camelCase main player", `<main><div class="mgp_videoWrapper">${video("proprietary", "muted autoplay")}</div></main>`, ["proprietary"]);
-    await scenario("small standalone embed without native controls", `<div>${video("embed", "muted", "width:320px;height:180px")}</div>`, ["embed"]);
-    await scenario("main player with large preview beside it", `<main><div class="player">${video("main")}</div><div class="video-card">${video("related")}</div></main>`, ["main"]);
-    await scenario("portrait short clip", `<main>${video("short", "controls muted loop", "width:240px;height:420px")}</main>`, ["short"]);
-    await scenario("article embed remains usable", `<main><article><h1>Lesson</h1>${video("lesson")}<p><a href="/next">Next lesson</a></p></article></main>`, ["lesson"]);
-    await scenario("explicit ad preview rejected", `<div class="ad-video player">${video("ad")}</div>`, []);
-    await scenario("unrelated silent thumbnail does not receive overlay", `<main>${video("main")}<aside>${video("thumb", "muted loop", "width:260px;height:140px")}</aside></main>`, ["main"]);
-    await scenario("below-fold giant video does not steal overlay", `${video("main")}<div style="margin-top:1100px">${video("below", "controls", "width:1100px;height:600px")}</div>`, ["main"]);
-    await scenario("popup opens from a card context", `<div class="video-card"><div role="dialog" aria-modal="true"><div class="player">${video("popup")}</div></div></div>`, ["popup"]);
-    await scenario("grid previews inside a dialog stay excluded", `<div role="dialog"><div class="video-grid">${video("popup-preview")}</div></div>`, []);
-    await scenario("reparenting main player into a card removes controls", `<div class="player" id="host">${video("moving")}</div><div class="video-card" id="card"></div>`, ["moving"], async () => {
-      await page.evaluate(() => document.querySelector("#card").append(document.querySelector("#moving")));
-      await waitFor([]);
-      await page.evaluate(() => document.querySelector("#host").append(document.querySelector("#moving")));
-      await waitFor(["moving"]);
+    await scenario("deep generic player", `<main><section><div>${video("deep", "muted")}</div></section></main>`, ["deep"]);
+    await scenario("YouTube watch columns and sidebar", `<ytd-watch-flexy><div style="display:grid;grid-template-columns:2fr 1fr"><div><div id="movie_player">${video("youtube", "muted")}</div><h1>Example video</h1><a href="/channel/demo">Channel</a></div><aside><a href="/watch/next">Next</a></aside></div></ytd-watch-flexy>`, ["youtube"]);
+    await scenario("custom player beside recommendation sidebar", `<div style="display:grid;grid-template-columns:2fr 1fr"><section><div class="player">${video("watch", "muted")}</div><a href="/author">Author</a></section><aside><a href="/next">Next</a></aside></div>`, ["watch"]);
+    await scenario("outer recommendation labels do not hide video", `<div class="related-content video-list-page"><main>${video("page")}</main></div>`, ["page"]);
+    await scenario("linked video is eligible again", `<a href="/watch/other">${video("linked")}</a>`, ["linked"]);
+    await scenario("preview class cannot hide a real player", `<div class="video-preview jwplayer">${video("named-preview", "muted")}</div>`, ["named-preview"]);
+    await scenario("all separate visible players receive controls", `<main>${video("first", "muted")}<div class="video-card">${video("second", "muted", "width:320px;height:180px")}</div></main>`, ["first", "second"]);
+    await scenario("video collection remains eligible", `<div class="videos-grid" role="feed">${video("feed", "muted")}</div>`, ["feed"]);
+    await scenario("proprietary player", `<div class="mgp_videoWrapper">${video("custom", "muted autoplay")}</div>`, ["custom"]);
+    await scenario("muted autoplay short loop", `<main>${video("loop", "controls muted autoplay loop")}</main>`, ["loop"]);
+    await scenario("small player", `<section>${video("small", "muted", "width:240px;height:160px")}</section>`, ["small"]);
+    await scenario("hidden videos excluded", `${video("display-none", "", "display:none;width:640px;height:360px")}${video("invisible", "", "visibility:hidden;width:640px;height:360px")}${video("transparent", "", "opacity:0;width:640px;height:360px")}`, []);
+    await scenario("offscreen player appears when scrolled into view", `<div style="height:1200px"></div>${video("below")}`, [], async () => {
+      await page.locator("video").scrollIntoViewIfNeeded();
+      await waitFor(["below"]);
     });
-    await scenario("lazy preview class changes trigger a fresh decision", `<div class="player">${video("dynamic")}</div>`, ["dynamic"], async () => {
-      await page.evaluate(() => { document.querySelector("video").className = "hoverPreview"; });
+    await scenario("reparenting does not discard video controls", `<div id="host">${video("moving")}</div><div class="video-card" id="card"></div>`, ["moving"], async () => {
+      await page.evaluate(() => document.querySelector("#card").append(document.querySelector("video")));
+      await waitFor(["moving"]);
+      await page.evaluate(() => document.querySelector("video").remove());
       await waitFor([]);
-      await page.evaluate(() => { document.querySelector("video").className = ""; });
+    });
+    await scenario("preview classes changing do not hide controls", `<div>${video("dynamic")}</div>`, ["dynamic"], async () => {
+      await page.evaluate(() => { document.querySelector("video").className = "hoverPreview"; });
       await waitFor(["dynamic"]);
     });
-    await scenario("SPA navigation replaces stale overlay on reused video", `<div class="player">${video("spa")}</div>`, ["spa"], async () => {
+    await scenario("SPA navigation resets reused player state", `${video("spa")}`, ["spa"], async () => {
       await page.evaluate(() => {
         document.querySelector(".uvt-wrap").dataset.oldJob = "yes";
         history.pushState({}, "", "/watch/new-video");
         document.querySelector("video").setAttribute("data-preview", "true");
       });
-      await waitFor([]);
-      await page.evaluate(() => document.querySelector("video").removeAttribute("data-preview"));
+      await page.waitForFunction(() => !document.querySelector(".uvt-wrap[data-old-job]"));
       await waitFor(["spa"]);
-      assert.equal(await page.locator(".uvt-wrap[data-old-job]").count(), 0);
     });
-    await scenario("fullscreen expansion overrides card classification", `<div class="video-card" id="full">${video("full-video")}<button id="expand">Open video</button></div>`, [], async () => {
-      await page.evaluate(() => document.querySelector("#expand").onclick = () => document.querySelector("#full").requestFullscreen());
+    await scenario("stacked players only attach to active video", `<div style="position:relative">${video("idle", "", "position:absolute;width:640px;height:360px")}${video("active", "", "position:absolute;width:640px;height:360px")}</div>`, ["idle"], async () => {
+      await page.evaluate(() => Object.defineProperty(document.querySelector("#active"), "paused", {get: () => false}));
+      await waitFor(["active"]);
+    });
+    await scenario("small inset is a separate player, not a duplicate", `<div style="position:relative;width:640px;height:360px">${video("background", "muted")}${video("inset", "muted", "position:absolute;right:0;bottom:0;width:240px;height:160px")}</div>`, ["background", "inset"]);
+    await scenario("fullscreen excludes another playing video", `<div id="full">${video("full-main", "muted")}<button id="expand">Open video</button></div>${video("sidebar", "muted", "width:320px;height:180px")}`, ["full-main", "sidebar"], async () => {
+      await page.evaluate(() => {
+        Object.defineProperty(document.querySelector("#sidebar"), "paused", {get: () => false});
+        document.querySelector("#expand").onclick = () => document.querySelector("#full").requestFullscreen();
+      });
       await page.locator("#expand").click();
       await page.waitForFunction(() => !!document.fullscreenElement);
-      await waitFor(["full-video"]);
+      await waitFor(["full-main"]);
       await page.evaluate(() => document.exitFullscreen());
-      await waitFor([]);
+      await waitFor(["full-main", "sidebar"]);
     });
-    await scenario("plain page layout named list-page is not a preview", `<main class="list-page"><div class="player">${video("plain")}</div></main>`, ["plain"]);
-    await scenario("legitimate nested iframe player", `<iframe id="embed-frame" style="width:640px;height:400px" srcdoc="<main><section><div><video id='iframe-video' muted style='width:600px;height:340px'></video></div></section></main>"></iframe>`, [], async () => {
+    await scenario("fullscreen keeps accessible controls", `<div id="full">${video("full-video")}<button id="expand">Open video</button></div>`, ["full-video"], async () => {
+      await page.evaluate(() => document.querySelector("#expand").onclick = () => document.querySelector("#full").requestFullscreen());
+      await page.locator("#expand").click();
+      await page.waitForFunction(() => document.querySelector(".uvt-wrap").parentElement === document.fullscreenElement);
+      await page.evaluate(() => document.exitFullscreen());
+      await page.waitForFunction(() => document.querySelector(".uvt-wrap").parentElement === document.body);
+    });
+    await scenario("nested iframe player", `<iframe id="embed-frame" style="width:640px;height:400px" srcdoc="<main><section><div><video id='iframe-video' muted style='width:600px;height:340px'></video></div></section></main>"></iframe>`, [], async () => {
       const frame = page.frames().find(frame => frame !== page.mainFrame());
       await frame.addScriptTag({ path: script });
       await frame.waitForFunction(() => document.querySelector(".uvt-wrap")?.__uvtVideo.id === "iframe-video");
       assert.equal(await frame.locator(".uvt-wrap").count(), 1);
+    });
+    await scenario("idle over controls fully hides, passes clicks, then movement restores", `<main>${video("idle", "muted")}</main>`, ["idle"], async () => {
+      const chip = page.getByRole("button", { name: /Настройки пакетного перевода:/ });
+      const box = await chip.boundingBox();
+      const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+      await page.mouse.move(point.x, point.y);
+      await opacity("1");
+      if (process.env.UVT_SCREENSHOT_DIR) await page.screenshot({path: `${process.env.UVT_SCREENSHOT_DIR}/uvt-controls-visible.png`});
+      await opacity("0");
+      assert.equal(await page.evaluate(p => !!document.elementFromPoint(p.x, p.y)?.closest(".uvt-wrap"), point), false);
+      assert.equal(await chip.evaluate(el => getComputedStyle(el).pointerEvents), "none");
+      await page.waitForTimeout(600);
+      assert.equal(await page.locator(".uvt-wrap").evaluate(el => getComputedStyle(el).opacity), "0", "stationary pointer must not wake the layer");
+      if (process.env.UVT_SCREENSHOT_DIR) await page.screenshot({path: `${process.env.UVT_SCREENSHOT_DIR}/uvt-controls-hidden.png`});
+      await page.mouse.move(point.x + 2, point.y + 2);
+      await opacity("1");
+      assert.equal(await page.evaluate(p => !!document.elementFromPoint(p.x + 2, p.y + 2)?.closest(".uvt-wrap"), point), true);
+    });
+    await scenario("keyboard focus wakes and retains controls", `<main>${video("keyboard", "muted")}</main>`, ["keyboard"], async () => {
+      await page.mouse.move(1000, 800);
+      await opacity("0");
+      await page.keyboard.press("Tab");
+      await opacity("1");
+      assert.equal(await page.evaluate(() => !!document.activeElement.closest(".uvt-wrap")), true);
+      await page.waitForTimeout(3300);
+      assert.equal(await page.locator(".uvt-wrap").evaluate(el => getComputedStyle(el).opacity), "1");
+    });
+    await page.setViewportSize({width:390,height:844});
+    await scenario("mobile controls fit the player", `<main>${video("mobile", "muted", "width:100%;height:220px")}</main>`, ["mobile"], async () => {
+      assert.equal(await page.locator(".uvt-wrap").evaluate(el => { const r = el.getBoundingClientRect(); return r.left >= 0 && r.right <= innerWidth; }), true);
+      if (process.env.UVT_SCREENSHOT_DIR) await page.screenshot({path: `${process.env.UVT_SCREENSHOT_DIR}/uvt-controls-mobile.png`});
     });
     assert.deepEqual(errors, [], "userscript emitted browser errors");
     console.log(JSON.stringify({ passed: results.length, scenarios: results, browserErrors: errors }));

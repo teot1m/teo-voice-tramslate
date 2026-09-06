@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         UVT — закадровый перевод видео
 // @namespace    uvt
-// @version      0.18.2
+// @version      0.18.3
 // @description  Пакетный закадровый перевод через личный UVT: реплики звучат по мере готовности; Free, GPT или ElevenLabs
 // @match        *://*/*
 // @grant        GM_getValue
@@ -67,7 +67,7 @@
   const WINDOW_LEAD_S = 0.15;  // приглушать чуть раньше начала реплики
   const WINDOW_TAIL_S = 0.3;   // и отпускать чуть позже её конца
   const SPEECH_RATE_S = 0.07;  // оценка длительности озвучки: секунд на символ
-  const MIN_VIDEO_WIDTH = 200; // минимальный размер плеера; карточки исключаются по контексту
+  const MIN_VIDEO_WIDTH = 200; // не добавлять плашку на технические видео размером в несколько пикселей
 
   const LANG_NAMES = {
     auto: "авто", ru: "русский", en: "английский", uk: "украинский",
@@ -256,8 +256,10 @@
 
   function syncLayerPosition(video, wrapper) {
     const rect = video.getBoundingClientRect();
+    const fullscreen = document.fullscreenElement || document.webkitFullscreenElement;
     const offscreen = (
-      !rect.width || !rect.height
+      (fullscreen && fullscreen !== video && !fullscreen.contains(video))
+      || !rect.width || !rect.height
       || rect.bottom < 0 || rect.right < 0
       || rect.top > window.innerHeight || rect.left > window.innerWidth
     );
@@ -993,15 +995,14 @@
     const videoState = video && state.get(video);
     const settingsMode = videoState && videoState.settingsMode === "override"
       ? "override" : "server";
+    const overrides = videoState && videoState.videoOverrides || {};
     return {
       route,
       server: serverForRoute(route),
       settingsMode,
-      source: prefs.source,
-      target: prefs.target,
-      voice: prefs.voice,
-      voiceId: route === "free" ? prefs.voiceId : "",
-      profileId: route === "free" ? prefs.localProfile : "",
+      ...overrides,
+      voiceId: route === "free" ? overrides.voiceId : undefined,
+      profileId: route === "free" ? overrides.profileId : undefined,
     };
   }
 
@@ -1011,10 +1012,25 @@
     const baseMeta = await api("/meta", requestOptions, jobPrefs.server);
     const capabilities = baseMeta.capabilities || {};
     const profiles = Array.isArray(baseMeta.profiles) ? baseMeta.profiles : [];
-    const advertisedProfile = capabilities.profile_selection
-      && profiles.some((item) => item.id === jobPrefs.profileId && item.installed !== false)
-      ? jobPrefs.profileId
-      : "";
+    const defaults = baseMeta.defaults || {};
+    const baseSettings = baseMeta.profile || {};
+    jobPrefs = {
+      ...jobPrefs,
+      source: jobPrefs.source ?? baseSettings.source_lang ?? "auto",
+      target: jobPrefs.target ?? baseSettings.target_lang ?? "ru",
+      voice: jobPrefs.voice ?? defaults.voice_gender ?? "auto",
+      voiceId: jobPrefs.voiceId ?? defaults.voice_id ?? "",
+    };
+    const requestedProfile = profiles.find((item) => item.id === jobPrefs.profileId);
+    if (jobPrefs.profileId && (!capabilities.profile_selection || !requestedProfile)) {
+      throw new Error("Выбранный профиль недоступен на этом сервере. Обновите список в настройках видео.");
+    }
+    if (requestedProfile && requestedProfile.installed === false) {
+      throw new Error("Модели выбранного профиля ещё не установлены. Установите их в UVT или выберите другой профиль.");
+    }
+    // Unknown readiness may still be selected; the server checks model files
+    // at job start. Never silently replace the user's chosen profile.
+    const advertisedProfile = requestedProfile ? requestedProfile.id : "";
 
     let selectedMeta = baseMeta;
     const baseProfile = baseMeta.profile && baseMeta.profile.name;
@@ -1031,7 +1047,7 @@
       && selectedMeta.capabilities.voice_selection
       && voices.some((voice) => (
         voice.id === jobPrefs.voiceId
-        && voice.language === jobPrefs.target
+        && (voice.language === jobPrefs.target || (voice.languages || []).includes(jobPrefs.target))
         && voice.installed !== false
       ))
       ? jobPrefs.voiceId
@@ -1208,8 +1224,9 @@
 
   function chipLabel(video) {
     const videoState = video && state.get(video);
-    return videoState && videoState.settingsMode === "override"
-      ? prefs.source + " → " + prefs.target
+    const values = videoState && videoState.videoPrefs;
+    return videoState && videoState.settingsMode === "override" && values
+      ? values.source + " → " + values.target
       : "Настройки";
   }
 
@@ -1326,6 +1343,12 @@
     if (!s) return;
     cleanupSettingsState(wrapper);
     s.settingsAbort = new AbortController();
+    // Model/language/voice overrides belong to this video only. Global server
+    // settings are inherited until a field is explicitly changed here.
+    const videoPrefs = s.videoPrefs || (s.videoPrefs = {
+      source: "auto", target: "ru", voice: "auto", voiceId: "", localProfile: "",
+    });
+    s.videoOverrides ||= {};
 
     const panel = document.createElement("section");
     panel.className = "uvt-panel";
@@ -1464,7 +1487,7 @@
     settingsModeSelect.id = settingsModeId;
     Object.assign(settingsModeSelect.style, selectStyle);
     for (const [value, label] of [
-      ["server", "Web-панель сервера (по умолчанию)"],
+      ["server", "Глобальные настройки (по умолчанию)"],
       ["override", "Свои настройки для этого видео"],
     ]) {
       const option = document.createElement("option");
@@ -1498,9 +1521,9 @@
     useDashboardDefaults.type = "button";
     setButton(
       useDashboardDefaults,
-      "Вернуть настройки сервера",
+      "Сбросить настройки видео",
       "rgba(35, 95, 155, .9)",
-      "Отменить настройки этого видео и снова использовать настройки web-панели"
+      "Вернуть значения из глобальных настроек для этого видео"
     );
     Object.assign(useDashboardDefaults.style, CHIP_STYLE, {
       minHeight: "40px",
@@ -1510,7 +1533,7 @@
     openDashboard.type = "button";
     setButton(
       openDashboard,
-      "Открыть web-панель",
+      "Глобальные настройки ↗",
       "rgba(255,255,255,.12)",
       "Открыть web-панель настроек текущего UVT-маршрута"
     );
@@ -1530,25 +1553,18 @@
 
     const setSettingsMode = (mode, { reloadMeta = true } = {}) => {
       s.settingsMode = mode === "override" ? "override" : "server";
+      if (s.settingsMode === "server") s.videoOverrides = {};
       settingsModeSelect.value = s.settingsMode;
       useDashboardDefaults.hidden = s.settingsMode === "server";
       settingsModeStatus.textContent = s.settingsMode === "server"
-        ? "Действуют настройки сервера. Измените поле ниже, чтобы настроить только это видео."
-        : "Для следующего перевода этого видео будут отправлены выбранные ниже язык, локальный профиль и голос.";
+        ? "Значения взяты из глобальных настроек. Любое поле ниже можно изменить только для этого видео."
+        : "Изменения действуют только для этого видео. Остальные поля наследуются из глобальных настроек; текущий перевод не меняется.";
       syncChipLabels();
       if (reloadMeta) refreshMeta();
     };
-    const activateManualOverride = () => {
-      if (s.settingsMode !== "override") {
-        // Adopt the displayed server values together. Changing one field must
-        // not silently send unrelated stale preferences from another video.
-        prefs.source = sourceSelect.value;
-        prefs.target = targetSelect.value;
-        prefs.localProfile = profileSelect.value;
-        prefs.voice = voiceSelect.value;
-        prefs.voiceId = voiceModelSelect.value;
-        setSettingsMode("override", { reloadMeta: false });
-      }
+    const activateManualOverride = (fields = {}) => {
+      Object.assign(s.videoOverrides, fields);
+      if (s.settingsMode !== "override") setSettingsMode("override", { reloadMeta: false });
     };
     settingsModeSelect.addEventListener("change", () => {
       stopPreviewAudio();
@@ -1583,19 +1599,19 @@
 
     const sourceId = nextControlId("source");
     const sourceSelect = makeSelect(
-      prefs.source,
+      videoPrefs.source,
       true,
       (value) => {
         if (
           localSourceRestricted && value !== "auto"
           && !LOCAL_PIPELINE_LANGUAGES.has(value)
         ) {
-          sourceSelect.value = prefs.source;
+          sourceSelect.value = videoPrefs.source;
           readiness.textContent = "Этот локальный профиль принимает 25 языков Parakeet; выберите auto или доступный язык.";
           return;
         }
-        prefs.source = value;
-        activateManualOverride();
+        videoPrefs.source = value;
+        activateManualOverride({ source: value });
         refreshChip();
         refreshMeta();
       },
@@ -1606,17 +1622,17 @@
 
     const targetId = nextControlId("target");
     const targetSelect = makeSelect(
-      prefs.target,
+      videoPrefs.target,
       false,
       (value) => {
         if (localTargetLanguages && !localTargetLanguages.has(value)) {
-          targetSelect.value = prefs.target;
+          targetSelect.value = videoPrefs.target;
           readiness.textContent = "Для локального Piper доступны только установленные целевые языки; выберите RU/UK или облачный маршрут.";
           return;
         }
         stopPreviewAudio();
-        prefs.target = value;
-        activateManualOverride();
+        videoPrefs.target = value;
+        activateManualOverride({ target: value });
         refreshChip();
         refreshVoiceOptions();
         refreshMeta();
@@ -1653,8 +1669,8 @@
         option.value = item.id;
         option.textContent = item.label || item.id;
         if (item.id === "local-natural" && !option.textContent.includes("тяжёлый")) option.textContent += " · тяжёлый";
-        if (item.installed !== true) {
-          option.textContent += item.installed === false ? " · не установлен" : " · проверка";
+        if (item.installed === false) {
+          option.textContent += " · не установлен";
           option.disabled = true;
         }
         const engines = item.engines || {};
@@ -1664,12 +1680,12 @@
       }
       profileSelect.value = selectedProfile;
     };
-    renderProfileOptions([], prefs.localProfile || "local-balanced");
-    profileSelect.disabled = true;
+    renderProfileOptions([], videoPrefs.localProfile || "local-balanced");
+    profileSelect.disabled = prefs.route !== "free";
     profileSelect.addEventListener("change", () => {
       stopPreviewAudio();
-      prefs.localProfile = profileSelect.value;
-      activateManualOverride();
+      videoPrefs.localProfile = profileSelect.value;
+      activateManualOverride({ profileId: profileSelect.value });
       localSourceRestricted = false;
       localTargetLanguages = null;
       refreshLanguageOptions();
@@ -1696,7 +1712,7 @@
       profileGuide.style.background = profile === "local-natural" ? "#43341c" : "#203043";
       profileGuide.style.borderColor = profile === "local-natural" ? "#816333" : "#354a62";
     };
-    updateProfileGuide(prefs.localProfile || "local-balanced");
+    updateProfileGuide(videoPrefs.localProfile || "local-balanced");
     panel.appendChild(profileGuide);
 
     const readiness = document.createElement("div");
@@ -1726,15 +1742,15 @@
       const option = document.createElement("option");
       option.value = value;
       option.textContent = label;
-      option.selected = value === prefs.voice;
+      option.selected = value === videoPrefs.voice;
       voiceSelect.appendChild(option);
     }
     voiceSelect.addEventListener("change", () => {
       stopPreviewAudio();
-      prefs.voice = voiceSelect.value;
-      prefs.voiceId = "";
+      videoPrefs.voice = voiceSelect.value;
+      videoPrefs.voiceId = "";
       voiceModelSelect.value = "";
-      activateManualOverride();
+      activateManualOverride({ voice: videoPrefs.voice, voiceId: "" });
     });
     appendLabel("Режим:", voiceSelect);
 
@@ -1744,19 +1760,20 @@
     Object.assign(voiceModelSelect.style, selectStyle);
     voiceModelSelect.addEventListener("change", () => {
       stopPreviewAudio();
-      prefs.voiceId = voiceModelSelect.value;
-      activateManualOverride();
-      const selected = voiceCatalog.find((voice) => voice.id === prefs.voiceId);
+      videoPrefs.voiceId = voiceModelSelect.value;
+      activateManualOverride({ voiceId: videoPrefs.voiceId });
+      const selected = voiceCatalog.find((voice) => voice.id === videoPrefs.voiceId);
       if (selected) {
-        prefs.voice = selected.gender;
+        videoPrefs.voice = selected.gender;
+        s.videoOverrides.voice = selected.gender;
         voiceSelect.value = selected.gender;
       }
     });
     appendLabel("Конкретный:", voiceModelSelect);
 
-    function refreshVoiceOptions({ clearInvalid = false, target = targetSelect.value, selected = prefs.voiceId } = {}) {
+    function refreshVoiceOptions({ clearInvalid = false, target = targetSelect.value, selected = videoPrefs.voiceId } = {}) {
       const compatible = voiceCatalog.filter(
-        (voice) => voice.language === target && voice.installed === true
+        (voice) => (voice.language === target || (voice.languages || []).includes(target)) && voice.installed === true
       );
       const previous = selected;
       voiceModelSelect.replaceChildren();
@@ -1774,7 +1791,10 @@
       // LOCAL_VOICES is only an offline fallback.  A custom Piper voice stays
       // pending until a successful Free /meta response authoritatively says it
       // is unavailable; switching to GPT/ElevenLabs must not erase it.
-      if (clearInvalid && !stillCompatible) prefs.voiceId = "";
+      if (clearInvalid && !stillCompatible) {
+        videoPrefs.voiceId = "";
+        if (Object.hasOwn(s.videoOverrides, "voiceId")) s.videoOverrides.voiceId = "";
+      }
       voiceModelSelect.value = stillCompatible ? previous : "";
       voiceModelSelect.disabled = prefs.route !== "free" || compatible.length === 0;
     }
@@ -1823,7 +1843,7 @@
     previewText.id = nextControlId("preview-text");
     previewText.maxLength = 240;
     previewText.rows = 2;
-    previewText.value = prefs.target === "uk"
+    previewText.value = videoPrefs.target === "uk"
       ? "Привіт! Так звучатиме локальний переклад UVT."
       : "Здравствуйте! Так будет звучать локальный перевод UVT.";
     Object.assign(previewText.style, {
@@ -1865,7 +1885,7 @@
 
     const applyPreviewButtonState = () => {
       const compatible = voiceCatalog.filter(
-        (voice) => voice.language === targetSelect.value && voice.installed === true
+        (voice) => (voice.language === targetSelect.value || (voice.languages || []).includes(targetSelect.value)) && voice.installed === true
       );
       malePreview.disabled = !previewAllowed
         || !compatible.some((voice) => voice.gender === "male");
@@ -2017,7 +2037,7 @@
         readiness.textContent = "Проверяю сервер и модели…";
       }
       previewAllowed = false;
-      profileSelect.disabled = true;
+      profileSelect.disabled = prefs.route !== "free";
       applyPreviewButtonState();
       try {
         const activeRoute = prefs.route;
@@ -2026,11 +2046,23 @@
         if (!panel.isConnected || sequence !== metaSequence) return;
 
         const usingServerSettings = s.settingsMode !== "override";
+        const inherited = baseMeta.profile || {};
+        const defaults = baseMeta.defaults || {};
+        const overrides = usingServerSettings ? {} : s.videoOverrides;
+        videoPrefs.source = overrides.source ?? inherited.source_lang ?? "auto";
+        videoPrefs.target = overrides.target ?? inherited.target_lang ?? "ru";
+        videoPrefs.voice = overrides.voice ?? defaults.voice_gender ?? "auto";
+        videoPrefs.voiceId = overrides.voiceId ?? defaults.voice_id ?? "";
+        videoPrefs.localProfile = overrides.profileId ?? defaults.profile_id ?? inherited.name ?? "";
+        sourceSelect.value = videoPrefs.source;
+        targetSelect.value = videoPrefs.target;
+        voiceSelect.value = videoPrefs.voice;
+        refreshChip();
         const baseProfiles = Array.isArray(baseMeta.profiles) ? baseMeta.profiles : [];
         const canSelectProfile = activeRoute === "free"
           && !!(baseMeta.capabilities && baseMeta.capabilities.profile_selection);
         const preferred = baseProfiles.find(
-          (item) => item.id === prefs.localProfile && item.installed !== false
+          (item) => item.id === videoPrefs.localProfile
         );
         const defaultProfile = (baseMeta.defaults && baseMeta.defaults.profile_id)
           || (baseMeta.profile && baseMeta.profile.name)
@@ -2043,19 +2075,14 @@
         const baseProfile = baseMeta.profile && baseMeta.profile.name;
         const baseTarget = baseMeta.profile && baseMeta.profile.target_lang;
         if (!usingServerSettings && (
-          (canSelectProfile && selectedProfile !== baseProfile) || prefs.target !== baseTarget
+          (canSelectProfile && selectedProfile !== baseProfile) || videoPrefs.target !== baseTarget
         )) {
-          const query = new URLSearchParams({ target_lang: prefs.target });
+          const query = new URLSearchParams({ target_lang: videoPrefs.target });
           if (canSelectProfile && selectedProfile) query.set("profile_id", selectedProfile);
           meta = await api(`/meta?${query.toString()}`, { signal: s.settingsAbort.signal }, activeServer);
           if (!panel.isConnected || sequence !== metaSequence) return;
         }
 
-        if (usingServerSettings) {
-          sourceSelect.value = (baseMeta.profile && baseMeta.profile.source_lang) || "auto";
-          targetSelect.value = (baseMeta.profile && baseMeta.profile.target_lang) || "ru";
-          voiceSelect.value = (baseMeta.defaults && baseMeta.defaults.voice_gender) || "auto";
-        }
         const engines = meta.profile && meta.profile.engines ? meta.profile.engines : {};
         const profileInfo = (meta.profiles || []).find((item) => item.id === selectedProfile);
         const engineInfo = profileInfo && profileInfo.engines ? profileInfo.engines : engines;
@@ -2068,18 +2095,20 @@
         localTargetLanguages = activeRoute === "free" && engineInfo.tts === "piper"
           ? new Set(advertisedTargets) : null;
         if (!usingServerSettings &&
-          localSourceRestricted && prefs.source !== "auto"
-          && !LOCAL_PIPELINE_LANGUAGES.has(prefs.source)
+          localSourceRestricted && videoPrefs.source !== "auto"
+          && !LOCAL_PIPELINE_LANGUAGES.has(videoPrefs.source)
         ) {
-          prefs.source = "auto";
+          videoPrefs.source = "auto";
+          s.videoOverrides.source = "auto";
           sourceSelect.value = "auto";
           refreshChip();
         }
-        if (!usingServerSettings && localTargetLanguages && !localTargetLanguages.has(prefs.target)) {
+        if (!usingServerSettings && localTargetLanguages && !localTargetLanguages.has(videoPrefs.target)) {
           const fallbackTarget = localTargetLanguages.has("ru")
             ? "ru" : [...localTargetLanguages][0];
           if (fallbackTarget) {
-            prefs.target = fallbackTarget;
+            videoPrefs.target = fallbackTarget;
+            s.videoOverrides.target = fallbackTarget;
             targetSelect.value = fallbackTarget;
             refreshChip();
             refreshVoiceOptions();
@@ -2091,7 +2120,7 @@
         refreshLanguageOptions();
         const readinessInfo = meta.model_readiness || {};
         const readinessText = readinessInfo.detail || "сервер отвечает";
-        const settingsLabel = usingServerSettings ? "Web-панель" : "Для этого видео";
+        const settingsLabel = usingServerSettings ? "Глобальные настройки" : "Для этого видео";
         const privacy = meta.privacy || {};
         const privacyText = privacy.data_leaves_device === false && !(privacy.unknown_components || []).length
           ? "Обработка на устройстве сервера."
@@ -2108,10 +2137,10 @@
         refreshVoiceOptions({
           clearInvalid: !usingServerSettings && activeRoute === "free",
           target: targetSelect.value,
-          selected: usingServerSettings ? (baseMeta.defaults && baseMeta.defaults.voice_id) || "" : prefs.voiceId,
+          selected: usingServerSettings ? (baseMeta.defaults && baseMeta.defaults.voice_id) || "" : videoPrefs.voiceId,
         });
         const compatible = voiceCatalog.filter(
-          (voice) => voice.language === targetSelect.value && voice.installed === true
+          (voice) => (voice.language === targetSelect.value || (voice.languages || []).includes(targetSelect.value)) && voice.installed === true
         );
         const hasMale = compatible.some((voice) => voice.gender === "male");
         const hasFemale = compatible.some((voice) => voice.gender === "female");
@@ -2121,10 +2150,11 @@
         const piperNeedsBothVoices = activeRoute === "free"
           && engineInfo.tts === "piper" && (!hasMale || !hasFemale);
         if (automaticVoice) automaticVoice.disabled = piperNeedsBothVoices;
-        if (!usingServerSettings && piperNeedsBothVoices && prefs.voice === "auto") {
+        if (!usingServerSettings && piperNeedsBothVoices && videoPrefs.voice === "auto") {
           const availableGender = hasFemale ? "female" : hasMale ? "male" : "";
           if (availableGender) {
-            prefs.voice = availableGender;
+            videoPrefs.voice = availableGender;
+            s.videoOverrides.voice = availableGender;
             voiceSelect.value = availableGender;
           }
         }
@@ -2134,7 +2164,7 @@
         applyPreviewButtonState();
         if (!previewAllowed) {
           previewStatus.textContent = activeRoute === "free"
-            ? `Для языка ${prefs.target} нет установленного локального Piper-голоса.`
+            ? `Для языка ${videoPrefs.target} нет установленного локального Piper-голоса.`
             : "Проба доступна только для локального Piper.";
         }
 
@@ -2144,9 +2174,9 @@
       } catch (error) {
         if (error && error.name === "AbortError") return;
         if (!panel.isConnected || sequence !== metaSequence) return;
-        profileSelect.disabled = true;
+        profileSelect.disabled = prefs.route !== "free";
         voiceModelSelect.disabled = true;
-        readiness.textContent = `Сервер недоступен. Проверьте запуск UVT и адрес в «Подключение и диагностика». ${String(error && error.message ? error.message : error)}`;
+        readiness.textContent = `Сервер недоступен. Профиль можно выбрать заранее; доступность моделей проверится при запуске перевода. Проверьте запуск UVT и адрес в «Подключение и диагностика». ${String(error && error.message ? error.message : error)}`;
       }
     }
 
@@ -2315,7 +2345,6 @@
     const listenerOptions = { signal: abortController.signal };
     let timer = null;
     let keyboardFocus = false;
-    let pointerOverControls = false;
 
     const hasKeyboardFocus = () => {
       try {
@@ -2335,15 +2364,15 @@
     const mustStay = () => {
       const s = state.get(video);
       return !!(
-        pointerOverControls ||
         (s && s.settingsPanel && s.settingsPanel.isConnected) ||
         (s && s.errorPanel) ||
         hasKeyboardFocus()
       );
     };
+    const pointerTargets = () => [wrapper, ...wrapper.querySelectorAll("button,select,input,a")];
     const show = () => {
       wrapper.style.opacity = "1";
-      forcePointerEvents(wrapper);
+      for (const target of pointerTargets()) forcePointerEvents(target);
     };
     const hide = () => {
       if (mustStay()) {
@@ -2355,11 +2384,10 @@
       // dimming so the next Space/Enter cannot repeat a pointer action.
       const active = document.activeElement;
       if (active instanceof HTMLElement && wrapper.contains(active)) active.blur();
-      // Keep the controls visibly present and hit-testable. YouTube can render
-      // transparent overlays above <video>; disabling pointer events here made
-      // the next click fall through to the player and pause the video.
-      wrapper.style.opacity = "0.55";
-      forcePointerEvents(wrapper);
+      // Invisible controls must not intercept the player. Each button/select
+      // has its own pointer-events override, so disable those as well.
+      wrapper.style.opacity = "0";
+      for (const target of pointerTargets()) target.style.setProperty("pointer-events", "none", "important");
     };
     const poke = () => {
       show();
@@ -2380,18 +2408,8 @@
       }
     }, { capture: true, passive: true, signal: abortController.signal });
 
-    for (const el of [container, video]) {
-      el.addEventListener("pointerenter", poke, listenerOptions);
-    }
-    wrapper.addEventListener("pointerenter", () => {
-      pointerOverControls = true;
-      poke();
-    }, listenerOptions);
-    wrapper.addEventListener("pointerleave", () => {
-      pointerOverControls = false;
-      clearTimeout(timer);
-      timer = setTimeout(hide, 400);
-    }, listenerOptions);
+    // Do not wake on pointerenter: hiding changes the hit target beneath a
+    // stationary cursor. Real movement above restores the layer instead.
 
     // Do not let player-level pointer/mouse handlers pause the video while a
     // UVT control is being pressed. Individual controls still handle click.
@@ -2439,8 +2457,8 @@
   function rectsOverlap(a, b) {
     const w = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
     const h = Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
-    const smaller = Math.min(a.width * a.height, b.width * b.height);
-    return smaller > 0 && (w * h) / smaller > 0.7;
+    const larger = Math.max(a.width * a.height, b.width * b.height);
+    return larger > 0 && (w * h) / larger > 0.7;
   }
 
   function livelinessScore(video) {
@@ -2467,122 +2485,41 @@
     wrapper.remove();
   }
 
-  // Main-player discovery: size alone also matches hover previews in cards.
-  // Muted/autoplay/short videos are valid players; none is a rejection signal.
-  const PLAYER_SELECTOR = [
-    "#movie_player", "#player", "#video-player", "#video_player",
-    ".html5-video-player", ".jwplayer", ".plyr", ".video-js", ".flowplayer",
-    ".fp-player", ".player", ".video-player", ".video_player", ".player-container",
-    ".player-wrapper", "[data-player]", "[data-player-container]",
-  ].join(",");
-  const PREVIEW_CONTEXT = /(?:^|[\s_-])(?:preview|teaser|thumbnail|thumb|thumbs|recommendation|recommendations|related|suggested|ad-video|ad-player)(?:$|[\s_-])/i;
-  const CARD_CONTEXT = /(?:^|[\s_-])(?:card|tile)(?:$|[\s_-])/i;
-  const COLLECTION_CONTEXT = /(?:^|[\s_-])(?:videos?|media|movies?|clips?)[_-](?:grid|list|feed|item|card|tile|thumb)(?:$|[\s_-])/i;
   let scanFrame = null;
 
   function pageIdentity() {
     return location.href.split("#", 1)[0];
   }
 
-  function navigatesToAnotherPage(anchor) {
-    try {
-      const href = anchor.getAttribute("href");
-      if (!href || href.startsWith("#") || href.startsWith("javascript:")) return false;
-      const url = new URL(href, location.href);
-      return /^https?:$/.test(url.protocol) && url.href.split("#", 1)[0] !== pageIdentity();
-    } catch (_) { return false; }
-  }
-
-  function contextLabel(element) {
-    return [element.id, element.getAttribute("class"), element.getAttribute("data-testid"),
-      element.getAttribute("data-role"), element.getAttribute("data-type")].filter(Boolean)
-      .join(" ").replace(/([a-z])([A-Z])/g, "$1-$2");
-  }
-
-  function previewContext(video, boundary = null) {
-    for (let node = video; node && node !== boundary; node = node.parentElement) {
-      if (node === document.body || node === document.documentElement) break;
-      const label = contextLabel(node);
-      if (node.matches("[role=feed],ytd-rich-item-renderer,ytd-rich-grid-media,ytd-video-renderer,ytd-compact-video-renderer,ytm-rich-item-renderer")) return true;
-      if (PREVIEW_CONTEXT.test(label) || COLLECTION_CONTEXT.test(label) ||
-          node.hasAttribute("data-preview") || node.hasAttribute("data-hover-preview")) return true;
-      if (node.matches("a[href]") && navigatesToAnotherPage(node)) return true;
-      // Unnamed cards often have a sibling title link and live in a grid/list.
-      // Restrict this to a repeated collection item, not a page's main layout.
-      const parent = node.parentElement;
-      if (CARD_CONTEXT.test(label)) {
-        const linksAway = [...node.querySelectorAll("a[href]")].some(navigatesToAnotherPage);
-        const cardPeers = parent && [...parent.children].some(peer => peer !== node && CARD_CONTEXT.test(contextLabel(peer)));
-        if (linksAway || cardPeers || node.matches("[role=link]")) return true;
-      }
-      if (!parent || parent === document.body || parent === boundary) continue;
-      const list = parent.matches("ul,ol,[role=list],[role=feed],[role=grid]");
-      const grid = getComputedStyle(parent).display === "grid";
-      if (!(list || grid) || parent.children.length < 2) continue;
-      const linked = [...node.querySelectorAll("a[href]")].some(navigatesToAnotherPage);
-      if (!linked) continue;
-      const peers = [...parent.children].filter(item => item !== node &&
-        (item.querySelector("video") || item.querySelector("a[href]")));
-      if (peers.length && !node.matches("main,[role=main]")) return true;
-    }
-    return false;
-  }
-
-  function mainPlayerRank(video, visibleVideos) {
-    const fullscreen = document.fullscreenElement || document.webkitFullscreenElement;
-    if (fullscreen && (fullscreen === video || fullscreen.contains(video))) return 1000;
-    const dialog = video.closest("dialog[open],[role=dialog],[aria-modal=true]");
-    if (previewContext(video, dialog)) return 0;
-    if (dialog) return 700;
-    let player = video.closest(PLAYER_SELECTOR);
-    // Proprietary players use prefixes/camelCase, e.g. mgp_videoWrapper.
-    for (let node = video.parentElement; !player && node && node !== document.body; node = node.parentElement) {
-      if (/(?:^|[\s_-])(?:player|video[_-](?:wrapper|container))(?:$|[\s_-])/i.test(contextLabel(node))) player = node;
-    }
-    if (player) return 500;
-    if (video.controls || video.hasAttribute("controls")) return 400;
-    // Lightweight embeds and direct media documents may have custom controls
-    // outside the video, without a recognizable player class.
-    if (visibleVideos.length === 1) {
+  // Keep every visible player eligible, regardless of the site's DOM/classes.
+  // Players sometimes stack old/ad/replacement video elements in one spot;
+  // attach just once there, preferring the video that is actually playing.
+  function selectVisibleVideos(visible) {
+    const keep = new Set();
+    visible.sort((a, b) => livelinessScore(b) - livelinessScore(a));
+    for (const video of visible) {
       const rect = video.getBoundingClientRect();
-      const embedded = window.top !== window || /(?:^|\/)(?:embed|player)(?:\/|$)/i.test(location.pathname);
-      const standalone = video.parentElement === document.body ||
-        (video.parentElement && video.parentElement.parentElement === document.body);
-      if ((embedded || standalone) && rect.width >= MIN_VIDEO_WIDTH && rect.height >= 100) return 250;
+      if (![...keep].some(other => rectsOverlap(rect, other.getBoundingClientRect()))) keep.add(video);
     }
-    return 0;
-  }
-
-  function selectMainVideos(visible) {
-    const candidates = visible.map(video => ({ video, rect: video.getBoundingClientRect(),
-      rank: mainPlayerRank(video, visible) })).filter(item => item.rank > 0);
-    candidates.sort((a, b) => {
-      if (a.rank !== b.rank) return b.rank - a.rank;
-      if (rectsOverlap(a.rect, b.rect)) return livelinessScore(b.video) - livelinessScore(a.video);
-      return b.rect.width * b.rect.height - a.rect.width * a.rect.height;
-    });
-    return new Set(candidates.length ? [candidates[0].video] : []);
+    return keep;
   }
 
   function scan() {
+    const fullscreen = document.fullscreenElement || document.webkitFullscreenElement;
     const visible = [...document.querySelectorAll("video")]
+      .filter(video => !fullscreen || fullscreen === video || fullscreen.contains(video))
       .filter(video => !videoGone(video) && video.offsetWidth >= MIN_VIDEO_WIDTH)
       .filter(video => {
         const rect = video.getBoundingClientRect();
         return rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth;
       });
-    const keep = selectMainVideos(visible);
+    const keep = selectVisibleVideos(visible);
     for (const wrapper of document.querySelectorAll(".uvt-wrap")) {
       const video = wrapper.__uvtVideo;
       const current = state.get(video);
-      // An expanded video can be reused as a hover card after SPA navigation.
-      // Stop and detach that old overlay even if a translation was active.
-      if (videoGone(video) || previewContext(video, video.closest("dialog[open],[role=dialog],[aria-modal=true]")) ||
-          (current && current.pageIdentity !== pageIdentity())) {
-        const fullscreen = document.fullscreenElement || document.webkitFullscreenElement;
-        if (!(fullscreen && (fullscreen === video || fullscreen.contains(video))) ||
-            (current && current.pageIdentity !== pageIdentity())) removeWrapperFor(video, wrapper);
-        else if (keep.has(video)) continue;
+      // A reused player belongs to a new video after SPA navigation.
+      if (videoGone(video) || (current && current.pageIdentity !== pageIdentity())) {
+        removeWrapperFor(video, wrapper);
       } else if (keep.has(video)) {
         if (current && current.playerParent !== video.parentElement) {
           if (current.cleanupAutoHide) current.cleanupAutoHide();
