@@ -1,0 +1,67 @@
+[
+  {
+    "start": 0.0,
+    "end": 0.8,
+    "original": "Good morning.",
+    "translated": "Доброе утро.",
+    "language": "en",
+    "target_lang": "ru",
+    "tts_start": 0.0,
+    "tts_end": 1.51325,
+    "speaker_id": null,
+    "speaker_confidence": null,
+    "voice_style": "female"
+  },
+  {
+    "start": 0.8,
+    "end": 3.7600000000000002,
+    "original": "Our project meeting starts at 10:15 tomorrow.",
+    "translated": "Завтра в 10:15 начнется наша совещание по проекту.",
+    "language": "en",
+    "target_lang": "ru",
+    "tts_start": 1.51325,
+    "tts_end": 4.321666666666666,
+    "speaker_id": null,
+    "speaker_confidence": null,
+    "voice_style": "female"
+  },
+  {
+    "start": 3.7600000000000002,
+    "end": 7.04,
+    "original": "Please bring the updated budget and a short list of risks.",
+    "translated": "Пожалуйста, принесите обновленный бюджет и краткий список рисков.",
+    "language": "en",
+    "target_lang": "ru",
+    "tts_start": 4.321666666666666,
+    "tts_end": 7.531541666666667,
+    "speaker_id": null,
+    "speaker_confidence": null,
+    "voice_style": "female"
+  },
+  {
+    "start": 7.04,
+    "end": 10.8,
+    "original": "We will compare two options and choose the next steps before lunch.",
+    "translated": "Мы сравним два варианта и выберем следующие шаги перед обедом.",
+    "language": "en",
+    "target_lang": "ru",
+    "tts_start": 7.531541666666667,
+    "tts_end": 11.14625,
+    "speaker_id": null,
+    "speaker_confidence": null,
+    "voice_style": "female"
+  },
+  {
+    "start": 10.8,
+    "end": 13.84,
+    "original": "Do not send the draft to customers until it is approved.",
+    "translated": "Не отправляйте черновик клиентам, пока он не будет одобрен.",
+    "language": "en",
+    "target_lang": "ru",
+    "tts_start": 11.14625,
+    "tts_end": 16.50625,
+    "speaker_id": null,
+    "speaker_confidence": null,
+    "voice_style": "female"
+  }
+]

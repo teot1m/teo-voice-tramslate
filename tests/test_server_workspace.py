@@ -169,7 +169,7 @@ async def test_upload_tiny_video_remuxes_original_video_and_two_audio_tracks(tmp
         streams = probe(output, "stream=codec_type,codec_name")["streams"]
         assert [s["codec_name"] for s in streams if s["codec_type"] == "video"] == ["mpeg4"]
         assert len([s for s in streams if s["codec_type"] == "audio"]) == 2
-        assert not list((server.audio_dir / "uploads").iterdir())
+        assert len(list((server.audio_dir / "uploads").iterdir())) == 1  # Original retained for playback/export.
 
 
 @requires_media

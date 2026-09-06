@@ -1,0 +1,6 @@
+{
+  "status": "passed",
+  "scope": "Qt offscreen UI: profile selection, EN/RU, engines, voice/subtitle switch, no auto-start",
+  "audio_devices": "stubbed; no microphone, sound output or models started",
+  "live_call_tested": false
+}

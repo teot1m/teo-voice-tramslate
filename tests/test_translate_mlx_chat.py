@@ -187,3 +187,59 @@ class TestShorten:
         original = "Длинная реплика для укладки."
 
         assert await engine.shorten(original, "ru", 10) == original
+
+
+class TestLiveTranslation:
+    async def test_history_is_context_for_one_current_generation(self, tmp_path, monkeypatch):
+        tokenizer = _FakeTokenizer()
+        calls = _install_fake_mlx(monkeypatch, tokenizer, lambda prompts: ["Спасибо."] * len(prompts))
+        engine = _engine(tmp_path, context_pairs=3)
+        history = [
+            ("Outside the window.", "За окном."),
+            ("Have you seen my keys?", "Ты видел мои ключи?"),
+            ("They are on the table.", "Они на столе."),
+            ("Near the blue cup.", "Возле синей чашки."),
+        ]
+
+        assert await engine.translate("Thank you.", "en", "ru", history) == "Спасибо."
+
+        # One model invocation containing one prompt, regardless of history size.
+        assert len(calls["generate"]) == 1
+        assert len(calls["generate"][0][0]) == 1
+        assert len(tokenizer.prompts) == 1
+        prompt = tokenizer.prompts[0][-1]["content"]
+        for source, _ in history[-3:]:
+            assert source in prompt
+        assert history[0][0] not in prompt
+        assert "→ 4. Thank you." in prompt
+        assert "Переведи только отмеченную реплику: Thank you." in prompt
+
+    async def test_current_line_without_history_still_generates_once(self, tmp_path, monkeypatch):
+        tokenizer = _FakeTokenizer()
+        calls = _install_fake_mlx(monkeypatch, tokenizer, lambda prompts: ["Привет."] * len(prompts))
+        engine = _engine(tmp_path)
+
+        assert await engine.translate("Hello.", "en", "ru", []) == "Привет."
+        assert len(calls["generate"]) == 1
+        assert len(calls["generate"][0][0]) == 1
+        assert "→ 1. Hello." in tokenizer.prompts[0][-1]["content"]
+
+    async def test_blank_current_line_does_not_translate_history(self, tmp_path, monkeypatch):
+        tokenizer = _FakeTokenizer()
+        calls = _install_fake_mlx(monkeypatch, tokenizer, lambda prompts: ["Старый ответ."] * len(prompts))
+        engine = _engine(tmp_path)
+
+        assert await engine.translate("   ", "en", "ru", [("Old line.", "Старая реплика.")]) == ""
+        assert calls["generate"] == []
+        assert tokenizer.prompts == []
+
+
+    async def test_disabled_history_ignores_supplied_past_lines(self, tmp_path, monkeypatch):
+        tokenizer = _FakeTokenizer()
+        calls = _install_fake_mlx(monkeypatch, tokenizer, lambda prompts: ["Привет."] * len(prompts))
+        engine = _engine(tmp_path, context_pairs=0)
+
+        assert await engine.translate("Hello.", "en", "ru", [("Old line.", "Старая реплика.")]) == "Привет."
+        assert len(calls["generate"][0][0]) == 1
+        assert "Old line." not in tokenizer.prompts[0][-1]["content"]
+        assert "→ 1. Hello." in tokenizer.prompts[0][-1]["content"]

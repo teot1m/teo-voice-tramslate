@@ -17,6 +17,7 @@ from typing import Any
 
 import numpy as np
 
+from uvt.config import configured_role_voice
 from uvt.interfaces import TTSEngine
 from uvt.registry import register
 
@@ -99,7 +100,8 @@ class PiperTTS(TTSEngine):
 
     def _resolve_model(self, language: str) -> Path:
         root = str(language or "").replace("_", "-").split("-", 1)[0].lower()
-        requested_voice = str(getattr(self.cfg, "voice_id", "") or "").strip()
+        requested_voice = (str(getattr(self.cfg, "voice_id", "") or "").strip()
+                           or configured_role_voice(self.cfg) or "")
         if requested_voice:
             for key, model_path in self._voice_models.items():
                 key_language = key.split(":", 1)[0]

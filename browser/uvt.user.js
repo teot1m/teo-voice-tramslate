@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         UVT — закадровый перевод видео
 // @namespace    uvt
-// @version      0.18.1
+// @version      0.18.2
 // @description  Пакетный закадровый перевод через личный UVT: реплики звучат по мере готовности; Free, GPT или ElevenLabs
 // @match        *://*/*
 // @grant        GM_getValue
@@ -67,7 +67,7 @@
   const WINDOW_LEAD_S = 0.15;  // приглушать чуть раньше начала реплики
   const WINDOW_TAIL_S = 0.3;   // и отпускать чуть позже её конца
   const SPEECH_RATE_S = 0.07;  // оценка длительности озвучки: секунд на символ
-  const MIN_VIDEO_WIDTH = 200; // на мелкие превью кнопку не вешаем
+  const MIN_VIDEO_WIDTH = 200; // минимальный размер плеера; карточки исключаются по контексту
 
   const LANG_NAMES = {
     auto: "авто", ru: "русский", en: "английский", uk: "украинский",
@@ -289,7 +289,7 @@
   window.addEventListener("scroll", syncLayers, { capture: true, passive: true });
   window.addEventListener("resize", syncLayers, { passive: true });
   for (const eventName of ["fullscreenchange", "webkitfullscreenchange"]) {
-    document.addEventListener(eventName, syncLayers, true);
+    document.addEventListener(eventName, () => { syncLayers(); scheduleScan(); }, true);
   }
 
   function nextControlId(prefix) {
@@ -2299,6 +2299,8 @@
       jobAbort: null,
       settingsPanel: null,
       cleanupAutoHide: null,
+      pageIdentity: pageIdentity(),
+      playerParent: parent,
       // Прогрессивная озвучка: плеер готовых реплик и его аудиоконтекст.
       progressive: null,
       audioCtx: null,
@@ -2465,38 +2467,163 @@
     wrapper.remove();
   }
 
-  function scan() {
-    // Уборка: кнопки видео, которых больше нет или которые спрятаны (реклама)
-    for (const wrapper of document.querySelectorAll(".uvt-wrap")) {
-      if (videoGone(wrapper.__uvtVideo)) {
-        removeWrapperFor(wrapper.__uvtVideo, wrapper);
-      }
-    }
+  // Main-player discovery: size alone also matches hover previews in cards.
+  // Muted/autoplay/short videos are valid players; none is a rejection signal.
+  const PLAYER_SELECTOR = [
+    "#movie_player", "#player", "#video-player", "#video_player",
+    ".html5-video-player", ".jwplayer", ".plyr", ".video-js", ".flowplayer",
+    ".fp-player", ".player", ".video-player", ".video_player", ".player-container",
+    ".player-wrapper", "[data-player]", "[data-player-container]",
+  ].join(",");
+  const PREVIEW_CONTEXT = /(?:^|[\s_-])(?:preview|teaser|thumbnail|thumb|thumbs|recommendation|recommendations|related|suggested|ad-video|ad-player)(?:$|[\s_-])/i;
+  const CARD_CONTEXT = /(?:^|[\s_-])(?:card|tile)(?:$|[\s_-])/i;
+  const COLLECTION_CONTEXT = /(?:^|[\s_-])(?:videos?|media|movies?|clips?)[_-](?:grid|list|feed|item|card|tile|thumb)(?:$|[\s_-])/i;
+  let scanFrame = null;
 
-    // Дедупликация: из видео, перекрывающих друг друга в одном плеере
-    // (контент + спрятанная реклама), кнопку получает только «живое»
-    const visible = [...document.querySelectorAll("video")]
-      .filter((v) => !videoGone(v) && v.offsetWidth >= MIN_VIDEO_WIDTH);
-    const chosen = [];
-    for (const video of visible) {
-      const rect = video.getBoundingClientRect();
-      const clash = chosen.findIndex((c) => rectsOverlap(rect, c.rect));
-      if (clash === -1) {
-        chosen.push({ video, rect });
-      } else if (livelinessScore(video) > livelinessScore(chosen[clash].video)) {
-        chosen[clash] = { video, rect };
+  function pageIdentity() {
+    return location.href.split("#", 1)[0];
+  }
+
+  function navigatesToAnotherPage(anchor) {
+    try {
+      const href = anchor.getAttribute("href");
+      if (!href || href.startsWith("#") || href.startsWith("javascript:")) return false;
+      const url = new URL(href, location.href);
+      return /^https?:$/.test(url.protocol) && url.href.split("#", 1)[0] !== pageIdentity();
+    } catch (_) { return false; }
+  }
+
+  function contextLabel(element) {
+    return [element.id, element.getAttribute("class"), element.getAttribute("data-testid"),
+      element.getAttribute("data-role"), element.getAttribute("data-type")].filter(Boolean)
+      .join(" ").replace(/([a-z])([A-Z])/g, "$1-$2");
+  }
+
+  function previewContext(video, boundary = null) {
+    for (let node = video; node && node !== boundary; node = node.parentElement) {
+      if (node === document.body || node === document.documentElement) break;
+      const label = contextLabel(node);
+      if (node.matches("[role=feed],ytd-rich-item-renderer,ytd-rich-grid-media,ytd-video-renderer,ytd-compact-video-renderer,ytm-rich-item-renderer")) return true;
+      if (PREVIEW_CONTEXT.test(label) || COLLECTION_CONTEXT.test(label) ||
+          node.hasAttribute("data-preview") || node.hasAttribute("data-hover-preview")) return true;
+      if (node.matches("a[href]") && navigatesToAnotherPage(node)) return true;
+      // Unnamed cards often have a sibling title link and live in a grid/list.
+      // Restrict this to a repeated collection item, not a page's main layout.
+      const parent = node.parentElement;
+      if (CARD_CONTEXT.test(label)) {
+        const linksAway = [...node.querySelectorAll("a[href]")].some(navigatesToAnotherPage);
+        const cardPeers = parent && [...parent.children].some(peer => peer !== node && CARD_CONTEXT.test(contextLabel(peer)));
+        if (linksAway || cardPeers || node.matches("[role=link]")) return true;
       }
+      if (!parent || parent === document.body || parent === boundary) continue;
+      const list = parent.matches("ul,ol,[role=list],[role=feed],[role=grid]");
+      const grid = getComputedStyle(parent).display === "grid";
+      if (!(list || grid) || parent.children.length < 2) continue;
+      const linked = [...node.querySelectorAll("a[href]")].some(navigatesToAnotherPage);
+      if (!linked) continue;
+      const peers = [...parent.children].filter(item => item !== node &&
+        (item.querySelector("video") || item.querySelector("a[href]")));
+      if (peers.length && !node.matches("main,[role=main]")) return true;
     }
-    const keep = new Set(chosen.map((c) => c.video));
+    return false;
+  }
+
+  function mainPlayerRank(video, visibleVideos) {
+    const fullscreen = document.fullscreenElement || document.webkitFullscreenElement;
+    if (fullscreen && (fullscreen === video || fullscreen.contains(video))) return 1000;
+    const dialog = video.closest("dialog[open],[role=dialog],[aria-modal=true]");
+    if (previewContext(video, dialog)) return 0;
+    if (dialog) return 700;
+    let player = video.closest(PLAYER_SELECTOR);
+    // Proprietary players use prefixes/camelCase, e.g. mgp_videoWrapper.
+    for (let node = video.parentElement; !player && node && node !== document.body; node = node.parentElement) {
+      if (/(?:^|[\s_-])(?:player|video[_-](?:wrapper|container))(?:$|[\s_-])/i.test(contextLabel(node))) player = node;
+    }
+    if (player) return 500;
+    if (video.controls || video.hasAttribute("controls")) return 400;
+    // Lightweight embeds and direct media documents may have custom controls
+    // outside the video, without a recognizable player class.
+    if (visibleVideos.length === 1) {
+      const rect = video.getBoundingClientRect();
+      const embedded = window.top !== window || /(?:^|\/)(?:embed|player)(?:\/|$)/i.test(location.pathname);
+      const standalone = video.parentElement === document.body ||
+        (video.parentElement && video.parentElement.parentElement === document.body);
+      if ((embedded || standalone) && rect.width >= MIN_VIDEO_WIDTH && rect.height >= 100) return 250;
+    }
+    return 0;
+  }
+
+  function selectMainVideos(visible) {
+    const candidates = visible.map(video => ({ video, rect: video.getBoundingClientRect(),
+      rank: mainPlayerRank(video, visible) })).filter(item => item.rank > 0);
+    candidates.sort((a, b) => {
+      if (a.rank !== b.rank) return b.rank - a.rank;
+      if (rectsOverlap(a.rect, b.rect)) return livelinessScore(b.video) - livelinessScore(a.video);
+      return b.rect.width * b.rect.height - a.rect.width * a.rect.height;
+    });
+    return new Set(candidates.length ? [candidates[0].video] : []);
+  }
+
+  function scan() {
+    const visible = [...document.querySelectorAll("video")]
+      .filter(video => !videoGone(video) && video.offsetWidth >= MIN_VIDEO_WIDTH)
+      .filter(video => {
+        const rect = video.getBoundingClientRect();
+        return rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth;
+      });
+    const keep = selectMainVideos(visible);
     for (const wrapper of document.querySelectorAll(".uvt-wrap")) {
       const video = wrapper.__uvtVideo;
-      if (keep.has(video)) continue;
-      const s = state.get(video);
-      if (s && (s.on || s.busy)) continue; // активный перевод не трогаем
-      removeWrapperFor(video, wrapper);
+      const current = state.get(video);
+      // An expanded video can be reused as a hover card after SPA navigation.
+      // Stop and detach that old overlay even if a translation was active.
+      if (videoGone(video) || previewContext(video, video.closest("dialog[open],[role=dialog],[aria-modal=true]")) ||
+          (current && current.pageIdentity !== pageIdentity())) {
+        const fullscreen = document.fullscreenElement || document.webkitFullscreenElement;
+        if (!(fullscreen && (fullscreen === video || fullscreen.contains(video))) ||
+            (current && current.pageIdentity !== pageIdentity())) removeWrapperFor(video, wrapper);
+        else if (keep.has(video)) continue;
+      } else if (keep.has(video)) {
+        if (current && current.playerParent !== video.parentElement) {
+          if (current.cleanupAutoHide) current.cleanupAutoHide();
+          current.cleanupAutoHide = setupAutoHide(video, wrapper);
+          current.playerParent = video.parentElement;
+        }
+        continue;
+      } else if (current && (current.on || current.busy)) {
+        // Scrolling the actual player off screen must not cancel its audio.
+        continue;
+      } else {
+        removeWrapperFor(video, wrapper);
+      }
     }
     for (const video of keep) addButton(video);
     syncLayers();
+  }
+
+  function scheduleScan() {
+    if (scanFrame !== null) return;
+    scanFrame = requestAnimationFrame(() => { scanFrame = null; scan(); });
+  }
+
+  function observePlayerChanges() {
+    const ownNode = node => {
+      const element = node.nodeType === 1 ? node : node.parentElement;
+      return element && (element.matches(".uvt-wrap,.uvt-panel,.uvt-error-panel") ||
+        element.closest(".uvt-wrap,.uvt-panel,.uvt-error-panel"));
+    };
+    const observer = new MutationObserver(records => {
+      if (records.some(record => !ownNode(record.target) &&
+          (record.type !== "childList" || [...record.addedNodes, ...record.removedNodes].some(node => !ownNode(node))))) {
+        scheduleScan();
+      }
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true,
+      attributeFilter: ["class", "id", "style", "hidden", "controls", "href", "src",
+        "data-preview", "data-hover-preview", "data-testid", "data-role", "data-type",
+        "role", "aria-modal", "open"] });
+    window.addEventListener("popstate", scheduleScan);
+    window.addEventListener("resize", scheduleScan, { passive: true });
   }
 
   // Перехват нажатий уже зарегистрирован выше — раньше скриптов плеера.
@@ -2521,6 +2648,7 @@
     `;
     (document.head || document.documentElement).appendChild(styles);
     scan();
+    observePlayerChanges();
     setInterval(scan, 2000);
     // Плеер и страница двигают видео (раскрытие, theatre mode, липкий плеер):
     // слой должен ехать за ним, а не оставаться на прежнем месте.

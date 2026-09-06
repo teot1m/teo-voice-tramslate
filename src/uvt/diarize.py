@@ -4,10 +4,10 @@ Live-путь назначает спикера на ходу (``uvt.services.sp
 прошлые реплики и вынужден решать сразу. Пакетный дубляж видит весь файл, и это
 качественно другая задача — поэтому здесь офлайн-кластеризация:
 
-- признаки те же, что в live (F0, спектральный центроид, rolloff, ZCR), чтобы
-  два пути не расходились в оценках;
+- признаки F0 и спектра берутся из озвученных кадров; согласные и паузы
+  не должны создавать нового говорящего;
 - кластеризация агломеративная по всем репликам сразу, а не жадная по одной;
-- пол голоса определяется голосованием внутри кластера, а не по каждой
+- роль голоса выбирается по уверенным фрагментам кластера, а не по каждой
   реплике отдельно. Именно из-за пореплечного F0 диалог двух человек
   раскладывался в «30 мужских, 100 женских», и голос прыгал посреди сцены;
 - короткие реплики («Окей», «Да») не образуют своих кластеров: их F0 ненадёжен,
@@ -23,7 +23,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from uvt.gender import estimate_gender_f0
+from uvt.gender import PitchEvidence, estimate_pitch, voiced_audio
 from uvt.interfaces import STTSpan
 from uvt.services.speaker import _embedding
 
@@ -40,10 +40,6 @@ MAX_SPEAKERS = 8
 # слияния: он и есть граница между «тот же голос» и «другой голос».
 MIN_MERGE_GAP = 0.05      # скачок меньше — запись однородна, один голос
 MIN_SEPARATION = 0.12     # ближе этого кластеры не считаем разными голосами
-# Роль голоса: абсолютная граница мужской/женской медианы F0…
-FEMALE_F0_HZ = 173.0
-# …и относительное правило, когда все кластеры оказались по одну её сторону.
-RELATIVE_F0_SPREAD = 0.25
 
 
 @dataclass(slots=True)
@@ -142,21 +138,27 @@ def assign_speakers(
         return SpeakerLayout([], [], {})
 
     features: list[np.ndarray] = []
-    f0_values: list[float | None] = []
+    evidence: list[PitchEvidence] = []
     reliable: list[int] = []
     for index, span in enumerate(spans):
         start = max(0, int(span.start * rate))
         end = min(len(samples), int(span.end * rate))
         chunk = samples[start:end] if end > start else np.zeros(0, dtype=np.float32)
-        gender, f0 = estimate_gender_f0(chunk, rate) if len(chunk) else (None, None)
-        features.append(_embedding(chunk, rate, f0))
-        f0_values.append(f0)
-        if (end - start) >= int(MIN_RELIABLE_S * rate) and float(np.any(features[-1])):
+        pitch = estimate_pitch(chunk, rate)
+        evidence.append(pitch)
+        feature = _embedding(voiced_audio(chunk, rate, pitch), rate, pitch.f0_hz)
+        # ZCR mostly reflects the phonemes in a sentence, not speaker identity.
+        # Do not let one consonant-heavy line create a new speaker by itself.
+        feature[3] *= 0.15
+        features.append(feature)
+        if ((end - start) >= int(MIN_RELIABLE_S * rate)
+                and pitch.voiced_seconds >= .3 and pitch.confidence >= .5
+                and pitch.f0_hz is not None):
             reliable.append(index)
 
     if not reliable:
         log.info(
-            "надёжных по длительности реплик нет — оставляю один голос на всех"
+            "надёжных озвученных фрагментов нет — оставляю один голос на всех"
         )
         labels = ["speaker-1"] * len(spans)
         return SpeakerLayout(labels, [fallback_gender] * len(spans), {"speaker-1": fallback_gender})
@@ -173,43 +175,42 @@ def assign_speakers(
     for index, label in enumerate(labels):
         if label is not None:
             continue
-        nearest = min(reliable, key=lambda candidate: abs(candidate - index))
+        current = spans[index]
+        def temporal_distance(candidate: int) -> tuple[float, float]:
+            other = spans[candidate]
+            gap = max(0.0, other.start - current.end, current.start - other.end)
+            midpoint = abs((other.start + other.end) - (current.start + current.end))
+            return gap, midpoint
+        nearest = min(reliable, key=temporal_distance)
         labels[index] = labels[nearest]
 
-    # Роль голоса — голосованием F0 внутри кластера, а не по каждой реплике.
-    medians: dict[str, float | None] = {}
+    # Short/unvoiced phrases inherit identity but cannot overturn the role of
+    # a speaker with stronger evidence. Roles need a voiced-duration majority;
+    # two low (or two high) voices are never forced into opposite roles.
+    votes_by_label: dict[str, dict[str, float]] = {}
+    weights_by_label: dict[str, float] = {}
     for label in dict.fromkeys(labels):
-        members = [i for i, value in enumerate(labels) if value == label]
-        votes = [f0_values[i] for i in members if f0_values[i] is not None]
-        medians[str(label)] = float(np.median(votes)) if votes else None
-
-    speakers = {
-        label: (
-            fallback_gender
-            if median is None
-            else ("female" if median >= FEMALE_F0_HZ else "male")
-        )
-        for label, median in medians.items()
-    }
-
-    # Бывает, что все кластеры оказались по одну сторону границы: например у
-    # обоих участников диалога высокая медиана F0. Абсолютное правило тогда
-    # выдаёт всем одну роль, и диалог звучит одним голосом. Если кластеры
-    # различаются заметно, назначаем роли относительно друг друга.
-    known = {label: value for label, value in medians.items() if value is not None}
-    if len(known) >= 2 and len(set(speakers[label] for label in known)) == 1:
-        low = min(known, key=lambda label: known[label])
-        high = max(known, key=lambda label: known[label])
-        spread = (known[high] - known[low]) / max(known[low], 1e-6)
-        if spread >= RELATIVE_F0_SPREAD:
-            speakers[low] = "male"
-            speakers[high] = "female"
-            log.info(
-                "медианы F0 по одну сторону границы (%.0f и %.0f Гц) — "
-                "роли назначены относительно друг друга",
-                known[low],
-                known[high],
-            )
+        votes = {"male": 0.0, "female": 0.0}
+        weight = 0.0
+        for index in reliable:
+            pitch = evidence[index]
+            if labels[index] != label:
+                continue
+            amount = min(3.0, pitch.voiced_seconds) * pitch.confidence
+            weight += amount
+            if pitch.role is not None:
+                votes[pitch.role] += amount
+        votes_by_label[str(label)] = votes
+        weights_by_label[str(label)] = weight
+    totals = {role: sum(votes[role] for votes in votes_by_label.values()) for role in ("male", "female")}
+    total = sum(weights_by_label.values())
+    dominant = max(totals, key=totals.get)
+    contextual_fallback = dominant if total >= .3 and totals[dominant] / total >= .75 else fallback_gender
+    speakers = {}
+    for label, votes in votes_by_label.items():
+        total = weights_by_label[label]
+        role = max(votes, key=votes.get)
+        speakers[label] = role if total >= .3 and votes[role] / total >= .7 else contextual_fallback
 
     final_labels = [str(label) for label in labels]
     genders = [speakers[label] for label in final_labels]

@@ -63,7 +63,12 @@ _CURATED_PROFILES = (
     ("Текущая конфигурация", None),
     ("Local Private — всё на этом устройстве", "local"),
     ("Mac Local Fast — Parakeet + NLLB + Piper", "local-fast"),
+    ("Диалог на Mac — Parakeet + NLLB + Piper", "local-dialogue"),
+    ("Субтитры звонка — Parakeet + TranslateGemma", "local-meeting"),
     ("Mac Local Balanced — Parakeet + TranslateGemma", "local-balanced"),
+    ("Hy-MT2 — быстрый перевод + Piper", "local-hymt"),
+    ("Hy-MT2 + MOSS — живые голоса на CPU", "local-moss"),
+    ("Nemotron + Hy-MT2 + Piper", "local-nemotron"),
     ("Mac Local Quality — Whisper + TranslateGemma", "local-quality"),
     ("Free — без оплаты, Edge TTS через сеть", "free"),
     ("Cloud Fast — меньше задержка", "cloud-fast"),
@@ -200,8 +205,9 @@ class PipelineWorker(threading.Thread):
             asyncio.create_task(watch_status()),
             asyncio.create_task(tick_metrics()),
         ]
-        await pipeline.start()
         try:
+            if not await pipeline.start(stop_event=self._stop_event):
+                return
             await self._stop_event.wait()
         finally:
             for task in watchers:

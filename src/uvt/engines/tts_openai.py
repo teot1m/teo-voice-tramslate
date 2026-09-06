@@ -12,6 +12,7 @@ import os
 import numpy as np
 
 from uvt.audio import decode_bytes
+from uvt.config import configured_role_voice
 from uvt.interfaces import TTSEngine
 from uvt.registry import register
 
@@ -40,8 +41,11 @@ class OpenAITTS(TTSEngine):
             await self._client.aclose()
 
     def _voice(self) -> str:
-        if self.cfg.voice and self.cfg.voice != "auto":
+        if self.cfg.voice and self.cfg.voice not in {"auto", "cloud"}:
             return self.cfg.voice
+        selected = configured_role_voice(self.cfg)
+        if selected:
+            return selected
         gender = str(getattr(self.cfg, "voice_gender", "male") or "male").lower()
         return _FEMALE_VOICE if gender.startswith(("f", "ж")) else _MALE_VOICE
 

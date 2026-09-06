@@ -431,6 +431,44 @@ class FailoverTranslator(TranslationEngine):
         return list(result)
 
 
+    async def translate_batch_contextual(
+        self, texts: Sequence[str], source_lang: str | None, target_lang: str,
+        genders: Sequence[str] | None, *,
+        before: Sequence[tuple[str, str]] = (), after: Sequence[tuple[str, str]] = (),
+    ) -> list[str]:
+        try:
+            result = await self._delegate.call(
+                "translate_batch_contextual", texts, source_lang, target_lang, genders,
+                before=before, after=after,
+                validate=lambda value: _require_batch(value, len(texts)),
+                defer_fallback_retry=True,
+            )
+        except _FallbackActivated:
+            active = self._delegate.active
+            size = max(1, int(getattr(active, "batch_hint", 4)))
+            window = max(0, min(6, int(getattr(self.cfg, "file_context_lines", 3))))
+            roles = list(genders or [""] * len(texts))
+            neighbours = list(before) + list(zip(texts, roles)) + list(after)
+            offset = len(before)
+            result = []
+            for start in range(0, len(texts), size):
+                batch = list(texts[start:start + size])
+                first, last = offset + start, offset + start + len(batch)
+                # Preserve context even when the local fallback splits a cloud batch.
+                preceding = neighbours[max(0, first - window):first] if window else []
+                following = neighbours[last:last + window] if window else []
+                preceding = [(text[:200], role) for text, role in preceding]
+                following = [(text[:200], role) for text, role in following]
+                chunk = await self._delegate.call(
+                    "translate_batch_contextual", batch, source_lang, target_lang,
+                    roles[start:start + len(batch)] if genders is not None else None,
+                    before=preceding, after=following,
+                    validate=lambda value: _require_batch(value, len(batch)),
+                )
+                result.extend(chunk)
+        return list(result)
+
+
 def create_stt_engine(cfg: AppConfig, approval: ApprovalGate | None = None):
     """Создаёт primary STT или failover для явно заданного cloud-профиля."""
     if cfg.stt.fallback is not None and _is_remote_openai_compatible(cfg.stt):

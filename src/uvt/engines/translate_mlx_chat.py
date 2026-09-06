@@ -88,9 +88,11 @@ class MlxChatTranslator(TranslationEngine):
         # Одна MLX-модель и один GPU-воркер: параллельные пачки не ускоряют.
         self.concurrency_hint = 1
         self._max_tokens = _positive_int(getattr(cfg, "max_tokens", None), default=256)
-        self._context_lines = _positive_int(
-            getattr(cfg, "context_pairs", None), default=3
-        )
+        try:
+            context_pairs = getattr(cfg, "context_pairs", None)
+            self._context_lines = max(0, int(3 if context_pairs is None else context_pairs))
+        except (TypeError, ValueError):
+            self._context_lines = 3
         self._address = str(getattr(cfg, "address", "") or "ты").strip()
         self._glossary = [
             str(item).strip()
@@ -197,25 +199,27 @@ class MlxChatTranslator(TranslationEngine):
         texts: Sequence[str],
         index: int,
         genders: Sequence[str] | None,
+        *, context_lines: int | None = None,
     ) -> str:
-        start = max(0, index - self._context_lines)
-        end = min(len(texts), index + self._context_lines + 1)
+        window = self._context_lines if context_lines is None else context_lines
+        start = max(0, index - window)
+        end = min(len(texts), index + window + 1)
         lines = []
         for position in range(start, end):
             marker = "→" if position == index else " "
             speaker = ""
             if genders is not None and position < len(genders):
-                speaker = "Ж" if str(genders[position]).lower().startswith(("f", "ж")) else "М"
+                role = str(genders[position]).lower()
+                speaker = "Ж" if role.startswith(("f", "ж")) else "М" if role.startswith(("m", "м")) else "?"
                 speaker = f" [{speaker}]"
             lines.append(f"{marker} {position - start + 1}.{speaker} {texts[position]}")
         gender_note = ""
         if genders is not None and index < len(genders):
-            female = str(genders[index]).lower().startswith(("f", "ж"))
-            gender_note = (
-                " Говорит женщина — используй женские формы."
-                if female
-                else " Говорит мужчина — используй мужские формы."
-            )
+            role = str(genders[index]).lower()
+            if role.startswith(("f", "ж")):
+                gender_note = " Говорит женщина — используй женские формы."
+            elif role.startswith(("m", "м")):
+                gender_note = " Говорит мужчина — используй мужские формы."
         return (
             "Фрагмент диалога (стрелкой отмечена нужная реплика):\n"
             + "\n".join(lines)
@@ -305,6 +309,30 @@ class MlxChatTranslator(TranslationEngine):
             result[index] = value
         return result
 
+    async def translate_batch_contextual(
+        self, texts: Sequence[str], source_lang: str | None, target_lang: str,
+        genders: Sequence[str] | None, *,
+        before: Sequence[tuple[str, str]] = (), after: Sequence[tuple[str, str]] = (),
+    ) -> list[str]:
+        items = [text for text, _role in before] + list(texts) + [text for text, _role in after]
+        roles = [role for _text, role in before] + list(genders or [""] * len(texts)) + [role for _text, role in after]
+        offset = len(before)
+        indexes = [offset + i for i, text in enumerate(texts) if str(text).strip()]
+        if not indexes:
+            return ["" for _ in texts]
+        window = max(0, min(6, int(getattr(self.cfg, "file_context_lines", 3))))
+        system = self._system_prompt(source_lang, target_lang)
+        async with self._lock:
+            await asyncio.to_thread(self._load)
+            prompts = [self._encode(system, self._user_prompt(
+                items, i, roles, context_lines=window,
+            )) for i in indexes]
+            outputs = await asyncio.to_thread(self._generate, prompts)
+        result = ["" for _ in texts]
+        for index, value in zip(indexes, outputs, strict=True):
+            result[index - offset] = value
+        return result
+
     async def translate_batch(
         self, texts: Sequence[str], source_lang: str | None, target_lang: str
     ) -> list[str]:
@@ -319,10 +347,22 @@ class MlxChatTranslator(TranslationEngine):
     ) -> str:
         # Контекст live-пути — пары (оригинал, перевод); для промпта нужны
         # только оригиналы соседних реплик.
-        history = [str(pair[0]) for pair in list(context)[-self._context_lines :]]
+        if not str(text).strip():
+            return ""
+        history = (
+            [str(pair[0]) for pair in list(context)[-self._context_lines :]]
+            if self._context_lines
+            else []
+        )
         batch = [*history, str(text)]
-        results = await self.translate_batch_tagged(batch, source_lang, target_lang, None)
-        return results[-1]
+        system = self._system_prompt(source_lang, target_lang)
+        # История нужна в контексте одной текущей реплики. Повторный перевод
+        # всей истории лишь добавляет задержку на каждом шаге живого диалога.
+        async with self._lock:
+            await asyncio.to_thread(self._load)
+            prompt = self._encode(system, self._user_prompt(batch, len(batch) - 1, None))
+            outputs = await asyncio.to_thread(self._generate, [prompt])
+        return outputs[0]
 
     async def shorten(self, text: str, target_lang: str, max_chars: int) -> str:
         """Переписывает перевод короче, чтобы он уложился в тайминг реплики.

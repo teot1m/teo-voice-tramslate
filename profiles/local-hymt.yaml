@@ -1,0 +1,43 @@
+# Compact context-aware translation on M4/16 GB: Parakeet → Hy-MT2 → Piper.
+# Download Hy-MT2 once via setup-local; inference stays offline. No Demucs or
+# second shortening pass; Piper provides both Russian and Ukrainian voices.
+mode: voiceover
+source_lang: auto
+target_lang: ru
+vad:
+  engine: silero
+stt:
+  engine: parakeet-mlx
+  model: mlx-community/parakeet-tdt-0.6b-v3
+  revision: ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15
+  allow_download: false
+  chunk_seconds: 90
+  overlap_seconds: 15
+  concurrency: 1
+translation:
+  engine: hymt-mlx
+  model: .models/hymt2
+  revision: e5c6fe56c7b3bc77fae5ae92db31f2178f1e6912
+  allow_download: false
+  batch_size: 4
+  concurrency: 1
+  max_tokens: 160
+  context_pairs: 2
+tts:
+  engine: piper
+  voice_dir: ~/.local/share/uvt/piper
+  voice_models:
+    "uk:male": uk_UA-mykyta-high.onnx
+    "uk:female": uk_UA-tetiana-high.onnx
+    "ru:male": ru_RU-dmitri-medium.onnx
+    "ru:female": ru_RU-irina-medium.onnx
+  duration_per_char:
+    "uk:male": 0.082
+    "uk:female": 0.065
+    "ru:male": 0.055
+    "ru:female": 0.067
+  concurrency: 2
+latency:
+  preset: accuracy
+history:
+  enabled: true

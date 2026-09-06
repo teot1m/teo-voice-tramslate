@@ -1,0 +1,180 @@
+{
+  "source": "artifacts/benchmark/source-en.wav",
+  "source_duration_seconds": 13.9704375,
+  "source_note": "Neutral synthetic single-voice fixture; this establishes speaker count, not a persons gender.",
+  "runs": [
+    {
+      "segmentation": "nemotron-smoke.json",
+      "before": {
+        "speaker_count": 2,
+        "labels": [
+          "speaker-1",
+          "speaker-2",
+          "speaker-2",
+          "speaker-2",
+          "speaker-2"
+        ],
+        "roles": [
+          "female",
+          "female",
+          "female",
+          "female",
+          "female"
+        ]
+      },
+      "after": {
+        "speaker_count": 1,
+        "labels": [
+          "speaker-1",
+          "speaker-1",
+          "speaker-1",
+          "speaker-1",
+          "speaker-1"
+        ],
+        "roles": [
+          "male",
+          "male",
+          "male",
+          "male",
+          "male"
+        ]
+      },
+      "before_seconds": 0.0704788749862928,
+      "after_seconds": 0.06606404201011173,
+      "evidence": [
+        {
+          "start": 0.16,
+          "end": 1.2000000000000002,
+          "before_f0_hz": 181.8181818181818,
+          "after_f0_hz": 178.59278915156216,
+          "pitch_role": null,
+          "voiced_seconds": 0.68,
+          "confidence": 0.5981534344784607
+        },
+        {
+          "start": 1.12,
+          "end": 4.0,
+          "before_f0_hz": 190.47619047619048,
+          "after_f0_hz": 181.20244990615387,
+          "pitch_role": "female",
+          "voiced_seconds": 1.86,
+          "confidence": 0.7552223794487801
+        },
+        {
+          "start": 3.92,
+          "end": 7.28,
+          "before_f0_hz": 181.8181818181818,
+          "after_f0_hz": 175.46231273996617,
+          "pitch_role": null,
+          "voiced_seconds": 2.28,
+          "confidence": 0.7453768845429345
+        },
+        {
+          "start": 7.2,
+          "end": 11.040000000000001,
+          "before_f0_hz": 179.77528089887642,
+          "after_f0_hz": 173.04058675268112,
+          "pitch_role": null,
+          "voiced_seconds": 2.34,
+          "confidence": 0.6560067961537601
+        },
+        {
+          "start": 10.96,
+          "end": 13.84,
+          "before_f0_hz": 177.77777777777777,
+          "after_f0_hz": 169.50488126376302,
+          "pitch_role": null,
+          "voiced_seconds": 2.06,
+          "confidence": 0.7626961997655484
+        }
+      ]
+    },
+    {
+      "segmentation": "pipeline-moss-ru.json",
+      "before": {
+        "speaker_count": 2,
+        "labels": [
+          "speaker-1",
+          "speaker-2",
+          "speaker-2",
+          "speaker-2",
+          "speaker-2"
+        ],
+        "roles": [
+          "female",
+          "female",
+          "female",
+          "female",
+          "female"
+        ]
+      },
+      "after": {
+        "speaker_count": 1,
+        "labels": [
+          "speaker-1",
+          "speaker-1",
+          "speaker-1",
+          "speaker-1",
+          "speaker-1"
+        ],
+        "roles": [
+          "male",
+          "male",
+          "male",
+          "male",
+          "male"
+        ]
+      },
+      "before_seconds": 0.05321158401784487,
+      "after_seconds": 0.05927837497438304,
+      "evidence": [
+        {
+          "start": 0.0,
+          "end": 0.8,
+          "before_f0_hz": 185.02673796791444,
+          "after_f0_hz": 179.9880347675549,
+          "pitch_role": null,
+          "voiced_seconds": 0.56,
+          "confidence": 0.3764023075344992
+        },
+        {
+          "start": 0.8,
+          "end": 3.7600000000000002,
+          "before_f0_hz": 190.47619047619048,
+          "after_f0_hz": 181.20244990615387,
+          "pitch_role": "female",
+          "voiced_seconds": 2.02,
+          "confidence": 0.7828187104207988
+        },
+        {
+          "start": 3.7600000000000002,
+          "end": 7.04,
+          "before_f0_hz": 181.8181818181818,
+          "after_f0_hz": 174.6531661354751,
+          "pitch_role": null,
+          "voiced_seconds": 2.12,
+          "confidence": 0.7671857864198243
+        },
+        {
+          "start": 7.04,
+          "end": 10.8,
+          "before_f0_hz": 179.77528089887642,
+          "after_f0_hz": 172.51485298360132,
+          "pitch_role": null,
+          "voiced_seconds": 2.28,
+          "confidence": 0.6681794423766548
+        },
+        {
+          "start": 10.8,
+          "end": 13.84,
+          "before_f0_hz": 177.77777777777777,
+          "after_f0_hz": 170.8538010572243,
+          "pitch_role": null,
+          "voiced_seconds": 2.16,
+          "confidence": 0.7437116782682659
+        }
+      ]
+    }
+  ],
+  "limitations": "Pitch does not establish gender/identity. Borderline majority uses a stable contextual/configured fallback, male by default; explicit manual overrides remain authoritative. No model benchmark or accuracy claim is implied."
+}

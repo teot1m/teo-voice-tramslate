@@ -125,3 +125,81 @@ def test_non_media_cli_commands_do_not_probe(monkeypatch, command):
     monkeypatch.setattr(runtime, "ensure_media_runtime", lambda: pytest.fail("no media probe"))
     monkeypatch.setattr(cli, "_load_env_file", lambda: None)
     assert cli.main([command]) == 0
+
+
+@pytest.mark.parametrize("explicit_argv", [None, ["serve-personal", "--free-profile", "local-natural"]])
+def test_cli_reexec_applies_repaired_environment_before_python_starts(monkeypatch, explicit_argv):
+    monkeypatch.setenv("DYLD_FALLBACK_LIBRARY_PATH", "/previous/lib")
+    monkeypatch.setenv("UVT_TEST_INHERITED_VALUE", "preserve me")
+    monkeypatch.setattr(runtime.sys, "executable", "/mock/project with spaces/.venv/bin/python")
+    original_args = ["/mock/bin/uvt", "dub", "/tmp/нейтральный образец.wav"]
+    monkeypatch.setattr(runtime.sys, "argv", original_args)
+    calls = []
+
+    def repair():
+        monkeypatch.setenv("DYLD_FALLBACK_LIBRARY_PATH", "/compatible/lib:/previous/lib")
+        return True
+
+    class ProcessReplaced(BaseException):
+        pass
+
+    def replace_process(executable, args, env):
+        calls.append((executable, args, env))
+        raise ProcessReplaced
+
+    monkeypatch.setattr(runtime, "ensure_media_runtime", repair)
+    monkeypatch.setattr(runtime.os, "execve", replace_process)
+    with pytest.raises(ProcessReplaced):
+        runtime.prepare_media_runtime_for_cli(explicit_argv)
+
+    assert len(calls) == 1
+    executable, args, env = calls[0]
+    expected_args = original_args[1:] if explicit_argv is None else explicit_argv
+    assert executable == runtime.sys.executable
+    assert args == [runtime.sys.executable, "-m", "uvt", *expected_args]
+    assert env["DYLD_FALLBACK_LIBRARY_PATH"] == "/compatible/lib:/previous/lib"
+    assert env["UVT_TEST_INHERITED_VALUE"] == "preserve me"
+    assert env is not runtime.os.environ
+    assert runtime.sys.argv == original_args
+
+
+@pytest.mark.parametrize("repaired", [False, True])
+def test_cli_does_not_reexec_when_runtime_environment_is_unchanged(monkeypatch, repaired):
+    monkeypatch.setenv("DYLD_FALLBACK_LIBRARY_PATH", "/already/compatible")
+    monkeypatch.setattr(runtime, "ensure_media_runtime", lambda: repaired)
+    monkeypatch.setattr(runtime.os, "execve", lambda *_args: pytest.fail("unexpected process replacement"))
+
+    runtime.prepare_media_runtime_for_cli(["serve-personal"])
+
+    assert os.environ["DYLD_FALLBACK_LIBRARY_PATH"] == "/already/compatible"
+
+
+def test_cli_healthy_runtime_without_fallback_does_not_reexec(monkeypatch):
+    monkeypatch.delenv("DYLD_FALLBACK_LIBRARY_PATH", raising=False)
+    monkeypatch.setattr(runtime, "ensure_media_runtime", lambda: False)
+    monkeypatch.setattr(runtime.os, "execve", lambda *_args: pytest.fail("unexpected process replacement"))
+
+    runtime.prepare_media_runtime_for_cli(["serve"])
+
+    assert "DYLD_FALLBACK_LIBRARY_PATH" not in os.environ
+
+
+def test_cli_reexec_failure_is_reported_as_media_runtime_error(monkeypatch):
+    monkeypatch.delenv("DYLD_FALLBACK_LIBRARY_PATH", raising=False)
+
+    def repair():
+        monkeypatch.setenv("DYLD_FALLBACK_LIBRARY_PATH", "/compatible/lib")
+        return True
+
+    failure = OSError("test process replacement failure")
+
+    def fail_reexec(*_args):
+        raise failure
+
+    monkeypatch.setattr(runtime, "ensure_media_runtime", repair)
+    monkeypatch.setattr(runtime.os, "execve", fail_reexec)
+    with pytest.raises(runtime.MediaRuntimeError) as caught:
+        runtime.prepare_media_runtime_for_cli(["serve-personal"])
+
+    assert caught.value.__cause__ is failure
+    assert str(caught.value)

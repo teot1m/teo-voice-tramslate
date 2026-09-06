@@ -394,6 +394,32 @@ def _make_batches(
     return batches
 
 
+def _file_translation_context(
+    spans: list[STTSpan], batch: list[int], genders: list[str] | None,
+    lines: int,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Nearest source neighbours, bounded to 2400 characters across both sides."""
+    count = max(0, min(6, lines))
+    candidates = []
+    for distance in range(1, count + 1):
+        for index in (batch[0] - distance, batch[-1] + distance):
+            if 0 <= index < len(spans):
+                candidates.append(index)
+    remaining = 2400
+    selected: dict[int, tuple[str, str]] = {}
+    for index in candidates:
+        text = " ".join(spans[index].text.split())
+        if not text or remaining <= 0:
+            continue
+        text = text[:min(400, remaining)]
+        role = genders[index] if genders and index < len(genders) else ""
+        selected[index] = (text, role)
+        remaining -= len(text)
+    before = [selected[i] for i in sorted(selected) if i < batch[0]]
+    after = [selected[i] for i in sorted(selected) if i > batch[-1]]
+    return before, after
+
+
 async def _translate_all(
     cfg: AppConfig,
     spans: list[STTSpan],
@@ -451,16 +477,38 @@ async def _translate_all(
             rejected.discard(index)
             translated[index] = clean
 
+        context_lines = int(getattr(cfg.translation, "file_context_lines", 3))
+
+        async def translate_contextual(batch: list[int]) -> list[str]:
+            texts = [spans[i].text for i in batch]
+            roles = [genders[i] for i in batch] if genders else None
+            before, after = _file_translation_context(spans, batch, genders, context_lines)
+            method = getattr(translator, "translate_batch_contextual", None)
+            if callable(method):
+                result = await method(texts, span_langs[batch[0]], cfg.target_lang, roles,
+                                      before=before, after=after)
+            else:
+                result = await translator.translate_batch_tagged(texts, span_langs[batch[0]], cfg.target_lang, roles)
+            if not isinstance(result, (list, tuple)) or len(result) != len(batch):
+                raise RuntimeError("модель вернула неверное число переводов для пачки")
+            return list(result)
+
+        async def translate_one(index: int) -> str:
+            # Retry keeps both sides of the same source window where supported.
+            try:
+                return (await translate_contextual([index]))[0]
+            except Exception:
+                history = [(spans[i].text, translated[i])
+                           for i in range(max(0, index - context_lines), index)
+                           if translated[i]]
+                return await translator.translate(spans[index].text, span_langs[index] or "und",
+                                                  cfg.target_lang, history)
+
         async def run_batch(batch: list[int]) -> None:
             nonlocal completed
-            texts = [spans[i].text for i in batch]
-            batch_genders = [genders[i] for i in batch] if genders else None
-            batch_lang = span_langs[batch[0]]
             try:
                 async with limit:
-                    result = await translator.translate_batch_tagged(
-                        texts, batch_lang, cfg.target_lang, batch_genders
-                    )
+                    result = await translate_contextual(batch)
                 for idx, value in zip(batch, result):
                     accept(idx, value)
             except Exception as exc:  # noqa: BLE001 — деградируем до пореплечного
@@ -473,12 +521,7 @@ async def _translate_all(
                         async with limit:
                             accept(
                                 idx,
-                                await translator.translate(
-                                    spans[idx].text,
-                                    span_langs[idx] or "und",
-                                    cfg.target_lang,
-                                    [],
-                                ),
+                                await translate_one(idx),
                             )
                     except Exception as exc2:  # noqa: BLE001
                         log.error(
@@ -532,12 +575,7 @@ async def _translate_all(
                     async with limit:
                         accept(
                             index,
-                            await translator.translate(
-                                spans[index].text,
-                                span_langs[index] or "und",
-                                cfg.target_lang,
-                                [],
-                            ),
+                            await translate_one(index),
                         )
                 except Exception as exc:  # noqa: BLE001 — остаётся как было
                     log.debug("доперевод @%.1f с не удался: %s", spans[index].start, exc)
@@ -662,6 +700,12 @@ def _tts_retry_delay(error: BaseException, attempt: int) -> float:
 
 
 def _tts_failure_reason(provider: str, error: BaseException) -> str:
+    # ElevenLabs distinguishes unavailable library voices, API permissions,
+    # credits and rate limits in its JSON body. Do not replace that verified
+    # explanation with the old generic assumption that every 402 is quota.
+    provider_reason = getattr(error, "user_message", None)
+    if provider == "ElevenLabs" and isinstance(provider_reason, str) and provider_reason:
+        return provider_reason
     status = _tts_http_status(error)
     if status == 429:
         return (
@@ -788,6 +832,14 @@ async def _synthesize_all(
     """
     voice_labels = list(labels) if labels is not None else list(genders)
     engines, probe = await _create_tts_engines(cfg, genders)
+    # Reference-based engines share expensive weights between roles. Their
+    # mutable config must retain one replica's role until all retries and
+    # duration fitting finish, including cancellation of native inference.
+    shared_role_locks = {
+        id(engine): asyncio.Lock()
+        for engine in engines.values()
+        if sum(other is engine for other in engines.values()) > 1
+    }
 
     duration_aware = bool(getattr(probe, "supports_duration", False))
     use_reference = bool(getattr(probe, "supports_reference", False)) and bool(references)
@@ -1042,18 +1094,43 @@ async def _synthesize_all(
             if progress is not None:
                 progress(finished / max(len(spans), 1))
 
+    async def synth_with_role(
+        index: int, span: STTSpan, text: str, gender: str,
+        speed: float, target: float | None,
+    ) -> _SynthClip | None:
+        engine = engines[gender]
+        lock = shared_role_locks.get(id(engine))
+        if lock is None:
+            return await synth(index, span, text, gender, speed, target)
+        async with lock:
+            previous_role = engine.cfg.voice_gender
+            engine.cfg.voice_gender = gender
+            try:
+                return await synth(index, span, text, gender, speed, target)
+            finally:
+                engine.cfg.voice_gender = previous_role
+
     try:
         tasks = [
             asyncio.create_task(
-                synth(i, s, t, g, initial_speeds[i], initial_targets[i])
+                synth_with_role(i, s, t, g, initial_speeds[i], initial_targets[i])
             )
             for i, (s, t, g) in enumerate(zip(spans, texts, genders))
         ]
         try:
             clips = list(await asyncio.gather(*tasks))
-        except asyncio.CancelledError:
+        except BaseException:
             for task in tasks:
-                task.cancel()
+                if not task.done():
+                    task.cancel()
+            # A cancelled gather can raise before every sibling has drained.
+            # Keep role scopes and model ownership alive until they all finish.
+            drained = asyncio.gather(*tasks, return_exceptions=True)
+            while not drained.done():
+                try:
+                    await asyncio.shield(drained)
+                except asyncio.CancelledError:
+                    continue
             raise
         if fatal_error is not None:
             raise RuntimeError(
@@ -1098,6 +1175,11 @@ async def render_dub_track(
         raise FileNotFoundError(input_path)
     if cfg.tts.engine == "none":
         raise RuntimeError("для дубляжа нужен синтез речи: tts.engine != none")
+
+    if cfg.tts.engine == "f5":
+        from uvt.engines.tts_f5 import check_f5_audio_runtime
+
+        await _run_blocking(check_f5_audio_runtime)
 
     registry.load_builtins()
     registry.load_plugin_dirs(cfg.plugin_dirs)

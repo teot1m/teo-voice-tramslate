@@ -9,11 +9,43 @@ import asyncio
 import contextlib
 import logging
 from abc import ABC
+from dataclasses import dataclass, field
 
 from uvt.bus import Bus
 from uvt.config import AppConfig
 from uvt.events import TOPIC_STATUS, ServiceStatus
 from uvt.metrics import Metrics
+
+
+async def _finish_lifecycle(task: asyncio.Future):
+    """Drain setup/teardown before propagating cancellation of its waiter.
+
+    Cancelling a native model loader's to_thread await does not stop that
+    loader. Teardown must not race it or allow it to resurrect a model.
+    """
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            cancelled = True
+        except Exception:
+            if cancelled:
+                raise asyncio.CancelledError from None
+            raise
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+@dataclass
+class _Readiness:
+    event: asyncio.Event = field(default_factory=asyncio.Event)
+    initialized: bool = False
+    error: BaseException | None = None
 
 
 class Service(ABC):
@@ -27,6 +59,7 @@ class Service(ABC):
         self.metrics = metrics
         self.log = logging.getLogger(f"uvt.{self.name}")
         self._task: asyncio.Task | None = None
+        self._readiness = _Readiness()
 
     # --- переопределяемые точки ---
 
@@ -118,14 +151,47 @@ class Service(ABC):
         return self._task
 
     async def start(self) -> None:
+        if self._task is not None and not self._task.done():
+            raise RuntimeError(f"Сервис {self.name} уже запущен")
+        state = self._readiness = _Readiness()
         self._task = asyncio.create_task(self._run(), name=f"uvt:{self.name}")
 
-    async def stop(self) -> None:
+        def wake_waiters(task: asyncio.Task) -> None:
+            # A task cancelled before its first scheduled turn never enters
+            # _run's finally block. A per-start state also isolates restarts.
+            if not state.event.is_set():
+                state.error = (
+                    asyncio.CancelledError() if task.cancelled() else task.exception()
+                )
+                state.event.set()
+
+        self._task.add_done_callback(wake_waiters)
+
+    async def wait_ready(self) -> None:
+        """Wait for this start's setup; start() itself remains nonblocking."""
+        state = self._readiness
         if self._task is None:
+            raise RuntimeError(f"Сервис {self.name} не запущен")
+        await state.event.wait()
+        if isinstance(state.error, asyncio.CancelledError):
+            raise asyncio.CancelledError(f"Запуск сервиса {self.name} остановлен")
+        if state.error is not None:
+            raise RuntimeError(
+                f"Не удалось подготовить сервис {self.name}: {state.error}"
+            ) from state.error
+        if not state.initialized:
+            raise RuntimeError(f"Сервис {self.name} завершился до готовности")
+
+    async def stop(self) -> None:
+        task = self._task
+        if task is None:
             return
-        self._task.cancel()
-        await asyncio.gather(self._task, return_exceptions=True)
-        self._task = None
+        task.cancel()
+        try:
+            await _finish_lifecycle(asyncio.gather(task, return_exceptions=True))
+        finally:
+            if task.done() and self._task is task:
+                self._task = None
 
     async def _run(self) -> None:
         # Подписка до setup(): пока движок греется, события копятся в очереди,
@@ -133,11 +199,17 @@ class Service(ABC):
         inbox = self.bus.topic(self.consumes).subscribe() if self.consumes else None
         try:
             try:
-                await self.setup()
+                await _finish_lifecycle(asyncio.create_task(self.setup()))
+            except asyncio.CancelledError as exc:
+                self._readiness.error = exc
+                raise
             except Exception as exc:  # noqa: BLE001
+                self._readiness.error = exc
                 self.log.exception("сбой инициализации")
                 self.set_status("error", str(exc))
                 return
+            self._readiness.initialized = True
+            self._readiness.event.set()
             self.set_status("running")
 
             if inbox is None:
@@ -168,11 +240,12 @@ class Service(ABC):
                         continue
                     self.publish(event)
         finally:
+            self._readiness.event.set()
             if inbox is not None:
                 # A stopped/restarted live service must not retain queued audio
                 # or keep receiving events while its engine is shutting down.
                 self.bus.topic(self.consumes).unsubscribe(inbox)
             with contextlib.suppress(Exception):
-                await self.teardown()
+                await _finish_lifecycle(asyncio.create_task(self.teardown()))
             with contextlib.suppress(Exception):
                 self.set_status("stopped")

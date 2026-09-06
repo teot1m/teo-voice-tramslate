@@ -66,16 +66,19 @@
   }
   function selectedProfile() { return (state.meta?.profiles || []).find((item) => item.id === $("profile-select").value); }
   function updateVoices(preferred) {
-    const voices = state.meta?.voices || state.settings?.catalog?.voices || [];
+    const voices = selectedProfile()?.voices ?? state.meta?.voices ?? state.settings?.catalog?.voices ?? [];
     const target = $("target-lang").value;
     const profile = selectedProfile();
     const engine = profile?.engines?.tts || state.meta?.profile?.engines?.tts;
-    const compatible = voices.filter((voice) => voice.installed !== false && (!voice.language || voice.language === target) && (!voice.engine || voice.engine === engine));
+    const compatible = voices.filter((voice) => voice.installed !== false && (!voice.language && !voice.languages || (voice.languages || [voice.language]).includes(target)) && (!voice.engine || voice.engine === engine));
     setOptions($("voice-select"), compatible, preferred, "Автоматически");
   }
   function profileChanged() {
     const profile = selectedProfile();
     const catalog = state.settings?.catalog || {};
+    const targets = profile?.target_languages;
+    const targetOptions = catalog.target_languages || [{id: "ru", label: "Русский"}, {id: "uk", label: "Украинский"}];
+    setOptions($("target-lang"), targetOptions.filter((item) => !targets?.length || targets.includes(item.id)), $("target-lang").value);
     const all = catalog.all_source_languages || catalog.source_languages || [{id: "auto", label: "Автоопределение"}, {id: "en", label: "Английский"}, {id: "ru", label: "Русский"}, {id: "uk", label: "Украинский"}];
     const supported = profile?.source_languages || [];
     setOptions($("source-lang"), all.filter((item) => !supported.length || item.id === "auto" || supported.includes(item.id)), $("source-lang").value || state.meta?.profile?.source_lang || "auto");
@@ -151,7 +154,7 @@
   }
   function requestOptions() {
     const override = $("override-settings").checked;
-    const options = {settings_mode: override ? "override" : "server"};
+    const options = {settings_mode: override ? "override" : "server", workspace_video: true};
     if (override) {
       if ($("profile-select").value) options.profile_id = $("profile-select").value;
       options.source_lang = $("source-lang").value || "auto";
@@ -180,20 +183,103 @@
   function signedUrl(value) {
     try { const url = new URL(typeof value === "string" ? value : value.url, location.href); return url.origin === location.origin && ["http:", "https:"].includes(url.protocol) ? url.href : ""; } catch { return ""; }
   }
+  function stopPlayback() {
+    $("result-video").pause(); $("result-video").removeAttribute("src"); $("result-video").load();
+    $("result-audio").pause(); $("result-audio").removeAttribute("src"); $("result-audio").load();
+  }
+  function syncTranslation(play = false) {
+    const video = $("result-video"), audio = $("result-audio");
+    if (!video.getAttribute("src") || !audio.getAttribute("src")) return;
+    audio.playbackRate = video.playbackRate;
+    if (Number.isFinite(video.currentTime) && Math.abs(audio.currentTime - video.currentTime) > 0.15) {
+      try { audio.currentTime = video.currentTime; } catch { /* Wait for metadata. */ }
+    }
+    if (play && !video.paused && !video.seeking) {
+      const pending = audio.play();
+      pending?.catch((error) => { if (error?.name !== "AbortError" && !video.paused) $("video-error").textContent = "Браузер не запустил перевод. Нажмите паузу и воспроизведение ещё раз."; });
+    }
+  }
+  function updateVolumes() {
+    const original = Number($("original-volume").value) / 100;
+    const translation = Number($("translation-volume").value) / 100;
+    $("result-video").volume = original;
+    $("result-audio").volume = translation;
+    $("original-volume-value").value = `${Math.round(original * 100)}%`;
+    $("translation-volume-value").value = `${Math.round(translation * 100)}%`;
+  }
+  function renderVideo(job) {
+    const info = job.video || {};
+    const url = signedUrl(info.url);
+    const available = job.status === "done" && (info.can_prepare || url || info.has_video === false);
+    $("video-result").hidden = !available;
+    const busy = ["queued", "running"].includes(info.status);
+    $("prepare-video").hidden = !!url || info.has_video === false;
+    $("prepare-video").disabled = busy;
+    $("prepare-video").textContent = busy ? "Готовим видео…" : "Подготовить видео";
+    $("cancel-video").hidden = !busy;
+    $("save-video-mix").hidden = !url;
+    $("save-video-mix").disabled = busy;
+    $("video-mixer").hidden = !url;
+    $("result-video").hidden = !url;
+    $("original-volume").disabled = info.independent_audio === false;
+    $("video-note").textContent = info.detail || (info.has_video === false ? "У этого источника только звук." : url ? "Регулируйте оригинал и перевод отдельно. Для скачивания с новыми уровнями нажмите «Сохранить видео с этой громкостью»." : "Исходный видеоряд можно добавить к готовому переводу. Переводить повторно не нужно.");
+    if (info.resolution) $("video-note").textContent += ` Исходное разрешение: ${info.resolution}.`;
+    if (info.independent_audio === false) $("video-note").textContent += " В старой дорожке оригинал уже смешан с переводом; отдельно менять его громкость можно в новом задании.";
+    if (url && $("result-video").getAttribute("src") !== url) {
+      $("result-video").src = url;
+      $("original-volume").value = info.independent_audio === false ? 0 : Math.round((info.original_volume ?? 0.15) * 100);
+      $("translation-volume").value = Math.round((info.translation_volume ?? 1) * 100);
+      updateVolumes();
+    }
+    $("result-audio").hidden = !!url;
+    if (!url) $("result-audio").volume = 1;
+  }
+  async function prepareVideo() {
+    const id = jobId(state.job);
+    if (!id) return;
+    $("video-error").textContent = "";
+    $("prepare-video").disabled = true; $("save-video-mix").disabled = true;
+    try {
+      const job = await post(`/workspace/job/${encodeURIComponent(id)}/video`, {original_volume: Number($("original-volume").value) / 100, translation_volume: Number($("translation-volume").value) / 100});
+      if (id !== jobId(state.job)) return;
+      renderJob(job);
+      stopPolling(); pollJob(id, state.pollGeneration);
+    } catch (error) {
+      if (id === jobId(state.job)) { $("video-error").textContent = error.message; $("prepare-video").disabled = false; $("save-video-mix").disabled = false; }
+    }
+  }
+  $("prepare-video").addEventListener("click", prepareVideo);
+  $("save-video-mix").addEventListener("click", prepareVideo);
+  $("cancel-video").addEventListener("click", async () => {
+    const id = jobId(state.job);
+    try { await post(`/workspace/job/${encodeURIComponent(id)}/video/cancel`, {}); stopPolling(); pollJob(id, state.pollGeneration); }
+    catch (error) { $("video-error").textContent = error.message; }
+  });
+  for (const name of ["original", "translation"]) $(`${name}-volume`).addEventListener("input", updateVolumes);
+  $("result-video").addEventListener("play", () => syncTranslation(true));
+  $("result-video").addEventListener("playing", () => syncTranslation(true));
+  for (const name of ["pause", "ended", "waiting", "seeking"]) $("result-video").addEventListener(name, () => $("result-audio").pause());
+  $("result-video").addEventListener("seeked", () => syncTranslation(true));
+  $("result-video").addEventListener("volumechange", () => { $("original-volume").value = Math.round($("result-video").volume * 100); $("original-volume-value").value = `${$("original-volume").value}%`; });
+  $("result-video").addEventListener("ratechange", () => syncTranslation());
+  $("result-video").addEventListener("timeupdate", () => syncTranslation());
+  $("result-audio").addEventListener("loadedmetadata", () => syncTranslation(true));
+  $("result-video").addEventListener("error", () => { $("video-error").textContent = "Браузер не воспроизвёл видео. Скачайте MP4 и откройте во внешнем плеере."; });
   function renderDownloads(job) {
     const downloads = job.downloads || {};
-    const available = Object.entries(downloads).filter(([kind, value]) => ["m4a", "srt", "vtt", "txt", "json", "mkv"].includes(kind) && signedUrl(value));
+    const available = Object.entries(downloads).filter(([kind, value]) => ["original", "translated", "m4a", "srt", "vtt", "txt", "json", "mkv"].includes(kind) && signedUrl(value)).sort(([a], [b]) => (["original", "translated"].includes(a) ? 0 : 1) - (["original", "translated"].includes(b) ? 0 : 1));
     $("job-results").hidden = job.status !== "done" || !available.length;
     if (job.status !== "done") return;
     const audio = signedUrl(downloads.m4a);
     $("result-audio").hidden = !audio;
     if (audio && $("result-audio").getAttribute("src") !== audio) $("result-audio").src = audio;
     $("download-links").replaceChildren();
-    const names = {m4a: "Озвучка · M4A", srt: "Субтитры · SRT", vtt: "Субтитры · VTT", txt: "Текст перевода", json: "Данные · JSON", mkv: "Видео с переводом · MKV"};
+    const names = {m4a: "Озвучка · M4A", srt: "Субтитры · SRT", vtt: "Субтитры · VTT", txt: "Текст перевода", json: "Данные · JSON", mkv: "Две дорожки · MKV", original: "Оригинальное видео", translated: "Видео с переводом · MP4"};
     for (const [kind, value] of available) {
       const link = document.createElement("a"); link.href = signedUrl(value); link.textContent = `${names[kind]} ↓`; link.download = "";
       $("download-links").append(link);
     }
+    renderVideo(job);
   }
   function renderJob(job) {
     const previousStage = jobId(state.job) === jobId(job) ? state.job?.stage : "";
@@ -262,7 +348,7 @@
       if (generation !== state.pollGeneration) return;
       const job = payload.job || payload;
       renderJob(job);
-      if (terminal.has(job.status)) { await refreshJobs(); return; }
+      if (terminal.has(job.status) && !["queued", "running"].includes(job.video?.status)) { await refreshJobs(); return; }
       state.pollTimer = setTimeout(() => pollJob(id, generation), 1600);
     } catch (error) {
       if (generation !== state.pollGeneration || error.name === "AbortError") return;
@@ -275,7 +361,7 @@
     const id = typeof job === "string" ? job : jobId(job);
     if (!id) return;
     stopPolling();
-    $("result-audio").pause(); $("result-audio").removeAttribute("src");
+    stopPlayback();
     if (typeof job !== "string") renderJob(job);
     storage.set("uvt-workspace-job", id);
     pollJob(id, state.pollGeneration);
@@ -301,10 +387,12 @@
     }
     if (!state.restoreAttempted) {
       state.restoreAttempted = true;
-      const saved = storage.get("uvt-workspace-job");
-      const existing = jobs.find((job) => jobId(job) === saved);
-      if (existing) openJob(existing);
-      else if (saved) storage.remove("uvt-workspace-job");
+      const requested = new URLSearchParams(location.search).get("job") || "";
+      const linked = /^[a-f0-9]{12}$/.test(requested) ? requested : "";
+      const saved = linked || storage.get("uvt-workspace-job");
+      const found = jobs.find((job) => jobId(job) === saved);
+      if (!state.job && (found || linked)) openJob(found || linked);
+      else if (saved && !found) storage.remove("uvt-workspace-job");
     }
   }
   async function refresh() {
@@ -359,7 +447,7 @@
     } else if (!state.file || state.tab !== "file") return;
     stopPolling();
     state.creating = true; state.uploading = state.tab === "file"; updateSubmit();
-    $("result-audio").pause(); $("result-audio").removeAttribute("src");
+    stopPlayback();
     renderJob({title: state.uploading ? state.file.name : sourceUrl.hostname, status: "running", stage: state.uploading ? "upload" : "download", progress: null, detail: state.uploading ? "Передаём файл в вашу студию…" : "Создаём задание…"});
     $("cancel-job").hidden = !state.uploading;
     $("cancel-job").textContent = "Отменить загрузку";
@@ -419,7 +507,7 @@
   for (const type of ["dragenter", "dragover"]) $("drop-zone").addEventListener(type, (event) => { event.preventDefault(); $("drop-zone").classList.add("dragging"); });
   for (const type of ["dragleave", "drop"]) $("drop-zone").addEventListener(type, (event) => { event.preventDefault(); $("drop-zone").classList.remove("dragging"); if (type === "drop") { if (event.dataTransfer.files.length > 1) $("form-error").textContent = "Выберите один файл для одного перевода."; else setFile(event.dataTransfer.files[0]); } });
   $("override-settings").addEventListener("change", () => { $("override-fields").hidden = !$("override-settings").checked; $("options-summary").textContent = $("override-settings").checked ? "Для этого видео" : "По настройкам студии"; updateSubmit(); });
-  $("profile-select").addEventListener("change", profileChanged); $("target-lang").addEventListener("change", () => updateVoices());
+  $("profile-select").addEventListener("change", () => { $("voice-select").value = ""; profileChanged(); }); $("target-lang").addEventListener("change", () => updateVoices());
   $("copy-command").addEventListener("click", async () => {
     try { await navigator.clipboard.writeText($("meeting-command").textContent); $("copy-command").textContent = "Скопировано"; setTimeout(() => { $("copy-command").textContent = "Копировать"; }, 2000); }
     catch { const selection = window.getSelection(), range = document.createRange(); range.selectNodeContents($("meeting-command")); selection.removeAllRanges(); selection.addRange(range); $("copy-command").textContent = "Выделено"; }

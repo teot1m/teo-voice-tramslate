@@ -107,3 +107,26 @@ def ensure_media_runtime() -> bool:
         if _error_message:
             raise MediaRuntimeError(_error_message)
         return _repaired
+
+
+def prepare_media_runtime_for_cli(argv: list[str] | None = None) -> None:
+    """Set native loader paths before Python starts, if a repair is needed.
+
+    Updating os.environ repairs child FFmpeg processes but macOS dyld does
+    not use that update for libraries loaded inside this Python process.
+    Re-exec only at CLI startup, before servers, threads or models exist.
+    The next process sees working media tools and does not re-exec again.
+    """
+    previous = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH")
+    repaired = ensure_media_runtime()
+    if not repaired or previous == os.environ.get("DYLD_FALLBACK_LIBRARY_PATH"):
+        return
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    log.info("Перезапускаю UVT с совместимой библиотекой FFmpeg для локальной озвучки.")
+    try:
+        os.execve(sys.executable, [sys.executable, "-m", "uvt", *arguments], dict(os.environ))
+    except OSError as exc:
+        raise MediaRuntimeError(
+            "Не удалось перезапустить UVT с совместимой библиотекой FFmpeg. "
+            "Остановите UVT и откройте «Запустить UVT.command»."
+        ) from exc

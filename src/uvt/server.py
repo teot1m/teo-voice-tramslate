@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import hashlib
 import hmac
 import html
@@ -50,11 +51,13 @@ from uvt.fallback import ApprovalGate, create_stt_engine
 from uvt.interfaces import STTEngine
 from uvt.server_settings import (
     PARAKEET_LANGUAGE_IDS,
+    NEMOTRON_LANGUAGE_IDS,
     ServerSettingsStore,
     SettingsConflictError,
     apply_settings,
     effective_settings,
     normalize_settings,
+    local_voice_languages,
     route_key as settings_route_key,
     settings_catalog,
     settings_kind,
@@ -78,6 +81,9 @@ _LOCAL_PROFILE_LABELS = {
     "local-balanced": "Сбалансированный",
     "local-quality": "Качество",
     "local-natural": "Живые голоса · медленно",
+    "local-hymt": "Hy-MT2 · быстрый + Piper",
+    "local-moss": "Hy-MT2 + MOSS · живые голоса",
+    "local-nemotron": "Nemotron + Hy-MT2 + Piper",
 }
 _VOICE_LABELS = {
     "ru_RU-dmitri-medium": "Дмитрий",
@@ -840,7 +846,9 @@ class DubServer:
                     ),
                     kind=self._settings_kind,
                     profile_ids=set(self._profile_configs),
-                    local_voices=self._voice_catalog(self._base_cfg),
+                    local_voices=self._settings_voice_catalog(persisted),
+                    voice_engine=self._settings_voice_engine(persisted),
+                    voice_catalogs=self._settings_voice_catalogs(),
                 )
             except ValueError as exc:
                 self._settings_saved = False
@@ -895,7 +903,7 @@ class DubServer:
         # Shipped Apple-Silicon routes preload only their first heavy stage.
         # Translation remains lazy so two GPU models are never resident during
         # the same dubbing stage on a 16 GB machine.
-        local_stt = str(self.cfg.stt.engine) in {"parakeet-mlx", "mlx-whisper"}
+        local_stt = str(self.cfg.stt.engine) in {"parakeet-mlx", "mlx-whisper", "nemotron-mlx"}
         self._model_readiness: dict[str, object] = {
             "status": "pending" if local_stt else "not-applicable",
             "detail": (
@@ -927,16 +935,17 @@ class DubServer:
             preset_name = preset_for_profile(cfg)
             if preset_name is None:
                 continue
-            required = LOCAL_SETUP_PRESETS[preset_name].model_keys
+            preset = LOCAL_SETUP_PRESETS[preset_name]
+            required = preset.model_keys
             if model_statuses:
                 missing = [
                     key
                     for key in required
                     if not bool(dict(model_statuses.get(key, {}) or {}).get("ready"))
                 ]
-                installed = piper_ready and not missing
-                if not piper_ready:
+                if preset.requires_piper and not piper_ready:
                     missing.append("piper")
+                installed = not missing
             else:
                 # Small plugin/test reports may only expose the aggregate bit.
                 installed = report_ready
@@ -988,7 +997,7 @@ class DubServer:
 
     async def prepare_local_models(self) -> None:
         """Offline-preflight the route and keep its first STT model warm."""
-        if str(self.cfg.stt.engine) not in {"parakeet-mlx", "mlx-whisper"}:
+        if str(self.cfg.stt.engine) not in {"parakeet-mlx", "mlx-whisper", "nemotron-mlx"}:
             return
 
         async with self._prepare_stt_lock:
@@ -1073,7 +1082,7 @@ class DubServer:
 
     def schedule_local_model_prepare(self) -> None:
         """Re-warm STT while the server is idle after a completed job."""
-        if str(self.cfg.stt.engine) not in {"parakeet-mlx", "mlx-whisper"}:
+        if str(self.cfg.stt.engine) not in {"parakeet-mlx", "mlx-whisper", "nemotron-mlx"}:
             return
         if self._prepared_stt is not None:
             return
@@ -1212,6 +1221,9 @@ class DubServer:
     def _cleanup_audio_cache(self, max_age_days: float = 7.0) -> None:
         """Remove old rendered tracks and shared browser sources on startup."""
         cutoff = time.time() - max_age_days * 86400
+        video_results = getattr(self, "_video_results", None)
+        if video_results:
+            video_results.prune(cutoff)
         removed = 0
         for file in (*self.audio_dir.glob("*.m4a"), *self.audio_dir.glob("*.mkv")):
             try:
@@ -1288,8 +1300,52 @@ class DubServer:
             temporary.unlink(missing_ok=True)
         return destination
 
+    def _settings_voice_catalog(self, payload: dict[str, object]) -> list[dict[str, object]]:
+        profile_id = str(payload.get("profile_id") or getattr(self, "profile_name", self._base_profile_name))
+        profile = self._profile_configs.get(profile_id, self._base_cfg)
+        return self._voice_catalog(profile)
+
+    def _settings_voice_engine(self, payload: dict[str, object]) -> str:
+        if self._settings_kind != "local":
+            return str(self._base_cfg.tts.engine)
+        profile_id = str(payload.get("profile_id") or getattr(self, "profile_name", self._base_profile_name))
+        return str(self._profile_configs.get(profile_id, self._base_cfg).tts.engine)
+
+    def _settings_voice_catalogs(self) -> dict[str, list[dict[str, object]]]:
+        result: dict[str, dict[str, dict[str, object]]] = {}
+        for cfg in self._profile_configs.values():
+            bucket = result.setdefault(str(cfg.tts.engine), {})
+            for voice in self._voice_catalog(cfg):
+                bucket[str(voice["id"])] = voice
+        return {engine: list(voices.values()) for engine, voices in result.items()}
+
     @staticmethod
     def _voice_catalog(cfg: AppConfig) -> list[dict[str, object]]:
+        if str(cfg.tts.engine) == "f5":
+            from uvt.voice_references import catalog
+            return [{"id": "", "label": "Голос оригинала", "language": "ru", "languages": ["ru", "uk"], "gender": "auto", "engine": "f5", "installed": True}] + catalog()
+        if str(cfg.tts.engine) == "moss-onnx":
+            from uvt.engines.tts_moss_onnx import BUILTIN_VOICES, SUPPORTED_LANGUAGES, _local_path
+            from uvt.voice_references import catalog as reference_catalog
+            model = _local_path(getattr(cfg.tts, "model_path", None), ".models/moss-tts")
+            codec = _local_path(getattr(cfg.tts, "codec_path", None), ".models/moss-codec")
+            installed = all(path.is_file() for path in (
+                model / "browser_poc_manifest.json", model / "tokenizer.model",
+                model / "moss_tts_global_shared.data", model / "moss_tts_local_shared.data",
+                codec / "codec_browser_onnx_meta.json",
+                codec / "moss_audio_tokenizer_encode.onnx",
+                codec / "moss_audio_tokenizer_decode_full.onnx",
+            ))
+            return [{"id": voice, "label": voice, "language": "ru",
+                     "languages": sorted(SUPPORTED_LANGUAGES), "gender": gender,
+                     "quality": "nano", "engine": "moss-onnx", "installed": installed}
+                    for voice, gender in BUILTIN_VOICES.items()] + [dict(voice, engine="moss-onnx", installed=installed) for voice in reference_catalog() if set(voice.get("languages", [])) & SUPPORTED_LANGUAGES]
+        if str(cfg.tts.engine) in {"f5", "indextts"}:
+            # These profiles clone the source; a leftover Piper model catalog
+            # must not pretend that fixed Piper voice ids control this engine.
+            return [{"id": "", "label": "Голос оригинала", "language": "ru",
+                     "languages": ["ru", "uk"], "gender": "auto",
+                     "quality": "reference", "engine": str(cfg.tts.engine), "installed": True}]
         voice_models = dict(getattr(cfg.tts, "voice_models", {}) or {})
         voice_dir = Path(
             str(getattr(cfg.tts, "voice_dir", "") or "~/.local/share/uvt/piper")
@@ -1326,11 +1382,20 @@ class DubServer:
         return [
             voice
             for voice in cls._voice_catalog(cfg)
-            if voice["language"] == target_root and voice["installed"] is True
+            if target_root in local_voice_languages(voice) and voice["installed"] is True
         ]
 
     @classmethod
     def _validate_piper_voice_support(cls, cfg: AppConfig) -> None:
+        if str(cfg.tts.engine) == "moss-onnx":
+            from uvt.engines.tts_moss_onnx import SUPPORTED_LANGUAGES
+            target = str(cfg.target_lang).replace("_", "-").split("-", 1)[0].lower()
+            if target not in SUPPORTED_LANGUAGES:
+                raise ValueError("MOSS-TTS не поддерживает этот язык; для украинского выберите Piper")
+            requested = str(getattr(cfg.tts, "voice_id", "") or "")
+            if requested and requested not in {"Adam", "Bella"}:
+                raise ValueError(f"голос '{requested}' недоступен в MOSS-TTS")
+            return
         if str(cfg.tts.engine) != "piper":
             return
         catalog = cls._voice_catalog(cfg)
@@ -1358,6 +1423,11 @@ class DubServer:
 
     @staticmethod
     def _validate_stt_language_support(cfg: AppConfig) -> None:
+        if str(cfg.stt.engine) == "nemotron-mlx":
+            source = str(cfg.source_lang or "auto").lower().replace("_", "-").split("-", 1)[0]
+            if source not in NEMOTRON_LANGUAGE_IDS:
+                raise ValueError("Nemotron не поддерживает выбранный язык оригинала")
+            return
         if str(cfg.stt.engine) != "parakeet-mlx":
             return
         source = (
@@ -1376,89 +1446,42 @@ class DubServer:
         mode = str(data.get("settings_mode") or "legacy").strip().lower()
         if mode not in {"legacy", "server", "override"}:
             raise ValueError("settings_mode должен быть server или override")
-        # A saved dashboard choice is authoritative for old userscript builds
-        # too.  Explicit per-video overrides remain possible in v0.15+.
         if mode == "server" or (mode == "legacy" and self._settings_saved):
             return self.cfg.model_copy(deep=True), self.profile_name
-
-        requested_profile = str(
-            data.get("profile_id") or data.get("profile") or self.profile_name
-        )
+        requested_profile = str(data.get("profile_id") or data.get("profile") or self.profile_name)
         if self._settings_kind != "local":
             requested_profile = self.profile_name
-        base = self._profile_configs.get(requested_profile)
-        if self._settings_kind != "local":
-            base = self.cfg
-        elif base is None:
-            allowed = ", ".join(self._profile_configs)
-            raise ValueError(
-                f"профиль '{requested_profile}' недоступен; выберите: {allowed}"
-            )
-
-        cfg = base.model_copy(deep=True)
-        if data.get("source_lang"):
-            cfg.source_lang = str(data["source_lang"])
-        if data.get("target_lang"):
-            cfg.target_lang = str(data["target_lang"])
-
-        gender = str(data.get("voice_gender") or cfg.tts.voice_gender or "auto").lower()
-        if gender not in _VOICE_GENDERS:
-            raise ValueError("voice_gender должен быть auto, male или female")
-        cfg.tts.voice_gender = gender
-
+        if requested_profile not in self._profile_configs:
+            raise ValueError(f"профиль '{requested_profile}' недоступен; выберите: {', '.join(self._profile_configs)}")
+        if self._settings_kind == "generic":
+            cfg = self.cfg.model_copy(deep=True)
+            for field in ("source_lang", "target_lang"):
+                if data.get(field):
+                    setattr(cfg, field, str(data[field]))
+            gender = str(data.get("voice_gender") or cfg.tts.voice_gender or "auto").lower()
+            if gender not in _VOICE_GENDERS:
+                raise ValueError("voice_gender должен быть auto, male или female")
+            cfg.tts.voice_gender = gender
+            return cfg, requested_profile
+        names = {"source_lang", "target_lang", "voice_gender", "male_voice_id", "female_voice_id", "voice_pairs"}
+        names |= {"voice_id", "profile_id"} if self._settings_kind == "local" else {"stt_model", "translation_model", "tts_model", "tts_voice"}
+        fields = {key: data[key] for key in names if key in data}
         if self._settings_kind == "local":
-            requested_voice = (
-                str(data.get("voice_id") or "").strip()
-                if "voice_id" in data
-                else str(getattr(cfg.tts, "voice_id", "") or "").strip()
-            ) or None
-            cfg.tts.voice_id = requested_voice
-            if requested_voice:
-                voice = next(
-                    (item for item in self._voice_catalog(cfg) if item["id"] == requested_voice),
-                    None,
-                )
-                if voice is None:
-                    raise ValueError(f"голос '{requested_voice}' недоступен")
-                if voice["installed"] is not True:
-                    raise ValueError(f"голос '{requested_voice}' не установлен")
-                target_root = cfg.target_lang.replace("_", "-").split("-", 1)[0].lower()
-                if voice["language"] != target_root:
-                    raise ValueError(
-                        f"голос '{requested_voice}' не подходит для языка '{cfg.target_lang}'"
-                    )
-                cfg.tts.voice_gender = str(voice["gender"])
-        elif self._settings_kind in {"openai", "elevenlabs"}:
-            setting_fields = {
-                name: data[name]
-                for name in (
-                    "source_lang",
-                    "target_lang",
-                    "voice_gender",
-                    "stt_model",
-                    "translation_model",
-                    "tts_model",
-                    "tts_voice",
-                )
-                if name in data
-            }
-            normalized = normalize_settings(
-                setting_fields,
-                current=effective_settings(
-                    cfg, kind=self._settings_kind, profile_name=self.profile_name
-                ),
-                kind=self._settings_kind,
-                profile_ids=set(self._profile_configs),
-                local_voices=[],
-            )
-            cfg, _ = apply_settings(
-                cfg,
-                normalized,
-                kind=self._settings_kind,
-                base_profile_name=self.profile_name,
-                profiles=self._profile_configs,
-            )
-        return cfg, requested_profile
+            fields["profile_id"] = requested_profile
+        normalized = normalize_settings(
+            fields,
+            current=effective_settings(self.cfg, kind=self._settings_kind, profile_name=self.profile_name),
+            kind=self._settings_kind, profile_ids=set(self._profile_configs),
+            local_voices=self._settings_voice_catalog(fields),
+            voice_engine=self._settings_voice_engine(fields),
+            voice_catalogs=self._settings_voice_catalogs(),
+            validate_target_availability=False,
+        )
+        cfg, profile_name = apply_settings(
+            self._base_cfg, normalized, kind=self._settings_kind,
+            base_profile_name=self._base_profile_name, profiles=self._profile_configs,
+        )
+        return cfg, profile_name
 
     def _profile_catalog(self) -> list[dict[str, object]]:
         catalog: list[dict[str, object]] = []
@@ -1473,6 +1496,10 @@ class DubServer:
                     "id": name,
                     "label": _LOCAL_PROFILE_LABELS.get(name, name),
                     "engines": engines,
+                    "voices": self._voice_catalog(cfg),
+                    "target_languages": sorted({language
+                        for voice in self._voice_catalog(cfg)
+                        for language in local_voice_languages(voice)}),
                     "loaded": (
                         self._stt_signature(cfg) == self._stt_signature(self.cfg)
                         and self._model_readiness.get("status") == "ready"
@@ -1490,6 +1517,8 @@ class DubServer:
                     "source_languages": (
                         sorted(PARAKEET_LANGUAGE_IDS)
                         if str(cfg.stt.engine) == "parakeet-mlx"
+                        else sorted(NEMOTRON_LANGUAGE_IDS)
+                        if str(cfg.stt.engine) == "nemotron-mlx"
                         else []
                     ),
                 }
@@ -1630,7 +1659,7 @@ class DubServer:
         self.cfg = cfg
         self.profile_name = profile_name
         self._preview_cache.clear()
-        if stt_changed and str(cfg.stt.engine) in {"parakeet-mlx", "mlx-whisper"}:
+        if stt_changed and str(cfg.stt.engine) in {"parakeet-mlx", "mlx-whisper", "nemotron-mlx"}:
             self._model_readiness = {
                 "status": "pending",
                 "detail": f"готовлю {cfg.stt.engine} для новых задач",
@@ -1666,12 +1695,15 @@ class DubServer:
             str(cfg.stt.engine),
             str(getattr(cfg.stt, "model", "") or ""),
             str(cfg.translation.engine),
+            str(getattr(cfg.translation, "file_context_lines", 3)),
             str(getattr(cfg.translation, "model", "") or ""),
             str(cfg.tts.engine),
             str(getattr(cfg.tts, "model", "") or ""),
             str(getattr(cfg.tts, "voice", "") or ""),
             str(cfg.tts.voice_gender),
             str(cfg.tts.voice_id or ""),
+            str(getattr(cfg.tts, "male_voice_id", "") or ""),
+            str(getattr(cfg.tts, "female_voice_id", "") or ""),
             profile_name,
         )
 
@@ -1828,15 +1860,17 @@ class DubServer:
             else None
         )
         local_engines = {
-            "stt": {"faster-whisper", "mlx-whisper", "parakeet-mlx", "dummy"},
+            "stt": {"faster-whisper", "mlx-whisper", "parakeet-mlx", "nemotron-mlx", "dummy"},
             "translation": {
                 "nllb-ct2",
                 "translategemma-mlx",
+                "hymt-mlx",
+                "mlx-chat",
                 "none",
                 "passthrough",
                 "dummy",
             },
-            "tts": {"kokoro", "piper", "dummy", "none"},
+            "tts": {"kokoro", "piper", "moss-onnx", "f5", "dummy", "none"},
         }
         cloud_engines = {
             "translation": {"google-free"},
@@ -1881,13 +1915,13 @@ class DubServer:
         compatible_voices = self._compatible_voices(cfg)
         installed_voice_languages = sorted(
             {
-                str(voice["language"])
-                for voice in self._voice_catalog(cfg)
+                language for voice in self._voice_catalog(cfg)
                 if voice["installed"] is True
+                for language in local_voice_languages(voice)
             }
         )
         tts_engine = str(cfg.tts.engine)
-        selectable_tts = bool(compatible_voices) if tts_engine == "piper" else tts_engine in {
+        selectable_tts = bool(compatible_voices) if tts_engine in {"piper", "moss-onnx"} else tts_engine in {
             "openai",
             "elevenlabs",
         }
@@ -2003,7 +2037,10 @@ class DubServer:
         now = time.time()
         queue_position, queue_ahead, eta_seconds = self._queue_stats(job)
         elapsed_from = job.started_at or job.created_at
+        video = getattr(self, "_video_results", None)
+        video_payload = video.payload(job) if video and job.status == "done" else {}
         payload = asdict(job)
+        payload.update(video_payload)
         job_cfg = self._job_configs.get(
             job.id, self._profile_configs.get(job.profile_name, self.cfg)
         )
@@ -2235,6 +2272,9 @@ class DubServer:
                         handed_stt = await self.take_prepared_stt(cfg)
                     # Для браузера — только голос перевода: оригинал играет сам
                     # плеер на странице (приглушённо), иначе звук двоится.
+                    video_results = getattr(self, "_video_results", None)
+                    if video_results:
+                        await video_results.retain_source(job, source, data)
                     mixed, entries = await render_dub_track(
                         cfg,
                         source,
@@ -2290,6 +2330,14 @@ class DubServer:
                 job.status = "done"
                 job.finished_at = time.time()
                 self._set_stage(job, "done", stage_progress=1.0)
+                if video_results:
+                    try:
+                        video_results.persist(job)
+                    except OSError as exc:
+                        log.warning("не удалось сохранить историю готового перевода %s: %s", job.id, exc)
+                    if data.get("workspace_video") and video_results.records.get(job.id, {}).get("has_video") is not False:
+                        video_results.start(job)
+
                 if job.started_at is not None:
                     self._completed_job_seconds = (
                         self._completed_job_seconds + [max(0.0, job.finished_at - job.started_at)]
@@ -2326,6 +2374,9 @@ class DubServer:
                 for suffix in ("m4a", "mkv"):
                     (self.audio_dir / f"{job.id}.{suffix}").unlink(missing_ok=True)
                 job.downloads.clear()
+                video_results = getattr(self, "_video_results", None)
+                if video_results:
+                    video_results.discard(job)
             if handed_stt is not None:
                 # Normally released by the STT stage; the second idempotent
                 # close also covers decode errors before transcription starts.
@@ -2345,7 +2396,7 @@ class DubServer:
                     }
                     self.schedule_local_model_prepare()
             elif stt_stage_started and job.status == "cancelled" and str(self.cfg.stt.engine) in {
-                "parakeet-mlx", "mlx-whisper"
+                "parakeet-mlx", "mlx-whisper", "nemotron-mlx"
             }:
                 self._model_readiness = {
                     "status": "cancelled",
@@ -2416,6 +2467,7 @@ class DubServer:
         app.router.add_get("/provider/voices", self._get_provider_voices)
         app.router.add_post("/dub", self._post_dub)
         app.router.add_post("/tts/preview", self._post_tts_preview)
+        app.router.add_post("/voices/reference", self._post_voice_reference)
         app.router.add_get("/job/{jid}", self._get_job)
         app.router.add_post("/job/{jid}/cancel", self._cancel_job)
         app.router.add_post("/job/{jid}/approve", self._approve_job)
@@ -2734,6 +2786,9 @@ class DubServer:
                 border-top:1px solid var(--border); color:#7f8997; }
               footer a { color:var(--blue); text-decoration:none; font-family:ui-monospace,monospace; }
               @media (max-width:820px) {
+              main > section:first-child { flex-wrap:wrap; }
+              .meta-link { max-width:100%; white-space:normal; text-align:center; }
+              .field { min-width:0; }
                 .shell { border:0; } header,main,footer { padding-inline:18px; }
                 header { align-items:flex-start; } .brand { gap:12px; flex-wrap:wrap; }
                 h1 { font-size:28px; }.subtitle { font-size:15px; padding-left:12px; }
@@ -2791,12 +2846,27 @@ class DubServer:
                       <select id="setting-target" name="target_lang"></select></div>
                     <div class="field" data-local-field><label for="setting-profile">Локальный профиль</label>
                       <select id="setting-profile" name="profile_id"></select>
-                      <span class="field-help">Для M4 / 16 ГБ рекомендуется «Сбалансированный».</span></div>
+                      <span class="field-help">Для диалогов с контекстом выбирайте профиль с Hy-MT2.</span></div>
                     <div class="field" data-local-field><label>Цепочка движков</label>
                       <div class="engine-chain" data-engine-chain></div></div>
-                    <div class="field"><label for="setting-gender">Тембр / пол голоса</label>
+                    <div class="field" data-voice-pair><label for="setting-male-voice">Мужской голос</label>
+                    <select id="setting-male-voice" name="male_voice_id"></select>
+                    <button type="button" class="action-button" data-role-preview="male">▶ Послушать мужской</button></div>
+                  <div class="field" data-voice-pair><label for="setting-female-voice">Женский голос</label>
+                    <select id="setting-female-voice" name="female_voice_id"></select>
+                    <button type="button" class="action-button" data-role-preview="female">▶ Послушать женский</button></div>
+                  <div class="field full"><span class="field-help" data-voice-pair-help>Выберите голоса для диалогов. Пара запоминается отдельно для движка и языка.</span></div>
+                  <details class="field full" data-reference-panel hidden><summary>Добавить свой образец голоса</summary>
+                    <p class="field-help">От 3 до 30 секунд чистой речи одного человека. Образец хранится локально. Укажите точный текст, который слышен на записи.</p>
+                    <label for="reference-label">Название голоса</label><input id="reference-label" maxlength="100" placeholder="Например, мягкий женский голос">
+                    <label for="reference-role">Роль</label><select id="reference-role"><option value="female">Женский</option><option value="male">Мужской</option></select>
+                    <label for="reference-audio">Аудиообразец</label><input id="reference-audio" type="file" accept="audio/*">
+                    <label for="reference-text">Текст из записи</label><textarea id="reference-text" maxlength="2000"></textarea>
+                    <button type="button" class="action-button" data-reference-upload>Сохранить образец</button>
+                  </details>
+                  <div class="field"><label for="setting-gender">Тембр / пол голоса</label>
                       <select id="setting-gender" name="voice_gender"></select></div>
-                    <div class="field" data-local-field><label for="setting-local-voice">Точный Piper-голос</label>
+                    <div class="field" data-local-field><label for="setting-local-voice">Один голос для всех (необязательно)</label>
                       <select id="setting-local-voice" name="voice_id"></select></div>
                     <div class="field" data-cloud-field><label for="setting-stt-model">Модель распознавания</label>
                       <select id="setting-stt-model" name="stt_model"></select></div>
@@ -2804,15 +2874,15 @@ class DubServer:
                       <select id="setting-translation-model" name="translation_model"></select></div>
                     <div class="field" data-cloud-field><label for="setting-tts-model">Модель озвучки</label>
                       <select id="setting-tts-model" name="tts_model"></select></div>
-                    <div class="field" data-openai-voice><label for="setting-openai-voice">Голос OpenAI</label>
+                    <div class="field" data-openai-voice><label for="setting-openai-voice">Один голос OpenAI для всех (необязательно)</label>
                       <select id="setting-openai-voice" name="openai_voice"></select></div>
-                    <div class="field" data-eleven-voice><label for="setting-eleven-voice">Голос ElevenLabs</label>
+                    <div class="field" data-eleven-voice><label for="setting-eleven-voice">Один голос ElevenLabs для всех (необязательно)</label>
                       <input id="setting-eleven-voice" name="eleven_voice" list="eleven-voice-list" autocomplete="off" placeholder="auto или Voice ID">
                       <datalist id="eleven-voice-list"></datalist>
                       <span class="field-help" data-eleven-help>Загружаю голоса аккаунта…</span></div>
                     <div class="field full"><label>Ключи провайдеров</label>
                       <div class="provider-status" data-provider-status>—</div></div>
-                    <div class="field full"><label for="preview-text">Проба озвучки</label>
+                    <div class="field full"><label for="preview-text">Проба озвучки</label><label for="preview-role">Какой голос проверить</label><select id="preview-role"><option value="female">Женский</option><option value="male">Мужской</option></select>
                       <div class="preview-row"><div class="field"><textarea id="preview-text" maxlength="240">Привет! Это проба голоса для перевода видео.</textarea></div>
                         <button class="action-button" type="button" data-preview-play>▶ Прослушать</button>
                         <button class="action-button ghost" type="button" data-preview-stop disabled>■ Стоп</button></div>
@@ -2978,11 +3048,59 @@ class DubServer:
                 document.querySelector("[data-openai-voice]").hidden = kind !== "openai";
                 document.querySelector("[data-eleven-voice]").hidden = kind !== "elevenlabs";
               }
+              let draftVoicePairs = {};
+              let currentPairScope = "";
+              let providerPairVoices = [];
+              function selectedVoiceEngine() {
+                if (!settingsDocument) return "";
+                if (settingsDocument.route.kind !== "local") return settingsDocument.engines.tts;
+                const selected = (settingsDocument.catalog.profiles || []).find(item => item.id === form.elements.profile_id.value);
+                return selected ? selected.engines.tts : settingsDocument.engines.tts;
+              }
+              function rememberVoicePair() {
+                if (currentPairScope) draftVoicePairs[currentPairScope] = {
+                  male_voice_id:form.elements.male_voice_id.value,
+                  female_voice_id:form.elements.female_voice_id.value
+                };
+              }
+              function pairVoices() {
+                const kind = settingsDocument.route.kind;
+                if (kind === "elevenlabs") return providerPairVoices;
+                if (kind === "openai") return (settingsDocument.catalog.voices || []).filter(voice => !voice.models || voice.models.includes(form.elements.tts_model.value));
+                const selected = (settingsDocument.catalog.profiles || []).find(item => item.id === form.elements.profile_id.value);
+                return ((selected && selected.voices) || []).filter(voice => voice.installed !== false && (voice.languages || [voice.language]).includes(form.elements.target_lang.value));
+              }
+              function updateRoleVoiceOptions() {
+                if (!settingsDocument) return;
+                rememberVoicePair();
+                const engine = selectedVoiceEngine();
+                currentPairScope = `${engine}:${form.elements.target_lang.value}`;
+                const pair = draftVoicePairs[currentPairScope] || {};
+                for (const role of ["male", "female"]) {
+                  const field = `${role}_voice_id`;
+                  const choices = pairVoices().filter(voice => voice.id && voice.id !== "auto").slice().sort((a,b) => Number(b.gender === role) - Number(a.gender === role));
+                  if (pair[field] && !choices.some(item => item.id === pair[field])) choices.push({id:pair[field], label:`${pair[field]} · сохранённый голос`});
+                  setOptions(form.elements[field], choices, pair[field] || "", engine === "f5" || engine === "moss-onnx" ? "Из оригинала / автоматически" : "Автоматический голос движка");
+                }
+                document.querySelector("[data-reference-panel]").hidden = !["f5", "moss-onnx"].includes(engine);
+                document.querySelector("[data-voice-pair-help]").textContent = engine === "f5"
+                  ? "F5 использует образцы голоса. Добавьте свои образцы и выберите их для диалога; пустой выбор сохраняет голос из оригинала."
+                  : "Пара запоминается отдельно для движка и языка. В режиме «Авто по спикеру» диалог озвучивается выбранными мужским и женским голосами.";
+              }
+              function clearSingleVoice() {
+                form.elements.voice_id.value = "";
+                form.elements.openai_voice.value = "";
+                form.elements.eleven_voice.value = "auto";
+              }
               function updateLocalVoiceOptions(preferred) {
                 if (!settingsDocument || settingsDocument.route.kind !== "local") return;
                 const target = form.elements.target_lang.value;
-                const voices = (settingsDocument.catalog.voices || []).filter(
-                  voice => voice.language === target && voice.installed !== false
+                const selected = (settingsDocument.catalog.profiles || []).find(
+                  item => item.id === form.elements.profile_id.value
+                );
+                const voices = ((selected && selected.voices) || settingsDocument.catalog.voices || []).filter(
+                  voice => (voice.languages || [voice.language]).includes(target)
+                    && voice.installed !== false && voice.id
                 );
                 setOptions(
                   form.elements.voice_id,
@@ -3018,6 +3136,13 @@ class DubServer:
                   : allSources;
                 const previousSource = form.elements.source_lang.value;
                 setOptions(form.elements.source_lang, supported, previousSource);
+                const allTargets = settingsDocument.catalog.all_target_languages || settingsDocument.catalog.target_languages || [];
+                const targetLanguages = selected && selected.target_languages;
+                const targets = targetLanguages && targetLanguages.length
+                  ? allTargets.filter(item => targetLanguages.includes(item.id)) : allTargets;
+                const previousTarget = form.elements.target_lang.value;
+                setOptions(form.elements.target_lang, targets, previousTarget);
+                updateLocalVoiceOptions();
               }
               function providerStatusText(items) {
                 if (!items || !items.length) return "Все движки локальные — API-ключи не нужны";
@@ -3028,6 +3153,14 @@ class DubServer:
               function renderSettings(documentData) {
                 settingsDocument = documentData;
                 const current = documentData.effective || {};
+                draftVoicePairs = JSON.parse(JSON.stringify(current.voice_pairs || {}));
+                currentPairScope = "";
+                const initialScope = `${documentData.engines.tts}:${current.target_lang}`;
+                draftVoicePairs[initialScope] = {male_voice_id:current.male_voice_id || "", female_voice_id:current.female_voice_id || ""};
+                providerPairVoices = [
+                  {id:"EXAVITQu4vr4xnSDxMaL", label:"Sarah · стандартный", gender:"female"},
+                  {id:"ErXwobaYiN019PkySvjV", label:"Adam · стандартный", gender:"male"}
+                ];
                 const catalog = documentData.catalog || {};
                 const kind = documentData.route.kind;
                 setKindVisibility(kind);
@@ -3036,8 +3169,8 @@ class DubServer:
                 setOptions(form.elements.voice_gender, catalog.voice_genders, current.voice_gender);
                 if (kind === "local") {
                   setOptions(form.elements.profile_id, catalog.profiles, current.profile_id);
-                  updateLocalVoiceOptions(current.voice_id || "");
                   updateEngineChain();
+                  updateLocalVoiceOptions(current.voice_id || "");
                 } else {
                   setOptions(form.elements.stt_model, catalog.stt_models, current.stt_model);
                   setOptions(form.elements.translation_model, catalog.translation_models, current.translation_model);
@@ -3059,14 +3192,19 @@ class DubServer:
                 form.querySelector("[data-save]").disabled = !documentData.can_save;
                 form.setAttribute("aria-busy", "false");
                 setSettingsStatus(documentData.warning || documentData.notice || "", documentData.warning ? "error" : "");
+                updateRoleVoiceOptions();
                 if (kind === "elevenlabs") loadProviderVoices();
               }
               function collectSettings() {
                 const kind = settingsDocument.route.kind;
+                rememberVoicePair();
                 const value = {
                   source_lang: form.elements.source_lang.value,
                   target_lang: form.elements.target_lang.value,
-                  voice_gender: form.elements.voice_gender.value
+                  voice_gender: form.elements.voice_gender.value,
+                  male_voice_id: form.elements.male_voice_id.value,
+                  female_voice_id: form.elements.female_voice_id.value,
+                  voice_pairs: draftVoicePairs
                 };
                 if (kind === "local") {
                   value.profile_id = form.elements.profile_id.value;
@@ -3100,11 +3238,17 @@ class DubServer:
               }
               async function loadProviderVoices() {
                 const help = document.querySelector("[data-eleven-help]");
+                const requestRoute = activeRoute;
                 help.textContent = "Загружаю голоса вашего ElevenLabs…";
                 try {
                   const response = await dashboardFetch(`${routeBase(activeRoute)}/provider/voices`);
                   if (!response.ok) throw new Error(await responseError(response));
                   const result = await response.json();
+                  if (activeRoute !== requestRoute) return;
+                  const merged = new Map(providerPairVoices.map(voice => [voice.id, voice]));
+                  for (const voice of result.voices || []) merged.set(voice.id, {...voice, label:`${voice.label}${voice.category === "professional" ? " · библиотека, возможен платный API" : ""}`});
+                  providerPairVoices = Array.from(merged.values());
+                  updateRoleVoiceOptions();
                   const list = document.getElementById("eleven-voice-list");
                   list.replaceChildren();
                   for (const voice of result.voices || []) {
@@ -3176,12 +3320,49 @@ class DubServer:
                   setSettingsStatus(error.message || "Не удалось сбросить", "error");
                 }
               });
-              form.elements.target_lang.addEventListener("change", () => updateLocalVoiceOptions(""));
+              form.elements.target_lang.addEventListener("change", () => { updateLocalVoiceOptions(""); updateRoleVoiceOptions(); });
               form.elements.profile_id.addEventListener("change", () => {
                 updateEngineChain();
+                updateLocalVoiceOptions("");
+                updateRoleVoiceOptions();
                 setSettingsStatus("Есть несохранённые изменения");
               });
-              form.elements.tts_model.addEventListener("change", () => updateOpenAIVoiceOptions(""));
+              form.elements.tts_model.addEventListener("change", () => { updateOpenAIVoiceOptions(""); updateRoleVoiceOptions(); });
+              for (const role of ["male", "female"]) form.elements[`${role}_voice_id`].addEventListener("change", () => { clearSingleVoice(); rememberVoicePair(); });
+              form.querySelectorAll("[data-role-preview]").forEach(button => button.addEventListener("click", () => {
+                if (selectedVoiceEngine() === "f5" && !form.elements[`${button.dataset.rolePreview}_voice_id`].value) {
+                  setSettingsStatus("Для пробы F5 добавьте и выберите образец голоса. Голос из оригинала доступен во время перевода видео.", "error");
+                  return;
+                }
+                document.getElementById("preview-role").value = button.dataset.rolePreview;
+                form.querySelector("[data-preview-play]").click();
+              }));
+              form.querySelector("[data-reference-upload]").addEventListener("click", async () => {
+                const file = document.getElementById("reference-audio").files[0];
+                if (!file) { setSettingsStatus("Выберите аудиообразец", "error"); return; }
+                const body = new FormData();
+                body.append("audio", file);
+                body.append("text", document.getElementById("reference-text").value);
+                body.append("label", document.getElementById("reference-label").value);
+                body.append("gender", document.getElementById("reference-role").value);
+                body.append("language", form.elements.target_lang.value);
+                const button = form.querySelector("[data-reference-upload]");
+                button.disabled = true;
+                const route = activeRoute;
+                try {
+                  const response = await dashboardFetch(`${routeBase(route)}/voices/reference`, {method:"POST", body});
+                  if (!response.ok) throw new Error(await responseError(response));
+                  const result = await response.json();
+                  if (activeRoute !== route) return;
+                  for (const profile of settingsDocument.catalog.profiles || []) if (["f5", "moss-onnx"].includes(profile.engines.tts)) profile.voices.push({...result.voice,engine:profile.engines.tts});
+                  updateLocalVoiceOptions();
+                  updateRoleVoiceOptions();
+                  form.elements[`${result.voice.gender}_voice_id`].value = result.voice.id;
+                  clearSingleVoice(); rememberVoicePair();
+                  setSettingsStatus("Образец добавлен и выбран. Сохраните настройки, чтобы применять его к переводам.", "ok");
+                } catch(error) { setSettingsStatus(error.message || "Не удалось добавить образец", "error"); }
+                finally { button.disabled = false; }
+              });
               form.addEventListener("input", event => {
                 if (event.target.closest("#preview-text")) return;
                 setSettingsStatus("Есть несохранённые изменения");
@@ -3196,7 +3377,7 @@ class DubServer:
                 try {
                   const response = await dashboardFetch(`${routeBase(activeRoute)}/tts/preview`, {
                     method:"POST", headers:{"Content-Type":"application/json"},
-                    body:JSON.stringify({...collectSettings(), settings_mode:"override", text:document.getElementById("preview-text").value}),
+                    body:JSON.stringify({...collectSettings(), voice_gender:document.getElementById("preview-role").value, voice_id:"", tts_voice:"auto", settings_mode:"override", text:document.getElementById("preview-text").value}),
                     signal:previewController.signal
                   });
                   if (!response.ok) throw new Error(await responseError(response));
@@ -3296,7 +3477,9 @@ class DubServer:
                 ),
                 kind=self._settings_kind,
                 profile_ids=set(self._profile_configs),
-                local_voices=self._voice_catalog(self._base_cfg),
+                local_voices=self._settings_voice_catalog(payload["settings"]),
+                    voice_engine=self._settings_voice_engine(payload["settings"]),
+                    voice_catalogs=self._settings_voice_catalogs(),
             )
             if self._settings_kind == "local":
                 self._require_profile_ready(str(normalized["profile_id"]))
@@ -3379,6 +3562,79 @@ class DubServer:
         response["message"] = "восстановлены значения из YAML-профиля"
         return web.json_response(response, headers={"Cache-Control": "no-store"})
 
+    async def _post_voice_reference(self, request):
+        from aiohttp import web
+        from uvt.voice_references import library_dir, catalog
+        from uvt.server_settings import LANGUAGES
+        import tempfile
+        if not self._dashboard_request_allowed(request):
+            raise web.HTTPForbidden(text="Добавлять образцы можно только из настроек UVT")
+        if len(catalog()) >= 100:
+            raise web.HTTPConflict(text="В библиотеке уже 100 образцов")
+        limit = 20 * 1024**2
+        total = 0
+        fields = {}
+        root = library_dir()
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.TemporaryDirectory(prefix="upload-", dir=root) as temporary:
+            source = Path(temporary) / "source"
+            try:
+                reader = await request.multipart()
+                async with asyncio.timeout(60):
+                    while (part := await reader.next()) is not None:
+                        if part.name == "audio" and not source.exists():
+                            with source.open("wb") as output:
+                                while chunk := await part.read_chunk():
+                                    total += len(chunk)
+                                    if total > limit:
+                                        raise web.HTTPRequestEntityTooLarge(max_size=limit, actual_size=total)
+                                    output.write(chunk)
+                        elif part.name in {"label", "text", "language", "gender"}:
+                            value = bytearray()
+                            while chunk := await part.read_chunk():
+                                value.extend(chunk)
+                                if len(value) > 8000:
+                                    raise web.HTTPBadRequest(text="Текст образца слишком длинный")
+                            fields[part.name] = value.decode("utf-8").strip()
+                        else:
+                            raise web.HTTPBadRequest(text="Неизвестное или повторное поле образца")
+            except (ValueError, UnicodeDecodeError, TimeoutError):
+                raise web.HTTPBadRequest(text="Не удалось прочитать образец голоса") from None
+            if not source.is_file() or not source.stat().st_size:
+                raise web.HTTPBadRequest(text="Выберите аудиофайл")
+            if not fields.get("text") or len(fields["text"]) > 2000:
+                raise web.HTTPBadRequest(text="Введите точный текст из образца, до 2000 символов")
+            if fields.get("gender") not in {"male", "female"}:
+                raise web.HTTPBadRequest(text="Выберите мужской или женский голос")
+            if fields.get("language") not in {item[0] for item in LANGUAGES} - {"auto"}:
+                raise web.HTTPBadRequest(text="Выберите язык озвучки")
+            lines = []
+            try:
+                await _run_process(["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type", "-of", "json", str(source)], 15, "проверка образца", on_line=lines.append)
+                probe = json.loads("\n".join(lines))
+                duration = float(probe["format"]["duration"])
+                if not 3 <= duration <= 30 or not any(item.get("codec_type") == "audio" for item in probe.get("streams", [])):
+                    raise ValueError("duration")
+                output = Path(temporary) / "sample.wav"
+                await _run_process(["ffmpeg", "-v", "error", "-y", "-i", str(source), "-map", "0:a:0", "-ac", "1", "-ar", "24000", "-t", "30", "-c:a", "pcm_s16le", str(output)], 20, "подготовка образца")
+            except (RuntimeError, ValueError, KeyError):
+                raise web.HTTPUnprocessableEntity(text="Нужен читаемый образец чистой речи длительностью от 3 до 30 секунд") from None
+            voice_id = "ref_" + uuid.uuid4().hex
+            metadata = {"id": voice_id, "label": (fields.get("label") or "Мой голос")[:100],
+                        "text": fields["text"], "language": fields["language"], "gender": fields["gender"]}
+            audio_path = root / (voice_id + ".wav")
+            metadata_path = root / (voice_id + ".json")
+            try:
+                output.chmod(0o600)
+                output.replace(audio_path)
+                metadata_path.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+                metadata_path.chmod(0o600)
+            except OSError:
+                audio_path.unlink(missing_ok=True)
+                metadata_path.unlink(missing_ok=True)
+                raise web.HTTPInsufficientStorage(text="Не удалось сохранить образец; проверьте свободное место") from None
+        return web.json_response({"voice": next(item for item in catalog() if item["id"] == voice_id)}, status=201)
+
     async def _get_provider_voices(self, request):
         from aiohttp import web
 
@@ -3429,6 +3685,7 @@ class DubServer:
                     "id": voice_id,
                     "label": str(item.get("name") or voice_id)[:100],
                     "category": str(item.get("category") or "")[:50],
+                        "gender": str((item.get("labels") or {}).get("gender") or ""),
                 }
             )
         voices.sort(key=lambda item: item["label"].casefold())
@@ -3487,6 +3744,9 @@ class DubServer:
         )
         self._set_stage(job, "queue")
         self.jobs[job.id] = job
+        video_results = getattr(self, "_video_results", None)
+        if video_results:
+            video_results.record_request(job, data)
         self._job_configs[job.id] = cfg_snapshot.model_copy(deep=True)
         self._job_cache[key] = job.id
         self._tasks[job.id] = asyncio.get_running_loop().create_task(
@@ -3585,6 +3845,8 @@ class DubServer:
             str(getattr(cfg.tts, "voice", "") or ""),
             str(cfg.tts.voice_gender),
             str(cfg.tts.voice_id or ""),
+            str(getattr(cfg.tts, "male_voice_id", "") or ""),
+            str(getattr(cfg.tts, "female_voice_id", "") or ""),
             text,
         )
         cached = self._preview_cache.get(cache_key)
@@ -3727,6 +3989,19 @@ class DubServer:
         return web.FileResponse(path, headers={"Content-Type": "audio/mp4"})
 
 
+class ServerBindError(OSError):
+    """An occupied listener reported without a CLI traceback."""
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        super().__init__(
+            f"Порт {port} уже занят ({_dashboard_url(host, port)}). "
+            "Если UVT уже работает, откройте этот адрес. "
+            "Для перезапуска остановите предыдущий UVT через Ctrl+C в его терминале."
+        )
+
+
 async def run_server(
     cfg: AppConfig,
     host: str = "127.0.0.1",
@@ -3766,14 +4041,16 @@ async def run_server(
     await runner.setup()
     site = web.TCPSite(runner, host, port)
     try:
-        server.schedule_local_model_prepare()
         await site.start()
-    except BaseException:
+    except BaseException as exc:
         await server.close_prepared_models()
         await runner.cleanup()
+        if isinstance(exc, OSError) and exc.errno == errno.EADDRINUSE:
+            raise ServerBindError(host, port) from None
         raise
     if bound_event is not None:
         bound_event.set()
+    server.schedule_local_model_prepare()
     if server._prepare_stt_task is not None:
         # The socket is already reachable and /meta exposes checking/loading;
         # the startup log below is emitted only after readiness is known.

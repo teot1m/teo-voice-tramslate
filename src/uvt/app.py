@@ -65,16 +65,52 @@ class Pipeline:
                 return service
         raise KeyError(name)
 
-    async def start(self) -> None:
-        # Задачи создаются с конца конвейера: потребители подписываются на
-        # топики раньше, чем источник начнёт публиковать.
-        for service in reversed(self.services):
-            await service.start()
+    async def start(self, stop_event: asyncio.Event | None = None) -> bool:
+        """Prepare consumers sequentially before capture; False means stopped."""
+        if stop_event is not None and stop_event.is_set():
+            return False
+
+        async def boot() -> None:
+            for service in reversed(self.services):
+                if stop_event is not None and stop_event.is_set():
+                    return
+                await service.start()
+                await service.wait_ready()
+
+        boot_task = asyncio.create_task(boot(), name="uvt:startup")
+        stop_task = (
+            asyncio.create_task(stop_event.wait()) if stop_event is not None else None
+        )
+        try:
+            if stop_task is not None:
+                await asyncio.wait({boot_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+                if stop_event.is_set():
+                    boot_task.cancel()
+                    await asyncio.gather(boot_task, return_exceptions=True)
+                    await self.stop()
+                    return False
+            await boot_task
+            return True
+        except BaseException:
+            boot_task.cancel()
+            await asyncio.gather(boot_task, return_exceptions=True)
+            await self.stop()
+            raise
+        finally:
+            if stop_task is not None:
+                stop_task.cancel()
+                await asyncio.gather(stop_task, return_exceptions=True)
 
     async def stop(self) -> None:
-        # Останавливаем с начала: сперва замолкает источник.
+        # Stop capture first, and drain every service even if stop is cancelled.
+        cancelled = False
         for service in self.services:
-            await service.stop()
+            try:
+                await service.stop()
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
 
 
 async def run_headless(cfg: AppConfig) -> None:
@@ -86,7 +122,9 @@ async def run_headless(cfg: AppConfig) -> None:
         with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(sig, stop_event.set)
 
-    await pipeline.start()
+    if not await pipeline.start(stop_event=stop_event):
+        log.info("запуск конвейера остановлен")
+        return
     log.info(
         "конвейер запущен: %s → %s, режим '%s', пресет задержки '%s'; Ctrl+C — остановка",
         cfg.source_lang, cfg.target_lang, cfg.mode, cfg.latency.preset,

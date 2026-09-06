@@ -10,6 +10,7 @@ import asyncio
 
 import numpy as np
 
+from uvt.config import configured_role_voice
 from uvt.interfaces import TTSEngine
 from uvt.registry import register
 
@@ -35,6 +36,15 @@ class KokoroTTS(TTSEngine):
 
         self._kokoro = Kokoro(self.cfg.model_path, self.cfg.voices_path)
 
+    def _voice(self, language: str) -> str:
+        explicit = str(getattr(self.cfg, "voice", "auto") or "auto").strip()
+        if explicit not in {"auto", "cloud"}:
+            return explicit
+        selected = configured_role_voice(self.cfg)
+        if selected:
+            return selected
+        return "af_heart"
+
     async def synthesize(self, text: str, language: str) -> tuple[np.ndarray, int]:
         lang_code = _KOKORO_LANGS.get(language.split("-")[0].lower())
         if lang_code is None:
@@ -42,7 +52,7 @@ class KokoroTTS(TTSEngine):
                 f"kokoro не поддерживает язык '{language}' "
                 f"(доступны: {', '.join(sorted(_KOKORO_LANGS))}); для него используйте tts.engine=edge"
             )
-        voice = self.cfg.voice if self.cfg.voice != "auto" else "af_heart"
+        voice = self._voice(language)
         samples, rate = await asyncio.to_thread(
             self._kokoro.create, text, voice=voice, speed=self.cfg.speed, lang=lang_code
         )
@@ -54,7 +64,7 @@ class KokoroTTS(TTSEngine):
         lang_code = _KOKORO_LANGS.get(language.split("-")[0].lower())
         if lang_code is None or speed <= 1.02:
             return await self.synthesize(text, language)
-        voice = self.cfg.voice if self.cfg.voice != "auto" else "af_heart"
+        voice = self._voice(language)
         samples, rate = await asyncio.to_thread(
             self._kokoro.create, text, voice=voice,
             speed=float(self.cfg.speed) * speed, lang=lang_code,

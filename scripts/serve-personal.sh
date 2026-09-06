@@ -18,4 +18,5 @@ if ! command -v uvt >/dev/null 2>&1; then
   exit 1
 fi
 
-exec uvt serve-personal "$@"
+# Native TorchCodec also needs the library path before Python starts.
+exec bash "$PROJECT_DIR/scripts/with-local-runtime.sh" "$(command -v uvt)" serve-personal "$@"

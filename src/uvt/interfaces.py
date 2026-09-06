@@ -141,6 +141,19 @@ class TranslationEngine(Engine):
         «я готов»). По умолчанию пол игнорируется."""
         return await self.translate_batch(texts, source_lang, target_lang)
 
+    async def translate_batch_contextual(
+        self, texts: Sequence[str], source_lang: str | None, target_lang: str,
+        genders: Sequence[str] | None, *,
+        before: Sequence[tuple[str, str]] = (),
+        after: Sequence[tuple[str, str]] = (),
+    ) -> list[str]:
+        """File-only neighbouring source lines and roles; return only ``texts``.
+
+        Engines without prompt context retain their existing batch implementation.
+        Live translation uses ``translate`` and never waits for future speech.
+        """
+        return await self.translate_batch_tagged(texts, source_lang, target_lang, genders)
+
     async def shorten(self, text: str, target_lang: str, max_chars: int) -> str:
         """Переписать перевод короче указанного объёма, сохранив смысл.
 

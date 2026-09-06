@@ -1,0 +1,15 @@
+{
+  "profile": "local-natural",
+  "tts": "F5-TTS Russian",
+  "device": "mps",
+  "offline": true,
+  "nfe_step": 16,
+  "decoder_seconds": 1.677,
+  "warmup_seconds": 11.75,
+  "synthesis_seconds": 42.301,
+  "audio_seconds": 5.013,
+  "sample_rate": 24000,
+  "finite_non_silent": true,
+  "reference": "Existing neutral project-meeting fixture; no user video used.",
+  "scope": "Native decoder + cached F5 model + one Russian synthesis; not full-video or listening-quality validation."
+}

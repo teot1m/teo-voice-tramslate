@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Annotated
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -111,12 +112,35 @@ class TranslationConfig(_Section):
     # None → встроенный шаблон; путь к файлу или сам текст шаблона (ТЗ §5)
     prompt_template: str | None = None
     context_pairs: int = 3  # сколько прошлых реплик отдавать LLM как контекст
+    # File dubbing can look ahead; live translation still uses only context_pairs.
+    file_context_lines: int = Field(default=3, ge=0, le=6)
     glossary: list[str] = Field(default_factory=list)
     # Для batch-дубляжа: размер одной пачки и число одновременных запросов.
     # Локальный Ollama по умолчанию работает последовательно, облако — параллельно.
     batch_size: int | None = Field(default=None, ge=1)
     concurrency: int | None = Field(default=None, ge=1)
     fallback: TranslationFallbackConfig | None = None
+
+
+class VoicePairConfig(BaseModel):
+    """User-selected timbres for two speaker roles within one engine/language."""
+
+    model_config = ConfigDict(extra="forbid")
+    male_voice_id: str | None = Field(default=None, strict=True, max_length=200)
+    female_voice_id: str | None = Field(default=None, strict=True, max_length=200)
+
+
+VoicePairKey = Annotated[
+    str, Field(pattern=r"^[a-z0-9][a-z0-9_-]*:[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
+]
+
+
+def configured_role_voice(cfg, gender: str | None = None) -> str | None:
+    """Return the effective pair preference; settings resolves engine/language scope."""
+    role = str(gender or getattr(cfg, "voice_gender", "auto") or "auto").lower()
+    field = "female_voice_id" if role.startswith(("f", "ж")) else "male_voice_id"
+    selected = str(getattr(cfg, field, "") or "").strip()
+    return selected or None
 
 
 class TTSConfig(_Section):
@@ -135,6 +159,9 @@ class TTSConfig(_Section):
     # Необязательный идентификатор одной из моделей из ``voice_models``.
     # Это именно allowlisted stem файла, а не путь от HTTP-клиента.
     voice_id: str | None = None
+    male_voice_id: str | None = Field(default=None, strict=True, max_length=200)
+    female_voice_id: str | None = Field(default=None, strict=True, max_length=200)
+    voice_pairs: dict[VoicePairKey, VoicePairConfig] = Field(default_factory=dict)
 
 
 class SpeakerConfig(_Section):

@@ -1,0 +1,40 @@
+# Nemotron 3.5 MLX + Hy-MT2 + Piper; pinned project-local models.
+mode: voiceover
+source_lang: auto
+target_lang: ru
+vad:
+  engine: silero
+stt:
+  engine: nemotron-mlx
+  model: .models/nemotron
+  revision: 7279359e4481b5e9e185a318bd618e429c6d86cd
+  allow_download: false
+  chunk_seconds: 5.0
+  concurrency: 1
+translation:
+  engine: hymt-mlx
+  model: .models/hymt2
+  revision: e5c6fe56c7b3bc77fae5ae92db31f2178f1e6912
+  allow_download: false
+  batch_size: 4
+  concurrency: 1
+  max_tokens: 160
+  context_pairs: 2
+tts:
+  engine: piper
+  voice_dir: ~/.local/share/uvt/piper
+  voice_models:
+    uk:male: uk_UA-mykyta-high.onnx
+    uk:female: uk_UA-tetiana-high.onnx
+    ru:male: ru_RU-dmitri-medium.onnx
+    ru:female: ru_RU-irina-medium.onnx
+  duration_per_char:
+    uk:male: 0.082
+    uk:female: 0.065
+    ru:male: 0.055
+    ru:female: 0.067
+  concurrency: 2
+latency:
+  preset: accuracy
+history:
+  enabled: true

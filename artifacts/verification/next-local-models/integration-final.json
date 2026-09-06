@@ -1,0 +1,35 @@
+{
+  "date": "2026-09-06",
+  "tests": {
+    "passed": 519,
+    "seconds": 14.99
+  },
+  "routes": [
+    8765,
+    8766,
+    8767
+  ],
+  "new_profiles_installed": [
+    "local-hymt",
+    "local-moss",
+    "local-nemotron"
+  ],
+  "moss_ru": true,
+  "moss_uk": false,
+  "completed_video": {
+    "restored": true,
+    "ready": true,
+    "resolution": "426x240",
+    "duration_seconds": 838.370122,
+    "codecs": [
+      "h264",
+      "aac"
+    ],
+    "http_range_original": 206,
+    "http_range_preview": 206,
+    "http_range_translated": 206,
+    "original_identical": true,
+    "translated_audio_preserved": true
+  },
+  "temporary_video_test_server_stopped": true
+}

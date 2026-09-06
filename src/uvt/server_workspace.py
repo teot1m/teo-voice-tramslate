@@ -98,6 +98,9 @@ class WorkspaceRoutes:
     def __init__(self, server):
         self.server = server
         self.upload_lock = asyncio.Lock()
+        from uvt.workspace_video import VideoResults
+        self.video = VideoResults(server)
+        server._video_results = self.video
 
     def register(self, app):
         app.router.add_get("/workspace", self.index)
@@ -107,6 +110,9 @@ class WorkspaceRoutes:
         app.router.add_get("/workspace/jobs", self.jobs)
         app.router.add_post("/workspace/upload", self.upload)
         app.router.add_get("/download/{jid}/{kind}", self.download)
+        app.router.add_post("/workspace/job/{jid}/video", self.prepare_video)
+        app.router.add_post("/workspace/job/{jid}/video/cancel", self.cancel_video)
+        app.on_cleanup.append(self._close_video)
 
     def require_dashboard(self, request):
         if not self.server._dashboard_request_allowed(request):
@@ -203,11 +209,11 @@ class WorkspaceRoutes:
                 data = {key: options[key] for key in (
                     "settings_mode", "profile_id", "source_lang", "target_lang", "voice_gender", "voice_id"
                 ) if key in options}
-                data.update(file=str(path), source_name=source_name, mix_original=True, export_video=has_video and options.get("export_video") is True)
+                data.update(file=str(path), source_name=source_name, mix_original=not has_video, source_has_video=has_video, workspace_video=has_video, export_video=has_video and options.get("export_video") is True)
                 response = await self.server._submit_dub_job(data)
                 job_id = json.loads(response.body)["id"]
                 task = self.server._tasks[job_id]
-                task.add_done_callback(lambda _task, owned_path=path: owned_path.unlink(missing_ok=True))
+                task.add_done_callback(lambda _task, owned_path=path: owned_path.unlink(missing_ok=True) if self.server.jobs[job_id].status != "done" or not has_video else None)
                 handed_off = True
                 return response
             except (ValueError, AssertionError) as exc:
@@ -222,6 +228,31 @@ class WorkspaceRoutes:
                 if path is not None and not handed_off:
                     path.unlink(missing_ok=True)
 
+    async def _close_video(self, _app):
+        await self.video.close()
+
+    async def prepare_video(self, request):
+        self.require_dashboard(request)
+        job = self.server.jobs.get(request.match_info["jid"])
+        if job is None or job.status != "done":
+            raise web.HTTPNotFound(text="Перевод ещё не готов или задание не найдено.")
+        try:
+            data = await request.json() if request.can_read_body else {}
+        except (ValueError, UnicodeDecodeError):
+            raise web.HTTPBadRequest(text="Не удалось прочитать настройки громкости.") from None
+        if not isinstance(data, dict):
+            raise web.HTTPBadRequest(text="Настройки должны быть объектом.")
+        self.video.start(job, original_volume=data.get("original_volume", 0.15), translation_volume=data.get("translation_volume", 1.0))
+        return web.json_response(self.server._job_payload(job), status=202)
+
+    async def cancel_video(self, request):
+        self.require_dashboard(request)
+        task = self.video.tasks.get(request.match_info["jid"])
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        return web.json_response({"ok": True})
+
     async def download(self, request):
         job_id, kind = request.match_info["jid"], request.match_info["kind"]
         job = self.server.jobs.get(job_id)
@@ -232,6 +263,12 @@ class WorkspaceRoutes:
             supplied = request.query.get("access", "")
             if not self.server._request_has_api_token(request) and not (expected and hmac.compare_digest(expected, supplied)):
                 raise web.HTTPUnauthorized(text="Нужен токен доступа к результату.")
+        if kind in {"original", "video", "translated"}:
+            path = self.video.path(job, kind)
+            if path is None:
+                raise web.HTTPNotFound(text="Видео ещё не подготовлено. Нажмите «Подготовить видео».")
+            disposition = "inline" if kind == "video" else "attachment"
+            return web.FileResponse(path, headers={"Cache-Control": "private, no-store", "Content-Disposition": f'{disposition}; filename="uvt-{job_id}-{kind}{path.suffix}"', "X-Content-Type-Options": "nosniff"})
         headers = {"Cache-Control": "private, no-store", "Content-Disposition": f'attachment; filename="uvt-{job_id}.{kind}"'}
         if kind in {"m4a", "mkv"}:
             path = self.server.audio_dir / f"{job_id}.{kind}"

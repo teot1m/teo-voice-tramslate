@@ -1,0 +1,18 @@
+UVT: совместимая библиотека FFmpeg подключена только для этого запуска.
+Native reference decoder passed.
+objc[81462]: Class AVFFrameReceiver is implemented in both /opt/homebrew/Cellar/ffmpeg/8.1.2/lib/libavdevice.62.3.102.dylib (0x1076ec328) and /Users/teotim/Documents/голос/.venv/lib/python3.13/site-packages/av/.dylibs/libavdevice.62.3.102.dylib (0x11c4dc3a8). This may cause spurious casting failures and mysterious crashes. One of the duplicates must be removed or renamed.
+objc[81462]: Class AVFAudioReceiver is implemented in both /opt/homebrew/Cellar/ffmpeg/8.1.2/lib/libavdevice.62.3.102.dylib (0x1076ec378) and /Users/teotim/Documents/голос/.venv/lib/python3.13/site-packages/av/.dylibs/libavdevice.62.3.102.dylib (0x11c4dc3f8). This may cause spurious casting failures and mysterious crashes. One of the duplicates must be removed or renamed.
+Download Vocos from huggingface charactr/vocos-mel-24khz
+
+vocab :  /Users/teotim/.cache/huggingface/hub/models--Misha24-10--F5-TTS_RUSSIAN/snapshots/ea166adeae4c80ec5ee423a671e2bdb83906cf84/F5TTS_v1_Base/vocab.txt
+token :  custom
+model :  /Users/teotim/.cache/huggingface/hub/models--Misha24-10--F5-TTS_RUSSIAN/snapshots/ea166adeae4c80ec5ee423a671e2bdb83906cf84/F5TTS_v1_Base/model_240000_inference.safetensors 
+
+Cached F5 model loaded.
+
+ref_text   Good morning. Our project meeting starts at ten fifteen tomorrow. Please bring the updated budget and a short list of risks. We will compare two options and choose the next steps before lunch. Do not send the draft to customers until it is approved. 
+gen_text 0 Проверка локальной озвучки. Завтра обсудим планы проекта.
+
+
+  0%|          | 0/1 [00:00<?, ?it/s]100%|██████████| 1/1 [00:41<00:00, 41.06s/it]100%|██████████| 1/1 [00:41<00:00, 41.06s/it]
+{"profile": "local-natural", "tts": "F5-TTS Russian", "device": "mps", "offline": true, "nfe_step": 16, "decoder_seconds": 1.677, "warmup_seconds": 11.75, "synthesis_seconds": 42.301, "audio_seconds": 5.013, "sample_rate": 24000, "finite_non_silent": true, "reference": "Existing neutral project-meeting fixture; no user video used.", "scope": "Native decoder + cached F5 model + one Russian synthesis; not full-video or listening-quality validation."}

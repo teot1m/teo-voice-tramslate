@@ -1,0 +1,21 @@
+{
+  "engine": "moss-onnx",
+  "voice": "Bella",
+  "text": "Привет! Как проходит твой день?",
+  "warmup_seconds": 4.163,
+  "tts_revision": "f52645cb467506d8e18e746ddd59482685b74e58",
+  "codec_revision": "ceff0d0749bfb3fa2d61149794ec6feef0d1e1ae",
+  "synthesis_seconds": 3.212,
+  "audio_seconds": 4.56,
+  "sample_rate": 48000,
+  "peak_rss_mib": 1509.97,
+  "finite": true,
+  "peak": 0.5788668394088745,
+  "reference_smoke": {
+    "synthesis_seconds": 2.615,
+    "audio_seconds": 3.2,
+    "sample_rate": 48000,
+    "finite": true,
+    "peak": 0.6137557625770569
+  }
+}

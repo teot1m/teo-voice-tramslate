@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+
+import pytest
 import sys
 from types import SimpleNamespace
 
@@ -42,12 +45,16 @@ def _fake_hub(tmp_path):
             for item in setup_local.LOCAL_MODEL_MANIFEST.values()
             if item.repo_id == kwargs["repo_id"]
         )
-        path = tmp_path / "hub" / "snapshots" / kwargs["revision"]
+        path = Path(kwargs["local_dir"]) if kwargs.get("local_dir") else tmp_path / spec.key / "snapshots" / spec.revision
         path.mkdir(parents=True, exist_ok=True)
         for filename in spec.required_files:
             target = path / filename
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(b"test-model")
+            if spec.local_dir:
+                metadata = path / ".cache/huggingface/download" / (filename + ".metadata")
+                metadata.parent.mkdir(parents=True, exist_ok=True)
+                metadata.write_text(spec.revision + "\netag\n0\n", encoding="utf-8")
         return str(path)
 
     def hf_hub_download(**kwargs):
@@ -78,6 +85,9 @@ def test_local_manifest_has_five_pinned_presets():
         "balanced",
         "quality",
         "natural",
+        "hymt",
+        "moss",
+        "nemotron",
         "all",
     )
     assert setup_local.LOCAL_SETUP_PRESETS["fast"].model_keys == (
@@ -183,3 +193,142 @@ def test_dry_preflight_uses_local_cache_only_and_never_downloads(
     assert len(calls) == 2
     assert all(call["local_files_only"] is True for call in calls)
     assert "Ничего не скачано" in setup_local.format_setup_report(result)
+
+
+NEW_LOCAL_MODELS = ("hymt2", "nemotron", "moss-tts", "moss-codec")
+
+
+def _checkout(monkeypatch, tmp_path):
+    # Redirect only the module's checkout-root calculation; tests must never
+    # touch the real weights downloaded by the user.
+    monkeypatch.setattr(setup_local,"__file__",str(tmp_path/"src"/"uvt"/"setup_local.py"))
+
+
+def _local_files(tmp_path,key):
+    spec = setup_local.LOCAL_MODEL_MANIFEST[key]
+    directory = tmp_path/spec.local_dir
+    for filename in spec.required_files:
+        target = directory/filename
+        target.parent.mkdir(parents=True,exist_ok=True)
+        target.write_bytes(b"model-data")
+        metadata = directory/".cache/huggingface/download"/(filename+".metadata")
+        metadata.parent.mkdir(parents=True,exist_ok=True)
+        metadata.write_text(spec.revision+"\netag\n0\n",encoding="utf-8")
+    return spec,directory
+
+
+def test_new_preset_engine_pairs_and_voice_dependency():
+    def cfg(stt,translation,tts="piper"):
+        return SimpleNamespace(stt=SimpleNamespace(engine=stt),translation=SimpleNamespace(engine=translation),tts=SimpleNamespace(engine=tts))
+
+    assert setup_local.preset_for_profile(cfg("parakeet-mlx","hymt-mlx")) == "hymt"
+    assert setup_local.preset_for_profile(cfg("parakeet-mlx","hymt-mlx","moss-onnx")) == "moss"
+    assert setup_local.preset_for_profile(cfg("nemotron-mlx","hymt-mlx")) == "nemotron"
+    assert setup_local.LOCAL_SETUP_PRESETS["moss"].requires_piper is False
+    assert setup_local.LOCAL_SETUP_PRESETS["moss"].model_keys == ("parakeet","hymt2","moss-tts","moss-codec")
+
+
+@pytest.mark.parametrize("key",NEW_LOCAL_MODELS)
+def test_checkout_local_only_preflight_never_calls_hub(monkeypatch,tmp_path,key):
+    _checkout(monkeypatch,tmp_path)
+    spec,directory = _local_files(tmp_path,key)
+    calls = []
+
+    def forbidden(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("checkout-local preflight must not call Hugging Face")
+
+    status=setup_local._model_status(spec,forbidden,local_only=True)
+    assert status["ready"] is True
+    assert Path(status["path"]) == directory
+    assert calls == []
+
+
+@pytest.mark.parametrize("key",NEW_LOCAL_MODELS)
+@pytest.mark.parametrize("damage",["wrong-revision","missing-metadata","missing-file","empty-file"])
+def test_checkout_preflight_rejects_unverified_or_incomplete_weights(monkeypatch,tmp_path,key,damage):
+    _checkout(monkeypatch,tmp_path)
+    spec,directory=_local_files(tmp_path,key)
+    name=spec.required_files[0]
+    metadata=directory/".cache/huggingface/download"/(name+".metadata")
+    if damage == "wrong-revision":
+        # The revision must be on line one, not merely present in metadata.
+        metadata.write_text("0"*40+"\n"+spec.revision+"\n",encoding="utf-8")
+    elif damage == "missing-metadata":
+        metadata.unlink()
+    elif damage == "missing-file":
+        (directory/name).unlink()
+    else:
+        (directory/name).write_bytes(b"")
+    calls=[]
+
+    def forbidden(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("no network or Hub fallback during preflight")
+
+    status=setup_local._model_status(spec,forbidden,local_only=True)
+    assert status["ready"] is False
+    assert status["error"]
+    assert calls == []
+
+
+@pytest.mark.parametrize("key",NEW_LOCAL_MODELS)
+def test_setup_uses_exact_revision_allowlist_and_checkout_directory(monkeypatch,tmp_path,key):
+    _checkout(monkeypatch,tmp_path)
+    snapshots,_,download,_=_fake_hub(tmp_path)
+    spec=setup_local.LOCAL_MODEL_MANIFEST[key]
+    status=setup_local._model_status(spec,download,local_only=False)
+    assert status["ready"] is True
+    assert snapshots == [{
+        "repo_id":spec.repo_id,"revision":spec.revision,"local_files_only":False,
+        "allow_patterns":list(spec.allow_patterns),"local_dir":str(tmp_path/spec.local_dir),
+    }]
+
+
+def test_moss_setup_neither_imports_nor_installs_piper(monkeypatch,tmp_path):
+    import sys
+    _checkout(monkeypatch,tmp_path)
+    snapshots,piper_files,download,piper_download=_fake_hub(tmp_path)
+    monkeypatch.setitem(sys.modules,"huggingface_hub",SimpleNamespace(snapshot_download=download,hf_hub_download=piper_download))
+    monkeypatch.setitem(sys.modules,"piper",None)
+    monkeypatch.setattr(setup_local,"_install_piper_voices",lambda *_a,**_k: pytest.fail("MOSS must not install unused Piper voices"))
+    report=setup_local.setup_mac_local("moss",voice_dir=tmp_path/"unused-voices")
+    assert report["ready"] is True
+    assert len(snapshots)==4
+    assert piper_files == []
+    assert not (tmp_path/"unused-voices").exists()
+
+
+def test_cache_snapshot_with_empty_required_file_is_not_ready(monkeypatch,tmp_path):
+    spec=setup_local.LOCAL_MODEL_MANIFEST["parakeet"]
+    directory=tmp_path/"snapshots"/spec.revision
+    directory.mkdir(parents=True)
+    for filename in spec.required_files:
+        target=directory/filename
+        target.parent.mkdir(parents=True,exist_ok=True)
+        target.write_bytes(b"data")
+    (directory/spec.required_files[0]).write_bytes(b"")
+    status=setup_local._model_status(spec,lambda **kwargs: str(directory),local_only=True)
+    assert status["ready"] is False
+    assert "пустые" in status["error"]
+
+
+def test_moss_preflight_validates_local_files_without_piper_or_new_hub_requests(monkeypatch,tmp_path):
+    import sys
+    _checkout(monkeypatch,tmp_path)
+    for key in ("hymt2","moss-tts","moss-codec"):
+        _local_files(tmp_path,key)
+    snapshots,_,download,_=_fake_hub(tmp_path)
+    monkeypatch.setitem(sys.modules,"huggingface_hub",SimpleNamespace(snapshot_download=download))
+    monkeypatch.setitem(sys.modules,"piper",None)
+    monkeypatch.setattr(setup_local,"_piper_status",lambda *_a,**_k: pytest.fail("MOSS does not depend on Piper files"))
+    report=setup_local.preflight_mac_local("moss",voice_dir=tmp_path/"unused-voices")
+    assert report["ready"] is True
+    assert report["voice_dir"] is None
+    assert report["piper"] == {"ready":True,"required":False}
+    # Only the existing Hub-cache Parakeet model uses HF's cache resolver;
+    # it is explicitly local-only, so even this call cannot use the network.
+    parakeet=setup_local.LOCAL_MODEL_MANIFEST["parakeet"]
+    assert snapshots == [{"repo_id":parakeet.repo_id,"revision":parakeet.revision,"local_files_only":True}]
+    assert "Piper не требуется" in setup_local.format_setup_report(report)
+    assert not (tmp_path/"unused-voices").exists()

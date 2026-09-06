@@ -1,0 +1,38 @@
+{
+  "browser": "Chromium via Playwright MCP",
+  "browser_plugin": "not available; Playwright MCP used",
+  "neutral_fixture": true,
+  "production_unchanged": true,
+  "routes_tested": [
+    "Free",
+    "GPT",
+    "ElevenLabs"
+  ],
+  "persisted_pairs": {
+    "piper": [
+      "ru_RU-dmitri-medium",
+      "ru_RU-irina-medium"
+    ],
+    "moss-onnx": [
+      "Nathan",
+      "Ava"
+    ],
+    "openai": [
+      "onyx",
+      "nova"
+    ],
+    "elevenlabs": [
+      "ErXwobaYiN019PkySvjV",
+      "EXAVITQu4vr4xnSDxMaL"
+    ]
+  },
+  "settings_http": 200,
+  "role_preview_mocked_no_quota": true,
+  "f5_sample_upload_http": 201,
+  "f5_sample_settings_http": 200,
+  "profile_pair_restore": true,
+  "language_pair_isolation": true,
+  "mobile_width": 390,
+  "mobile_overflow": false,
+  "console": "No application JS exceptions; favicon 405 is a preexisting missing icon endpoint; transient polling disconnects occurred only during intentional fixture restart."
+}

@@ -21,13 +21,16 @@ from __future__ import annotations
 import asyncio
 import gc
 import logging
+import secrets
 import sys
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from uvt.config import configured_role_voice
 from uvt.interfaces import TTSEngine, VoiceReference
 from uvt.registry import register
 
@@ -39,12 +42,43 @@ _MIN_SLOT_S = 0.35     # короче слота фиксация длитель
 _MIN_REF_S = 0.5
 
 
+@lru_cache(maxsize=1)
+def check_f5_audio_runtime() -> None:
+    """Exercise F5's real reference decoder once, before expensive work.
+
+    A working FFmpeg executable does not prove that native TorchCodec can
+    load its libraries in this process. No model or network is needed here.
+    Only successful checks are cached; transient failures remain retryable.
+    """
+    import wave
+
+    try:
+        import torchaudio
+
+        with tempfile.TemporaryDirectory(prefix="uvt-f5-decoder-") as directory:
+            path = Path(directory) / "probe.wav"
+            with wave.open(str(path), "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(_OUTPUT_RATE)
+                wav.writeframes(bytes(480 * 2))
+            torchaudio.load(str(path))
+    except Exception as exc:
+        raise RuntimeError(
+            "F5-TTS не может прочитать образец голоса (TorchCodec/FFmpeg). "
+            "Остановите UVT и откройте «Запустить UVT.command». "
+            "Если ошибка повторится, проверьте совместимость torch, torchaudio, "
+            "torchcodec и FFmpeg; устанавливать все версии FFmpeg не нужно."
+        ) from exc
+
+
 @register("tts", "f5")
 class F5TTSEngine(TTSEngine):
     supports_duration = True
     supports_reference = True
 
     async def warmup(self) -> None:
+        await asyncio.to_thread(check_f5_audio_runtime)
         try:
             from f5_tts.api import F5TTS  # noqa: F401 — падаем до старта задачи
         except ImportError as exc:
@@ -68,6 +102,8 @@ class F5TTSEngine(TTSEngine):
         self._min_slot_s = float(getattr(self.cfg, "min_slot_s", _MIN_SLOT_S) or _MIN_SLOT_S)
         seed = getattr(self.cfg, "seed", None)
         self._seed = int(seed) if seed is not None else None
+        if self._seed is not None and not 0 <= self._seed <= 0xFFFFFFFF:
+            raise RuntimeError("F5-TTS: seed должен быть целым числом от 0 до 4294967295")
         self._device = self._resolve_device()
 
         # Статический образец на случай, когда в ролике не нашлось чистого
@@ -201,6 +237,14 @@ class F5TTSEngine(TTSEngine):
     def _resolve_reference(
         self, reference: VoiceReference | None
     ) -> tuple[Path, str, float]:
+        selected = (str(getattr(self.cfg, "voice_id", "") or "").strip()
+                    or configured_role_voice(self.cfg))
+        if selected:
+            import soundfile as sf
+            from uvt.voice_references import resolve_reference
+
+            path, text = resolve_reference(selected)
+            return path, text, float(sf.info(str(path)).duration)
         if reference is not None:
             return self._store_reference(reference)
         if self._fallback_ref is not None:
@@ -259,7 +303,9 @@ class F5TTSEngine(TTSEngine):
                 speed=rate,
                 fix_duration=fix_duration,
                 remove_silence=False,
-                seed=self._seed,
+                # F5 uses sys.maxsize for its default random seed, then exports
+                # it as PYTHONHASHSEED. Child Python only accepts 32-bit seeds.
+                seed=self._seed if self._seed is not None else secrets.randbits(32),
             )
             samples = np.asarray(wav, dtype=np.float32).reshape(-1)
             return samples, int(sample_rate)

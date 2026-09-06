@@ -1,0 +1,43 @@
+{
+  "warmup_s": 8.661,
+  "runs": [
+    {
+      "target": "ru",
+      "seconds": 5.1,
+      "source": [
+        "The train leaves in twenty minutes. Please do not be late.",
+        "I did not say that the meeting was cancelled.",
+        "Have you seen my keys?",
+        "They are on the table, next to the blue cup."
+      ],
+      "translations": [
+        "Поезд отправляется через двадцать минут. Пожалуйста, не опаздьте.",
+        "Я не говорил, что встреча отменена.",
+        "Ты видел мои ключи?",
+        "Они лежат на столе, рядом с синей чашкой."
+      ]
+    },
+    {
+      "target": "uk",
+      "seconds": 3.416,
+      "source": [
+        "The train leaves in twenty minutes. Please do not be late.",
+        "I did not say that the meeting was cancelled.",
+        "Have you seen my keys?",
+        "They are on the table, next to the blue cup."
+      ],
+      "translations": [
+        "Поїзд виїжджає через двадцять хвилин. Будь ласка, не запізнюйтеся.",
+        "Я не казав, що зустріч скасована.",
+        "Ти бачила мої ключі?",
+        "Вони на столі, поруч з синім чашкою."
+      ]
+    }
+  ],
+  "live": {
+    "seconds": 0.807,
+    "source": "Thank you, I found them.",
+    "translation": "Спасибо, я нашла их."
+  },
+  "mlx_peak_bytes": 1458470012
+}

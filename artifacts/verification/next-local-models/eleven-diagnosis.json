@@ -1,0 +1,69 @@
+{
+  "settings": {
+    "tts_model": "eleven_turbo_v2_5",
+    "tts_voice": "auto",
+    "voice_gender": "auto"
+  },
+  "requests": [
+    {
+      "endpoint": "subscription",
+      "http": 401,
+      "status": "missing_permissions",
+      "message": "The API key you used is missing the permission user_read to execute this operation."
+    },
+    {
+      "endpoint": "voice",
+      "voice_id": "21m00Tcm4TlvDq8ikWAM",
+      "http": 200,
+      "detail": null,
+      "name": "Janet",
+      "category": "professional",
+      "is_owner": null,
+      "is_legacy": false,
+      "is_available_for_tiers": null,
+      "high_quality_base_model_ids": [
+        "eleven_turbo_v2_5",
+        "eleven_v2_5_flash",
+        "eleven_flash_v2_5",
+        "eleven_turbo_v2",
+        "eleven_v2_flash",
+        "eleven_flash_v2",
+        "eleven_multilingual_v2"
+      ],
+      "sharing": {
+        "status": "copied",
+        "free_users_allowed": true,
+        "disable_at_unix": null,
+        "available_for_tiers": null,
+        "voice_mixing_allowed": false,
+        "financial_rewards_enabled": true,
+        "rate": 1.0
+      }
+    },
+    {
+      "endpoint": "voice",
+      "voice_id": "ErXwobaYiN019PkySvjV",
+      "http": 200,
+      "detail": null,
+      "name": "Adam - Dominant, Firm",
+      "category": "premade",
+      "is_owner": null,
+      "is_legacy": false,
+      "is_available_for_tiers": null,
+      "high_quality_base_model_ids": [],
+      "sharing": {
+        "status": null,
+        "free_users_allowed": null,
+        "disable_at_unix": null,
+        "available_for_tiers": null,
+        "voice_mixing_allowed": null,
+        "financial_rewards_enabled": null,
+        "rate": null
+      }
+    }
+  ],
+  "resolved_voices": [
+    "21m00Tcm4TlvDq8ikWAM",
+    "ErXwobaYiN019PkySvjV"
+  ]
+}

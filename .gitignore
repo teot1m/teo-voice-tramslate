@@ -26,3 +26,7 @@ models/
 
 # Секреты
 .env
+
+.models/
+
+.uvt-cache/

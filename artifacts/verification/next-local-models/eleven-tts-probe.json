@@ -1,0 +1,16 @@
+[
+  {
+    "voice_id": "21m00Tcm4TlvDq8ikWAM",
+    "model": "eleven_turbo_v2_5",
+    "http": 402,
+    "status": "payment_required",
+    "message": "Free users cannot use library voices via the API. Please upgrade your subscription to use this voice."
+  },
+  {
+    "voice_id": "ErXwobaYiN019PkySvjV",
+    "model": "eleven_turbo_v2_5",
+    "http": 200,
+    "bytes": 18016,
+    "content_type": "audio/mpeg"
+  }
+]

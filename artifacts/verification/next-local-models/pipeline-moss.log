@@ -1,0 +1,46 @@
+UVT: совместимая библиотека FFmpeg подключена только для этого запуска.
+[16:49:26] DEBUG    asyncio: Using selector: KqueueSelector                     
+           INFO     uvt.dub: декодирую source-en.wav…                           
+           INFO     uvt.dub: декодирование завершено за 0.1 с                   
+           INFO     uvt.stt.parakeet-mlx: parakeet-mlx: loading model           
+                    mlx-community/parakeet-tdt-0.6b-v3...                       
+[16:49:28] INFO     uvt.stt.parakeet-mlx: parakeet-mlx: model ready:            
+                    /Users/teotim/.cache/huggingface/hub/models--mlx-community--
+                    parakeet-tdt-0.6b-v3/snapshots/ed2b7e8c15f9aaa0b5772e2efb986
+                    255eaef7e15 (GPU Apple Silicon)                             
+[16:49:29] INFO     uvt.dub: пакетное распознавание: 5 фрагментов → 5 реплик    
+           INFO     uvt.dub: распознавание завершено за 3.4 с                   
+           INFO     uvt.diarize: говорящих найдено 2 (speaker-1: female, 1      
+                    реплик, speaker-2: female, 4 реплик)                        
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='dynamic': {'mscale_all_dim', 'beta_fast', 'alpha', 'mscale', 'beta_slow'}
+[16:49:36] INFO     uvt.translate.mlx_chat: mlx-chat: модель загружена: hymt2   
+[transformers] Ignoring clean_up_tokenization_spaces=True for BPE tokenizer TokenizersBackend. The clean_up_tokenization post-processing step is designed for WordPiece tokenizers and is destructive for BPE (it strips spaces before punctuation). Set clean_up_tokenization_spaces=False to suppress this warning, or set clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output=True to force cleanup anyway.
+[16:49:39] INFO     uvt.dub: перевод: 4/5 реплик                                
+[16:49:40] INFO     uvt.dub: перевод: 5/5 реплик                                
+           INFO     uvt.dub: перевод завершён за 11.2 с                         
+           INFO     uvt.dub: [@    0.0 с] Good morning. ⇒ Доброе утро.          
+           INFO     uvt.dub: [@    0.8 с] Our project meeting starts at 10:15   
+                    tomorrow. ⇒ Завтра в 10:15 начнется наша совещание по       
+                    проекту.                                                    
+           INFO     uvt.dub: [@    3.8 с] Please bring the updated budget and a 
+                    short list of risks. ⇒ Пожалуйста, принесите обновленный    
+                    бюджет и краткий список рисков.                             
+           INFO     uvt.dub: [@    7.0 с] We will compare two options and choose
+                    the next steps before lunch. ⇒ Мы сравним два варианта и    
+                    выберем следующие шаги перед обедом.                        
+           INFO     uvt.dub: [@   10.8 с] Do not send the draft to customers    
+                    until it is approved. ⇒ Не отправляйте черновик клиентам,   
+                    пока он не будет одобрен.                                   
+           INFO     uvt.voices: образец голоса 'speaker-2': 3.0 с из оригинала  
+           INFO     uvt.voices: без чистого образца остались: speaker-1 — озвучу
+                    голосом движка                                              
+[16:49:44] INFO     uvt.tts.moss: MOSS-TTS-Nano: CPU ONNX готов, 48000 Гц, 4    
+                    потоков                                                     
+           INFO     uvt.dub: голоса клонируются из оригинала: 1 образцов        
+[16:50:01] INFO     uvt.dub: 4 реплик подогнаны atempo под тайминги             
+[16:50:02] INFO     uvt.dub: озвучка завершена за 21.2 с                        
+           INFO     uvt.dub: собираю дорожку (5 реплик, режим микс)…            
+           INFO     uvt.dub: дорожка подготовлена за 36.1 с                     
+           INFO     uvt.dub: готово:                                            
+                    artifacts/verification/next-local-models/pipeline-moss-ru.wa
+                    v (+ .srt, .json)                                           

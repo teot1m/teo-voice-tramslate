@@ -1,0 +1,69 @@
+# Live phrase-by-phrase EN -> RU on Apple M4 / 16 GB.
+# Uses the already prepared fast preset: no new model download during a call.
+# Select input (microphone/BlackHole) and headphones in the desktop Live UI.
+# NLLB + Piper prioritize speed; this profile does not clone the speaker.
+# Keep complete queued phrases until their deadline instead of replacing
+# every queued phrase with the latest. Late phrases can still be dropped.
+# 0.25 s is a scheduling offset, NOT measured end-to-end model latency.
+mode: voiceover
+source_lang: en
+target_lang: ru
+vad:
+  engine: silero
+  min_silence_ms: 320
+  pre_roll_ms: 160
+  max_segment_s: 4.0
+stt:
+  engine: parakeet-mlx
+  model: mlx-community/parakeet-tdt-0.6b-v3
+  revision: ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15
+  allow_download: false
+  chunk_seconds: 90
+  overlap_seconds: 15
+  concurrency: 1
+translation:
+  engine: nllb-ct2
+  model: OpenNMT/nllb-200-distilled-1.3B-ct2-int8
+  revision: 70f572adafa4794890ce7826156a4209717855af
+  allow_download: false
+  compute_type: int8
+  threads: 4
+  batch_size: 1
+  concurrency: 1
+  beam_size: 1
+  max_decoding_length: 128
+  context_pairs: 0
+tts:
+  engine: piper
+  voice_dir: ~/.local/share/uvt/piper
+  voice_models:
+    uk:male: uk_UA-mykyta-high.onnx
+    uk:female: uk_UA-tetiana-high.onnx
+    ru:male: ru_RU-dmitri-medium.onnx
+    ru:female: ru_RU-irina-medium.onnx
+  duration_per_char:
+    uk:male: 0.082
+    uk:female: 0.065
+    ru:male: 0.055
+    ru:female: 0.067
+  concurrency: 1
+latency:
+  preset: ultra
+history:
+  enabled: true
+capture:
+  backend: sounddevice
+  device: null
+separation:
+  enabled: false
+output:
+  backend: sounddevice
+  device: null
+  sample_rate: 24000
+  target_delay_s: 0.25
+  max_backlog_s: 6.0
+  latest_wins: false
+overlay:
+  enabled: true
+  show: translation
+  position: top

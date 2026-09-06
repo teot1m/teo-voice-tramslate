@@ -11,6 +11,7 @@ import re
 import numpy as np
 
 from uvt.audio import decode_bytes
+from uvt.config import configured_role_voice
 from uvt.interfaces import TTSEngine
 from uvt.registry import register
 
@@ -53,8 +54,11 @@ class EdgeTTS(TTSEngine):
         import edge_tts  # noqa: F401 — ранняя проверка зависимости
 
     def _voice(self, language: str) -> str:
-        if self.cfg.voice and self.cfg.voice != "auto":
+        if self.cfg.voice and self.cfg.voice not in {"auto", "cloud"}:
             return self.cfg.voice
+        selected = configured_role_voice(self.cfg)
+        if selected:
+            return selected
         lang = language.split("-")[0].lower()
         gender = str(getattr(self.cfg, "voice_gender", "male") or "male").lower()
         table = FEMALE_VOICES if gender.startswith(("f", "ж")) else DEFAULT_VOICES

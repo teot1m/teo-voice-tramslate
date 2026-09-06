@@ -1,0 +1,51 @@
+{
+  "model": "mlx-community/Hy-MT2-1.8B-4bit",
+  "profile": "local-hymt",
+  "offline": true,
+  "file_context_lines": 3,
+  "source_language": "en",
+  "target_language": "ru",
+  "source": [
+    "Have you found them?",
+    "Yes, I put them in my bag.",
+    "Good. Please bring the bag to the car."
+  ],
+  "genders": [
+    "male",
+    "female",
+    "male"
+  ],
+  "before": [
+    [
+      "I left the keys beside the blue cup.",
+      "female"
+    ]
+  ],
+  "after": [
+    [
+      "We can leave as soon as we have the keys.",
+      "male"
+    ]
+  ],
+  "warmup_seconds": 8.788,
+  "with_context": [
+    "Вы нашли их?",
+    "Да, я положила их в свою сумку.",
+    "Хорошо. Пожалуйста, принесите сумку в машину."
+  ],
+  "context_seconds": 2.495,
+  "native_prompts": [
+    "Context (for understanding only; do not translate it):\n[Before; speaker female] I left the keys beside the blue cup.\n[After; speaker female] Yes, I put them in my bag.\n[After; speaker male] Good. Please bring the bag to the car.\n[After; speaker male] We can leave as soon as we have the keys.\n\nTranslation preferences:\nThe speaker is male; use masculine forms where needed.\nForm of address to the listener: ты.\n\nTranslate into Russian. Note you should only output translated result without any explanation:\n\nHave you found them?",
+    "Context (for understanding only; do not translate it):\n[Before; speaker female] I left the keys beside the blue cup.\n[Before; speaker male] Have you found them?\n[After; speaker male] Good. Please bring the bag to the car.\n[After; speaker male] We can leave as soon as we have the keys.\n\nTranslation preferences:\nThe speaker is female; use feminine forms where needed.\nForm of address to the listener: ты.\n\nTranslate into Russian. Note you should only output translated result without any explanation:\n\nYes, I put them in my bag.",
+    "Context (for understanding only; do not translate it):\n[Before; speaker female] I left the keys beside the blue cup.\n[Before; speaker male] Have you found them?\n[Before; speaker female] Yes, I put them in my bag.\n[After; speaker male] We can leave as soon as we have the keys.\n\nTranslation preferences:\nThe speaker is male; use masculine forms where needed.\nForm of address to the listener: ты.\n\nTranslate into Russian. Note you should only output translated result without any explanation:\n\nGood. Please bring the bag to the car."
+  ],
+  "without_external_context": [
+    "Вы нашли их?",
+    "Да, я положила их в свою сумку.",
+    "Хорошо. Пожалуйста, принесите сумку в машину."
+  ],
+  "without_external_context_seconds": 1.975,
+  "peak_mlx_bytes": 1487747529,
+  "output_count": 3,
+  "model_closed": true
+}

@@ -51,7 +51,12 @@ _LEGACY_LIVE_MODES = {"replace", "dual"}
 _PROFILE_OVERVIEW = (
     ("local", "private local: Whisper + Ollama + Piper; модели и Piper нужно настроить"),
     ("local-fast", "Apple Silicon: Parakeet + NLLB INT8 + Piper; максимум скорости"),
+    ("local-dialogue", "живые фразы на Mac: Parakeet + NLLB + Piper; выберите вход и наушники в GUI"),
+    ("local-meeting", "локальные субтитры звонка: Parakeet + TranslateGemma, без озвучки"),
     ("local-balanced", "M4/16 ГБ: Parakeet + TranslateGemma 4-bit + Piper"),
+    ("local-hymt", "Hy-MT2 · быстрый перевод + Piper"),
+    ("local-moss", "Hy-MT2 + MOSS · живые голоса на CPU"),
+    ("local-nemotron", "Nemotron + Hy-MT2 + Piper · новые локальные модели"),
     ("local-quality", "Apple Silicon: chunked Whisper large + TranslateGemma + Piper"),
     ("local-natural", "живые голоса: Demucs + Parakeet + Qwen3 с контекстом + F5 с клонированием"),
     ("free", "без платных API: локальные STT/перевод + Microsoft Edge TTS через сеть"),
@@ -148,7 +153,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     setup_local.add_argument(
         "--preset",
-        choices=("fast", "balanced", "quality", "natural", "all"),
+        choices=("fast", "balanced", "quality", "natural", "hymt", "moss", "nemotron", "all"),
         default="balanced",
         help="набор моделей (по умолчанию balanced для M4/16 ГБ)",
     )
@@ -253,10 +258,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command in {"dub", "serve", "serve-personal", "gui"}:
-        from uvt.media_runtime import MediaRuntimeError, ensure_media_runtime
+        from uvt.media_runtime import MediaRuntimeError, prepare_media_runtime_for_cli
 
         try:
-            ensure_media_runtime()
+            prepare_media_runtime_for_cli(argv)
         except MediaRuntimeError as exc:
             print(f"Ошибка аудио: {exc}", file=sys.stderr)
             return 1
@@ -309,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
         except ImportError:
             print('серверу нужен aiohttp — установите: pip install "uvt[server]"', file=sys.stderr)
             return 1
-        from uvt.server import run_server
+        from uvt.server import ServerBindError, run_server
         from uvt.server_settings import ServerSettingsStore, route_key
 
         try:
@@ -326,6 +331,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         except KeyboardInterrupt:
             pass
+        except ServerBindError as exc:
+            print(f"Не удалось запустить UVT: {exc}", file=sys.stderr)
+            return 1
         return 0
 
     if args.command == "serve-personal":
@@ -334,7 +342,7 @@ def main(argv: list[str] | None = None) -> int:
         except ImportError:
             print('серверу нужен aiohttp — установите: pip install "uvt[server]"', file=sys.stderr)
             return 1
-        from uvt.server import run_personal_servers
+        from uvt.server import ServerBindError, run_personal_servers
 
         try:
             asyncio.run(
@@ -349,6 +357,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         except KeyboardInterrupt:
             pass
+        except ServerBindError as exc:
+            print(f"Не удалось запустить UVT: {exc}", file=sys.stderr)
+            return 1
         return 0
 
     if args.command == "gui":

@@ -183,6 +183,13 @@ class OpenAICompatibleTranslator(TranslationEngine):
         """Пачка пронумерованных реплик одним запросом: быстрее в ~20 раз и
         качественнее — модель видит соседние реплики как контекст. Теги [M]/[F]
         подсказывают род говорящего («я готова», а не «я готов»)."""
+        return await self.translate_batch_contextual(texts, source_lang, target_lang, genders)
+
+    async def translate_batch_contextual(
+        self, texts: Sequence[str], source_lang: str | None, target_lang: str,
+        genders: Sequence[str] | None, *,
+        before: Sequence[tuple[str, str]] = (), after: Sequence[tuple[str, str]] = (),
+    ) -> list[str]:
         system = self._system_prompt(source_lang or "und", target_lang) + (
             "\n\nYou will receive several numbered lines from one video, in order. "
             "A line may start with a speaker tag [M] (male speaker) or [F] (female "
@@ -199,6 +206,22 @@ class OpenAICompatibleTranslator(TranslationEngine):
             )
         else:
             user = "\n".join(f"{i}. {' '.join(t.split())}" for i, t in enumerate(texts, 1))
+        if before or after:
+            def context_block(label, lines):
+                tagged = []
+                for text, role in lines:
+                    normalized = str(role).lower()
+                    speaker = "F" if normalized.startswith(("f", "ж")) else "M" if normalized.startswith(("m", "м")) else "unknown"
+                    tagged.append(f"[{speaker}] {' '.join(str(text).split())}")
+                return label + " (context only, DO NOT translate or number):\n" + "\n".join(tagged)
+            context = []
+            if before:
+                context.append(context_block("PRECEDING dialogue", before))
+            if after:
+                context.append(context_block("FOLLOWING dialogue", after))
+            user = "\n\n".join(context) + "\n\nCURRENT lines to translate, and only these:\n" + user
+            system += " Use preceding and following context to resolve references and keep names, terminology and form of address consistent. Never include context lines in your answer."
+
         # Большая пачка длинных реплик генерируется долго — таймаут растёт с размером
         timeout = max(float(self.cfg.timeout_s), 20.0 + 8.0 * len(texts))
         response = await self._client.post(
@@ -216,7 +239,7 @@ class OpenAICompatibleTranslator(TranslationEngine):
         response.raise_for_status()
         content = _response_content(response.json())
         parsed = _parse_numbered(content)
-        if _misaligned(texts, parsed):
+        if any(index < 1 or index > len(texts) for index in parsed) or _misaligned(texts, parsed):
             # слабая модель вернула исходные строки со сдвигом нумерации —
             # такой перевод озвучил бы каждую реплику чужим текстом
             raise RuntimeError("модель сбила нумерацию пачки")
@@ -267,6 +290,8 @@ def _parse_numbered(text: str) -> dict[int, str]:
         match = re.match(r"\s*(\d+)\s*[.):\-–—]\s*(.*\S)\s*$", line)
         if match:
             last = int(match.group(1))
+            if last in result:
+                raise RuntimeError("модель повторила нумерацию пачки")
             result[last] = match.group(2)
         elif last is not None and line.strip():
             result[last] += " " + line.strip()

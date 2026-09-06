@@ -157,7 +157,9 @@ def _embedding(samples: np.ndarray, sample_rate: int, f0_hz: float | None) -> np
     zcr = float(np.mean(np.abs(np.diff(np.signbit(x))))) if len(x) > 1 else 0.0
     # F0 получают повышенный вес: это делает два явно разных голоса разными
     # кластерами даже при похожем микрофоне/громкости.
-    f0_feature = 1.5 * (float(f0_hz) / 400.0) if f0_hz else 0.0
+    # Accurate peak interpolation no longer inflates F0. Keep a clear octave
+    # change distinguishable at the default 0.42 clustering threshold.
+    f0_feature = 2.0 * (float(f0_hz) / 400.0) if f0_hz else 0.0
     return np.asarray(
         [f0_feature, centroid / 4000.0, rolloff / 4000.0, min(1.0, zcr * 4.0)],
         dtype=np.float32,

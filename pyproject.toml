@@ -47,6 +47,14 @@ mac-local = [
     "huggingface-hub>=0.25.0",
     "piper-tts>=1.4.0",
 ]
+local-next = [
+  "mlx-audio[stt]==0.5.1; sys_platform == 'darwin'",
+  "miniaudio==1.71",
+  "zstandard==0.25.0",
+  "onnxruntime>=1.27.0",
+  "sentencepiece>=0.2.2",
+  "scipy>=1.10.0",
+]
 vad = ["onnxruntime>=1.17"]
 tts = ["edge-tts>=6.1.9"]
 piper = ["piper-tts>=1.4.0"]

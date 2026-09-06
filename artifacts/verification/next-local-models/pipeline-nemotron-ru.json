@@ -1,0 +1,67 @@
+[
+  {
+    "start": 0.16,
+    "end": 1.2000000000000002,
+    "original": "Good morning.",
+    "translated": "Доброе утро.",
+    "language": "en",
+    "target_lang": "ru",
+    "tts_start": 0.01,
+    "tts_end": 0.8339375,
+    "speaker_id": null,
+    "speaker_confidence": null,
+    "voice_style": "female"
+  },
+  {
+    "start": 1.12,
+    "end": 4.0,
+    "original": "Our project meeting starts at ten fifteen tomorrow.",
+    "translated": "Завтра в десять пятнадцать начнется наша проектная встреча.",
+    "language": "en",
+    "target_lang": "ru",
+    "tts_start": 0.97,
+    "tts_end": 3.87875,
+    "speaker_id": null,
+    "speaker_confidence": null,
+    "voice_style": "female"
+  },
+  {
+    "start": 3.92,
+    "end": 7.28,
+    "original": "Please bring the updated Bajaden a short list of risks.",
+    "translated": "Пожалуйста, принесите обновленный список рисков Bajaden.",
+    "language": "en",
+    "target_lang": "ru",
+    "tts_start": 3.87875,
+    "tts_end": 7.0101875,
+    "speaker_id": null,
+    "speaker_confidence": null,
+    "voice_style": "female"
+  },
+  {
+    "start": 7.2,
+    "end": 11.040000000000001,
+    "original": "We will compare two options and choose the next steps before launch.",
+    "translated": "Мы сравним два варианта и выберем следующие шаги перед запуском.",
+    "language": "en",
+    "target_lang": "ru",
+    "tts_start": 7.05,
+    "tts_end": 10.671541666666666,
+    "speaker_id": null,
+    "speaker_confidence": null,
+    "voice_style": "female"
+  },
+  {
+    "start": 10.96,
+    "end": 13.84,
+    "original": "Do not send the draft to customers until it is approved.",
+    "translated": "Не отправляйте черновик клиентам, пока он не будет одобрен.",
+    "language": "en",
+    "target_lang": "ru",
+    "tts_start": 10.81,
+    "tts_end": 15.094083333333334,
+    "speaker_id": null,
+    "speaker_confidence": null,
+    "voice_style": "female"
+  }
+]

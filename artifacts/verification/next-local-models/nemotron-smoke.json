@@ -1,0 +1,40 @@
+{
+  "model": "Nemotron3.5-0.6B-8bit",
+  "offline": true,
+  "duration": 13.9704375,
+  "warmup_seconds": 6.874745917011751,
+  "transcription_seconds": 1.5883007909869775,
+  "mlx_peak_bytes": 964587176,
+  "spans": [
+    {
+      "start": 0.16,
+      "end": 1.2000000000000002,
+      "text": "Good morning.",
+      "language": "en"
+    },
+    {
+      "start": 1.12,
+      "end": 4.0,
+      "text": "Our project meeting starts at ten fifteen tomorrow.",
+      "language": "en"
+    },
+    {
+      "start": 3.92,
+      "end": 7.28,
+      "text": "Please bring the updated Bajaden a short list of risks.",
+      "language": "en"
+    },
+    {
+      "start": 7.2,
+      "end": 11.040000000000001,
+      "text": "We will compare two options and choose the next steps before launch.",
+      "language": "en"
+    },
+    {
+      "start": 10.96,
+      "end": 13.84,
+      "text": "Do not send the draft to customers until it is approved.",
+      "language": "en"
+    }
+  ]
+}

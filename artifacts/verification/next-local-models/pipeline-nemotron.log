@@ -1,0 +1,77 @@
+UVT: совместимая библиотека FFmpeg подключена только для этого запуска.
+[16:51:00] DEBUG    asyncio: Using selector: KqueueSelector                     
+           INFO     uvt.dub: декодирую source-en.wav…                           
+           INFO     uvt.dub: декодирование завершено за 0.1 с                   
+[16:51:01] INFO     uvt.stt.nemotron-mlx: Nemotron MLX: загружаю локальную      
+                    модель…                                                     
+[16:51:07] INFO     uvt.stt.nemotron-mlx: Nemotron MLX: модель готова           
+[16:51:09] INFO     uvt.dub: пакетное распознавание: 5 фрагментов → 5 реплик    
+           INFO     uvt.dub: распознавание завершено за 8.8 с                   
+           INFO     uvt.diarize: говорящих найдено 2 (speaker-1: female, 1      
+                    реплик, speaker-2: female, 4 реплик)                        
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='dynamic': {'alpha', 'beta_fast', 'mscale_all_dim', 'beta_slow', 'mscale'}
+[16:51:11] INFO     uvt.translate.mlx_chat: mlx-chat: модель загружена: hymt2   
+[transformers] Ignoring clean_up_tokenization_spaces=True for BPE tokenizer TokenizersBackend. The clean_up_tokenization post-processing step is designed for WordPiece tokenizers and is destructive for BPE (it strips spaces before punctuation). Set clean_up_tokenization_spaces=False to suppress this warning, or set clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output=True to force cleanup anyway.
+[16:51:13] INFO     uvt.dub: перевод: 4/5 реплик                                
+[16:51:14] INFO     uvt.dub: перевод: 5/5 реплик                                
+           INFO     uvt.dub: перевод завершён за 4.9 с                          
+           INFO     uvt.dub: [@    0.2 с] Good morning. ⇒ Доброе утро.          
+           INFO     uvt.dub: [@    1.1 с] Our project meeting starts at ten     
+                    fifteen tomorrow. ⇒ Завтра в десять пятнадцать начнется наша
+                    проектная встреча.                                          
+           INFO     uvt.dub: [@    3.9 с] Please bring the updated Bajaden a    
+                    short list of risks. ⇒ Пожалуйста, принесите обновленный    
+                    список рисков Bajaden.                                      
+           INFO     uvt.dub: [@    7.2 с] We will compare two options and choose
+                    the next steps before launch. ⇒ Мы сравним два варианта и   
+                    выберем следующие шаги перед запуском.                      
+           INFO     uvt.dub: [@   11.0 с] Do not send the draft to customers    
+                    until it is approved. ⇒ Не отправляйте черновик клиентам,   
+                    пока он не будет одобрен.                                   
+           INFO     uvt.dub: сразу ускоряю 3 реплик по длительности выбранного  
+                    голоса                                                      
+           DEBUG    piper.voice: Guessing voice config path:                    
+                    /Users/teotim/.local/share/uvt/piper/ru_RU-irina-medium.onnx
+                    .json                                                       
+[16:51:15] DEBUG    piper.voice: text=Доброе утро., phonemes=[['d', 'ˈ', 'o',   
+                    'b', 'r', 'ʌ', 'j', 'ɪ', ' ', 'ˈ', 'u', 't', 'r', 'ʌ', '.']]
+           DEBUG    piper.voice: text=Завтра в десять пятнадцать начнется наша  
+                    проектная встреча., phonemes=[['z', 'ˈ', 'ɑ', 'f', 't', 'r',
+                    'a', ' ', 'v', ' ', 'd', 'ʲ', 'ˈ', 'e', 's', 'ʲ', 'ʌ', 't', 
+                    'ʲ', ' ', 'p', 'ʲ', 'a', 't', 'n', 'ˈ', 'ɑ', 't', 't', 's', 
+                    'ʌ', 't', 'ʲ', ' ', 'n', 'a', 't', 'ʃ', 'ʲ', 'n', 'ʲ', 'ˈ', 
+                    'e', 't', 's', 'ʌ', ' ', 'n', 'ˈ', 'ɑ', 'ʃ', 'a', ' ', 'p', 
+                    'r', 'ʌ', 'ˈ', 'ɛ', 'k', 't', 'n', 'ʌ', 'j', 'a', ' ', 'f', 
+                    's', 't', 'r', 'ʲ', 'ˈ', 'e', 't', 'ʃ', 'ʲ', 'ʌ', '.']]     
+           DEBUG    piper.voice: text=Пожалуйста, принесите обновленный список  
+                    рисков Bajaden., phonemes=[['p', 'ʌ', 'ʒ', 'ˈ', 'ɑ', 'ɭ',   
+                    'u', 's', 't', 'a', ',', ' ', 'p', 'r', 'ʲ', 'i', 'n', 'ʲ', 
+                    'i', 's', 'ʲ', 'ˈ', 'i', 't', 'ʲ', 'i', ' ', 'ʌ', 'b', 'n', 
+                    'ʌ', 'v', 'ɭ', 'ʲ', 'ˈ', 'e', 'n', 'n', 'y', 'j', ' ', 's', 
+                    'p', 'ʲ', 'ˈ', 'i', 's', 'ʌ', 'k', ' ', 'r', 'ʲ', 'ˈ', 'i', 
+                    's', 'k', 'ʌ', 'f', ' ', 'b', 'ˈ', 'a', 'd', 'ʒ', 'a', 'd', 
+                    'ə', 'n', '.']]                                             
+           DEBUG    piper.voice: text=Мы сравним два варианта и выберем         
+                    следующие шаги перед запуском., phonemes=[['m', 'ˈ', 'y', ' 
+                    ', 's', 'r', 'a', 'v', 'n', 'ʲ', 'ˈ', 'i', 'm', ' ', 'd',   
+                    'v', 'ˈ', 'ɑ', ' ', 'v', 'ʌ', 'r', 'ʲ', 'i', 'ˈ', 'ɑ', 'n', 
+                    't', 'a', ' ', 'ɪ', ' ', 'v', 'ˈ', 'y', 'b', 'ʲ', 'i', 'r', 
+                    'ʲ', 'i', 'm', ' ', 's', 'ɭ', 'ʲ', 'ˈ', 'e', 'd', 'u', 'j', 
+                    'u', 'ɕ', 'i', 'j', 'ɪ', ' ', 'ʃ', 'a', 'ɡ', 'ʲ', 'ˈ', 'ɪ', 
+                    ' ', 'p', 'ʲ', 'i', 'r', 'ʲ', 'ˈ', 'e', 't', ' ', 'z', 'ˈ', 
+                    'ɑ', 'p', 'u', 's', 'k', 'ʌ', 'm', '.']]                    
+           DEBUG    piper.voice: text=Не отправляйте черновик клиентам, пока он 
+                    не будет одобрен., phonemes=[['n', 'ʲ', 'ɪ', ' ', 'ʌ', 't', 
+                    'p', 'r', 'a', 'v', 'ɭ', 'ʲ', 'ˈ', 'ɑ', 'j', 't', 'ʲ', 'i', 
+                    ' ', 't', 'ʃ', 'ʲ', 'i', 'r', 'n', 'ʌ', 'v', 'ʲ', 'ˈ', 'i', 
+                    'k', ' ', 'k', 'ɭ', 'ʲ', 'i', 'j', 'ˈ', 'e', 'n', 't', 'ʌ', 
+                    'm', ',', ' ', 'p', 'ʌ', 'k', 'ˈ', 'ɑ', ' ', 'ˈ', 'o', 'n', 
+                    ' ', 'n', 'ʲ', 'ɪ', ' ', 'b', 'ˌ', 'u', 'd', 'ʲ', 'i', 't', 
+                    ' ', 'ʌ', 'd', 'ˈ', 'o', 'b', 'r', 'ʲ', 'i', 'n', '.']]     
+[16:51:16] INFO     uvt.dub: 4 реплик подогнаны atempo под тайминги             
+           INFO     uvt.dub: озвучка завершена за 1.6 с                         
+           INFO     uvt.dub: собираю дорожку (5 реплик, режим микс)…            
+           INFO     uvt.dub: дорожка подготовлена за 15.5 с                     
+           INFO     uvt.dub: готово:                                            
+                    artifacts/verification/next-local-models/pipeline-nemotron-r
+                    u.wav (+ .srt, .json)                                       

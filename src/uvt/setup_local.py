@@ -32,6 +32,7 @@ class HuggingFaceModelSpec:
     # Репозитории с несколькими чекпойнтами качаются точечно: полный snapshot
     # весов F5 — это десятки гигабайт вместо нужной пары файлов.
     allow_patterns: tuple[str, ...] = ()
+    local_dir: str | None = None
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class LocalSetupPreset:
     model_keys: tuple[str, ...]
     stt_key: str
     translation_key: str
+    requires_piper: bool = True
 
 
 PARAKEET_REPO = "mlx-community/parakeet-tdt-0.6b-v3"
@@ -155,6 +157,40 @@ LOCAL_MODEL_MANIFEST: dict[str, HuggingFaceModelSpec] = {
     ),
 }
 
+# New optional runtimes keep their pinned files inside this checkout.
+LOCAL_MODEL_MANIFEST.update({
+    "hymt2": HuggingFaceModelSpec(
+        key="hymt2", role="translation", repo_id="mlx-community/Hy-MT2-1.8B-4bit",
+        revision="e5c6fe56c7b3bc77fae5ae92db31f2178f1e6912", local_dir=".models/hymt2",
+        required_files=("config.json", "model.safetensors", "model.safetensors.index.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"),
+        allow_patterns=("*.json", "*.safetensors", "*.jinja", "LICENSE.txt"),
+    ),
+    "nemotron": HuggingFaceModelSpec(
+        key="nemotron", role="stt", repo_id="mlx-community/nemotron-3.5-asr-streaming-0.6b-8bit",
+        revision="7279359e4481b5e9e185a318bd618e429c6d86cd", local_dir=".models/nemotron",
+        required_files=("config.json", "model.safetensors", "tokenizer.model", "vocab.txt"),
+        allow_patterns=("config.json", "model.safetensors", "tokenizer.model", "vocab.txt", "README.md"),
+    ),
+    "moss-tts": HuggingFaceModelSpec(
+        key="moss-tts", role="tts", repo_id="OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX",
+        revision="f52645cb467506d8e18e746ddd59482685b74e58", local_dir=".models/moss-tts",
+        required_files=("browser_poc_manifest.json", "tts_browser_onnx_meta.json", "tokenizer.model",
+            "moss_tts_prefill.onnx", "moss_tts_decode_step.onnx", "moss_tts_global_shared.data",
+            "moss_tts_local_decoder.onnx", "moss_tts_local_cached_step.onnx",
+            "moss_tts_local_fixed_sampled_frame.onnx", "moss_tts_local_shared.data"),
+        allow_patterns=("*.json", "tokenizer.model", "*.onnx", "*.data", "LICENSE*", "README.md"),
+    ),
+    "moss-codec": HuggingFaceModelSpec(
+        key="moss-codec", role="codec", repo_id="OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ONNX",
+        revision="ceff0d0749bfb3fa2d61149794ec6feef0d1e1ae", local_dir=".models/moss-codec",
+        required_files=("codec_browser_onnx_meta.json", "moss_audio_tokenizer_encode.onnx",
+            "moss_audio_tokenizer_encode.data", "moss_audio_tokenizer_decode_full.onnx",
+            "moss_audio_tokenizer_decode_step.onnx", "moss_audio_tokenizer_decode_shared.data"),
+        allow_patterns=("*.json", "*.onnx", "*.data", "LICENSE*", "README.md"),
+    ),
+})
+
+
 LOCAL_SETUP_PRESETS: dict[str, LocalSetupPreset] = {
     "fast": LocalSetupPreset(
         name="fast",
@@ -180,6 +216,9 @@ LOCAL_SETUP_PRESETS: dict[str, LocalSetupPreset] = {
         stt_key="parakeet",
         translation_key="qwen3-chat",
     ),
+    "hymt": LocalSetupPreset("hymt", ("parakeet", "hymt2"), "parakeet", "hymt2"),
+    "moss": LocalSetupPreset("moss", ("parakeet", "hymt2", "moss-tts", "moss-codec"), "parakeet", "hymt2", requires_piper=False),
+    "nemotron": LocalSetupPreset("nemotron", ("nemotron", "hymt2"), "nemotron", "hymt2"),
     "all": LocalSetupPreset(
         name="all",
         model_keys=(
@@ -189,6 +228,7 @@ LOCAL_SETUP_PRESETS: dict[str, LocalSetupPreset] = {
             "whisper",
             "qwen3-chat",
             "f5-ru",
+            "hymt2", "nemotron", "moss-tts", "moss-codec",
         ),
         stt_key="whisper",
         translation_key="translategemma",
@@ -205,6 +245,12 @@ def preset_for_profile(cfg: Any) -> str | None:
         ),
     )
     tts_engine = str(getattr(getattr(cfg, "tts", None), "engine", "") or "")
+    if tts_engine == "moss-onnx":
+        return "moss"
+    if pair == ("nemotron-mlx", "hymt-mlx"):
+        return "nemotron"
+    if pair == ("parakeet-mlx", "hymt-mlx"):
+        return "hymt"
     if tts_engine == "f5":
         # Клонирующая озвучка требует собственных весов, поэтому маршрут
         # опознаётся по ней, а не только по паре STT+перевод.
@@ -231,14 +277,26 @@ def _validate_snapshot(spec: HuggingFaceModelSpec, path: Path) -> None:
     if not path.is_dir():
         raise RuntimeError(f"{spec.repo_id}: Hub вернул не-каталог {path}")
     # snapshot_download without local_dir returns .../snapshots/<commit>.
-    if spec.revision not in path.parts:
+    if spec.local_dir:
+        for filename in spec.required_files:
+            metadata = path / ".cache/huggingface/download" / (filename + ".metadata")
+            try:
+                downloaded_revision = metadata.read_text(encoding="utf-8").splitlines()[0]
+            except (OSError, IndexError) as exc:
+                raise RuntimeError(f"{spec.repo_id}: нет подтверждения ревизии для {filename}; повторите setup") from exc
+            if downloaded_revision != spec.revision:
+                raise RuntimeError(f"{spec.repo_id}: неверная ревизия {filename}; повторите setup")
+    elif spec.revision not in path.parts:
         raise RuntimeError(
             f"{spec.repo_id}: ожидался snapshot {spec.revision}, получен {path}"
         )
-    missing = [name for name in spec.required_files if not (path / name).is_file()]
+    missing = [
+        name for name in spec.required_files
+        if not (path / name).is_file() or (path / name).stat().st_size == 0
+    ]
     if missing:
         raise RuntimeError(
-            f"{spec.repo_id}@{spec.revision}: нет файлов {', '.join(missing)}"
+            f"{spec.repo_id}@{spec.revision}: нет или пустые файлы {', '.join(missing)}"
         )
 
 
@@ -265,7 +323,16 @@ def _model_status(
         }
         if spec.allow_patterns:
             kwargs["allow_patterns"] = list(spec.allow_patterns)
-        path = Path(snapshot_download(**kwargs))
+        if spec.local_dir:
+            # Resolve against installed editable project, not a caller's cwd.
+            local_path = Path(__file__).resolve().parents[2] / spec.local_dir
+            if local_only:
+                path = local_path
+            else:
+                kwargs["local_dir"] = str(local_path)
+                path = Path(snapshot_download(**kwargs))
+        else:
+            path = Path(snapshot_download(**kwargs))
         _validate_snapshot(spec, path)
     except Exception as exc:  # noqa: BLE001 - report missing/corrupt artifact
         status["error"] = str(exc)
@@ -428,7 +495,7 @@ def _result(
         # Backwards-compatible convenience keys used by the existing CLI.
         "stt_path": stt_path,
         "translation_path": translation_path,
-        "voice_dir": piper_status["voice_dir"],
+        "voice_dir": piper_status.get("voice_dir"),
     }
 
 
@@ -459,7 +526,7 @@ def preflight_mac_local(
     return _result(
         selected,
         statuses,
-        _piper_status(target_voice_dir),
+        _piper_status(target_voice_dir) if selected.requires_piper else {"ready": True, "required": False},
         dry_run=True,
     )
 
@@ -483,7 +550,8 @@ def setup_mac_local(
 
     selected = _preset(preset)
     try:
-        import piper  # noqa: F401 - ensure the selected profiles can start
+        if selected.requires_piper:
+            import piper  # noqa: F401 - ensure the selected profiles can start
         from huggingface_hub import hf_hub_download, snapshot_download
     except ImportError as exc:
         raise RuntimeError(
@@ -503,12 +571,13 @@ def setup_mac_local(
     target_voice_dir = (
         voice_dir or Path.home() / ".local/share/uvt/piper"
     ).expanduser()
-    log.info("Piper: %s@%s -> %s", PIPER_REPO, PIPER_REVISION, target_voice_dir)
-    _install_piper_voices(target_voice_dir, hf_hub_download)
+    if selected.requires_piper:
+        log.info("Piper: %s@%s -> %s", PIPER_REPO, PIPER_REVISION, target_voice_dir)
+        _install_piper_voices(target_voice_dir, hf_hub_download)
     result = _result(
         selected,
         statuses,
-        _piper_status(target_voice_dir),
+        _piper_status(target_voice_dir) if selected.requires_piper else {"ready": True, "required": False},
         dry_run=False,
     )
     if not result["ready"]:  # defensive: install helpers should already raise
@@ -530,6 +599,9 @@ def format_setup_report(result: dict[str, Any]) -> str:
             f"{status['revision'][:12]} -> {location}"
         )
     piper_status = result.get("piper", {})
+    if piper_status.get("required") is False:
+        lines.append("  ✓ MOSS: встроенные голоса Adam/Bella; Piper не требуется")
+        return "\n".join(lines)
     piper_mark = "✓" if piper_status.get("ready") else "✗"
     piper_location = (
         piper_status.get("voice_dir")

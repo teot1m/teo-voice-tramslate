@@ -5,6 +5,7 @@ from contextlib import contextmanager, suppress
 
 from uvt import registry
 from uvt.audio import resample
+from uvt.config import configured_role_voice
 from uvt.events import TOPIC_TRANSLATION, TOPIC_TTS, Translation, TtsAudio
 from uvt.services.base import Service
 from uvt.services.speaker import SpeakerAssignment, SpeakerService
@@ -70,7 +71,9 @@ class TTSService(Service):
         configured_voice = str(getattr(engine_cfg, "voice", "auto") or "auto")
         configured_role = str(getattr(engine_cfg, "voice_gender", "auto") or "auto").lower()
         # Явный voice или manual voice_gender всегда важнее auto speaker map.
-        if configured_voice != "auto" or configured_role in {"male", "female"}:
+        if (configured_voice not in {"auto", "cloud"}
+                or getattr(engine_cfg, "voice_id", None)
+                or configured_role in {"male", "female"}):
             yield
             return
 
@@ -78,10 +81,10 @@ class TTSService(Service):
         original_voice = getattr(engine_cfg, "voice", None)
         original_role = getattr(engine_cfg, "voice_gender", None)
         try:
-            if assignment.voice:
-                engine_cfg.voice = assignment.voice
-            elif assignment.voice_gender:
+            if assignment.voice_gender:
                 engine_cfg.voice_gender = assignment.voice_gender
+            if assignment.voice and not configured_role_voice(engine_cfg):
+                engine_cfg.voice = assignment.voice
             yield
         finally:
             engine_cfg.voice = original_voice
