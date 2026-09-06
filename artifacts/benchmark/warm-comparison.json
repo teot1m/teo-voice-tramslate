@@ -1,0 +1,535 @@
+{
+  "started_at_utc": "2026-09-06T10:29:00.876716+00:00",
+  "status": "done",
+  "mode": "two sequential renders in one process, no HTTP listener",
+  "source_duration_seconds": 13.970438,
+  "model_lifecycle": "Normal render_dub_track lifecycle, including existing close/reload behavior; no engine changes and no forced model persistence.",
+  "runs": [
+    {
+      "run": 1,
+      "events": [
+        {
+          "seconds": 0.044,
+          "logger": "uvt.dub",
+          "message": "декодирую source-en.wav…"
+        },
+        {
+          "seconds": 0.132,
+          "logger": "uvt.dub",
+          "message": "декодирование завершено за 0.1 с"
+        },
+        {
+          "seconds": 0.132,
+          "logger": "uvt.stt.parakeet-mlx",
+          "message": "parakeet-mlx: loading model mlx-community/parakeet-tdt-0.6b-v3..."
+        },
+        {
+          "seconds": 3.031,
+          "logger": "uvt.stt.parakeet-mlx",
+          "message": "parakeet-mlx: model ready: /Users/teotim/.cache/huggingface/hub/models--mlx-community--parakeet-tdt-0.6b-v3/snapshots/ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15 (GPU Apple Silicon)"
+        },
+        {
+          "seconds": 8.154,
+          "logger": "uvt.dub",
+          "message": "пакетное распознавание: 5 фрагментов → 5 реплик"
+        },
+        {
+          "seconds": 8.204,
+          "logger": "uvt.dub",
+          "message": "распознавание завершено за 8.1 с"
+        },
+        {
+          "seconds": 8.31,
+          "logger": "uvt.diarize",
+          "message": "говорящих найдено 2 (speaker-1: female, 1 реплик, speaker-2: female, 4 реплик)"
+        },
+        {
+          "seconds": 21.671,
+          "logger": "uvt.translate.mlx_translategemma",
+          "message": "TranslateGemma MLX загружена: 5788ec08c047f3f2e17808101b8d9566ac930d58"
+        },
+        {
+          "seconds": 32.945,
+          "logger": "uvt.dub",
+          "message": "перевод: 5/5 реплик"
+        },
+        {
+          "seconds": 33.506,
+          "logger": "uvt.dub",
+          "message": "перевод завершён за 25.2 с"
+        },
+        {
+          "seconds": 33.506,
+          "logger": "uvt.dub",
+          "message": "[@    0.0 с] Good morning. ⇒ Доброе утро."
+        },
+        {
+          "seconds": 33.506,
+          "logger": "uvt.dub",
+          "message": "[@    0.8 с] Our project meeting starts at 10:15 tomorrow. ⇒ Наше совещание по проекту начнется завтра в 10:15."
+        },
+        {
+          "seconds": 33.506,
+          "logger": "uvt.dub",
+          "message": "[@    3.8 с] Please bring the updated budget and a short list of risks. ⇒ Пожалуйста, предоставьте обновленный бюджет и краткий список рисков."
+        },
+        {
+          "seconds": 33.506,
+          "logger": "uvt.dub",
+          "message": "[@    7.0 с] We will compare two options and choose the next steps before lunch. ⇒ Мы сравним два варианта и выберем следующие шаги до обеда."
+        },
+        {
+          "seconds": 33.506,
+          "logger": "uvt.dub",
+          "message": "[@   10.8 с] Do not send the draft to customers until it is approved. ⇒ Не отправляйте этот вариант клиентам, пока он не будет утвержден."
+        },
+        {
+          "seconds": 33.677,
+          "logger": "uvt.dub",
+          "message": "сразу ускоряю 2 реплик по длительности выбранного голоса"
+        },
+        {
+          "seconds": 38.333,
+          "logger": "uvt.dub",
+          "message": "3 реплик подогнаны atempo под тайминги"
+        },
+        {
+          "seconds": 38.851,
+          "logger": "uvt.dub",
+          "message": "озвучка завершена за 5.3 с"
+        },
+        {
+          "seconds": 38.852,
+          "logger": "uvt.dub",
+          "message": "собираю дорожку (5 реплик, режим только голос)…"
+        },
+        {
+          "seconds": 38.92,
+          "logger": "uvt.dub",
+          "message": "дорожка подготовлена за 38.9 с"
+        }
+      ],
+      "progress": [
+        {
+          "seconds": 3.048,
+          "percent": 0.0
+        },
+        {
+          "seconds": 5.828,
+          "percent": 70.0
+        },
+        {
+          "seconds": 32.942,
+          "percent": 85.0
+        },
+        {
+          "seconds": 37.395,
+          "percent": 87.0
+        },
+        {
+          "seconds": 38.085,
+          "percent": 89.0
+        },
+        {
+          "seconds": 38.183,
+          "percent": 92.0
+        },
+        {
+          "seconds": 38.27,
+          "percent": 94.0
+        },
+        {
+          "seconds": 38.332,
+          "percent": 97.0
+        },
+        {
+          "seconds": 38.333,
+          "percent": 97.0
+        },
+        {
+          "seconds": 38.918,
+          "percent": 100.0
+        }
+      ],
+      "clips": [
+        {
+          "index": 2,
+          "seconds": 37.393
+        },
+        {
+          "index": 0,
+          "seconds": 38.082
+        },
+        {
+          "index": 4,
+          "seconds": 38.181
+        },
+        {
+          "index": 1,
+          "seconds": 38.269
+        },
+        {
+          "index": 3,
+          "seconds": 38.331
+        }
+      ],
+      "first_clip_ready_seconds": 37.393,
+      "elapsed_seconds": 38.92,
+      "source_duration_seconds": 13.970438,
+      "wall_seconds_per_source_second": 2.786,
+      "output_duration_seconds": 15.352041666666667,
+      "entries": [
+        {
+          "start": 0.0,
+          "end": 0.8,
+          "original": "Good morning.",
+          "translated": "Доброе утро.",
+          "language": "en",
+          "target_lang": "ru",
+          "tts_start": 0.0,
+          "tts_end": 0.8500625,
+          "speaker_id": null,
+          "speaker_confidence": null,
+          "voice_style": "female"
+        },
+        {
+          "start": 0.8,
+          "end": 3.7600000000000002,
+          "original": "Our project meeting starts at 10:15 tomorrow.",
+          "translated": "Наше совещание по проекту начнется завтра в 10:15.",
+          "language": "en",
+          "target_lang": "ru",
+          "tts_start": 0.8500625,
+          "tts_end": 3.6702916666666665,
+          "speaker_id": null,
+          "speaker_confidence": null,
+          "voice_style": "female"
+        },
+        {
+          "start": 3.7600000000000002,
+          "end": 7.04,
+          "original": "Please bring the updated budget and a short list of risks.",
+          "translated": "Пожалуйста, предоставьте обновленный бюджет и краткий список рисков.",
+          "language": "en",
+          "target_lang": "ru",
+          "tts_start": 3.6702916666666665,
+          "tts_end": 6.8398125,
+          "speaker_id": null,
+          "speaker_confidence": null,
+          "voice_style": "female"
+        },
+        {
+          "start": 7.04,
+          "end": 10.8,
+          "original": "We will compare two options and choose the next steps before lunch.",
+          "translated": "Мы сравним два варианта и выберем следующие шаги до обеда.",
+          "language": "en",
+          "target_lang": "ru",
+          "tts_start": 6.89,
+          "tts_end": 10.5139375,
+          "speaker_id": null,
+          "speaker_confidence": null,
+          "voice_style": "female"
+        },
+        {
+          "start": 10.8,
+          "end": 13.84,
+          "original": "Do not send the draft to customers until it is approved.",
+          "translated": "Не отправляйте этот вариант клиентам, пока он не будет утвержден.",
+          "language": "en",
+          "target_lang": "ru",
+          "tts_start": 10.65,
+          "tts_end": 15.352041666666667,
+          "speaker_id": null,
+          "speaker_confidence": null,
+          "voice_style": "female"
+        }
+      ],
+      "peak_mlx_allocator_bytes": 2764520201,
+      "process_rss_high_water_bytes_macos": 1316225024,
+      "stage_summary": {
+        "stt_seconds_from_log": 8.1,
+        "translation_seconds_from_log": 25.2,
+        "tts_seconds_from_log": 5.3,
+        "translation_load_approx_seconds": 13.361,
+        "translation_generation_approx_seconds": 11.274
+      }
+    },
+    {
+      "run": 2,
+      "events": [
+        {
+          "seconds": 0.001,
+          "logger": "uvt.dub",
+          "message": "декодирую source-en.wav…"
+        },
+        {
+          "seconds": 0.138,
+          "logger": "uvt.dub",
+          "message": "декодирование завершено за 0.1 с"
+        },
+        {
+          "seconds": 0.138,
+          "logger": "uvt.stt.parakeet-mlx",
+          "message": "parakeet-mlx: loading model mlx-community/parakeet-tdt-0.6b-v3..."
+        },
+        {
+          "seconds": 1.797,
+          "logger": "uvt.stt.parakeet-mlx",
+          "message": "parakeet-mlx: model ready: /Users/teotim/.cache/huggingface/hub/models--mlx-community--parakeet-tdt-0.6b-v3/snapshots/ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15 (GPU Apple Silicon)"
+        },
+        {
+          "seconds": 3.226,
+          "logger": "uvt.dub",
+          "message": "пакетное распознавание: 5 фрагментов → 5 реплик"
+        },
+        {
+          "seconds": 3.835,
+          "logger": "uvt.dub",
+          "message": "распознавание завершено за 3.7 с"
+        },
+        {
+          "seconds": 3.957,
+          "logger": "uvt.diarize",
+          "message": "говорящих найдено 2 (speaker-1: female, 1 реплик, speaker-2: female, 4 реплик)"
+        },
+        {
+          "seconds": 10.11,
+          "logger": "uvt.translate.mlx_translategemma",
+          "message": "TranslateGemma MLX загружена: 5788ec08c047f3f2e17808101b8d9566ac930d58"
+        },
+        {
+          "seconds": 17.574,
+          "logger": "uvt.dub",
+          "message": "перевод: 5/5 реплик"
+        },
+        {
+          "seconds": 17.793,
+          "logger": "uvt.dub",
+          "message": "перевод завершён за 13.8 с"
+        },
+        {
+          "seconds": 17.794,
+          "logger": "uvt.dub",
+          "message": "[@    0.0 с] Good morning. ⇒ Доброе утро."
+        },
+        {
+          "seconds": 17.794,
+          "logger": "uvt.dub",
+          "message": "[@    0.8 с] Our project meeting starts at 10:15 tomorrow. ⇒ Наше совещание по проекту начнется завтра в 10:15."
+        },
+        {
+          "seconds": 17.794,
+          "logger": "uvt.dub",
+          "message": "[@    3.8 с] Please bring the updated budget and a short list of risks. ⇒ Пожалуйста, предоставьте обновленный бюджет и краткий список рисков."
+        },
+        {
+          "seconds": 17.794,
+          "logger": "uvt.dub",
+          "message": "[@    7.0 с] We will compare two options and choose the next steps before lunch. ⇒ Мы сравним два варианта и выберем следующие шаги до обеда."
+        },
+        {
+          "seconds": 17.794,
+          "logger": "uvt.dub",
+          "message": "[@   10.8 с] Do not send the draft to customers until it is approved. ⇒ Не отправляйте этот вариант клиентам, пока он не будет утвержден."
+        },
+        {
+          "seconds": 17.796,
+          "logger": "uvt.dub",
+          "message": "сразу ускоряю 2 реплик по длительности выбранного голоса"
+        },
+        {
+          "seconds": 19.746,
+          "logger": "uvt.dub",
+          "message": "3 реплик подогнаны atempo под тайминги"
+        },
+        {
+          "seconds": 20.112,
+          "logger": "uvt.dub",
+          "message": "озвучка завершена за 2.3 с"
+        },
+        {
+          "seconds": 20.113,
+          "logger": "uvt.dub",
+          "message": "собираю дорожку (5 реплик, режим только голос)…"
+        },
+        {
+          "seconds": 20.127,
+          "logger": "uvt.dub",
+          "message": "дорожка подготовлена за 20.1 с"
+        }
+      ],
+      "progress": [
+        {
+          "seconds": 1.797,
+          "percent": 0.0
+        },
+        {
+          "seconds": 3.216,
+          "percent": 70.0
+        },
+        {
+          "seconds": 17.573,
+          "percent": 85.0
+        },
+        {
+          "seconds": 19.061,
+          "percent": 87.0
+        },
+        {
+          "seconds": 19.574,
+          "percent": 89.0
+        },
+        {
+          "seconds": 19.654,
+          "percent": 92.0
+        },
+        {
+          "seconds": 19.684,
+          "percent": 94.0
+        },
+        {
+          "seconds": 19.745,
+          "percent": 97.0
+        },
+        {
+          "seconds": 19.746,
+          "percent": 97.0
+        },
+        {
+          "seconds": 20.125,
+          "percent": 100.0
+        }
+      ],
+      "clips": [
+        {
+          "index": 2,
+          "seconds": 19.06
+        },
+        {
+          "index": 0,
+          "seconds": 19.572
+        },
+        {
+          "index": 4,
+          "seconds": 19.653
+        },
+        {
+          "index": 1,
+          "seconds": 19.683
+        },
+        {
+          "index": 3,
+          "seconds": 19.744
+        }
+      ],
+      "first_clip_ready_seconds": 19.06,
+      "elapsed_seconds": 20.127,
+      "source_duration_seconds": 13.970438,
+      "wall_seconds_per_source_second": 1.441,
+      "output_duration_seconds": 15.352041666666667,
+      "entries": [
+        {
+          "start": 0.0,
+          "end": 0.8,
+          "original": "Good morning.",
+          "translated": "Доброе утро.",
+          "language": "en",
+          "target_lang": "ru",
+          "tts_start": 0.0,
+          "tts_end": 0.8500625,
+          "speaker_id": null,
+          "speaker_confidence": null,
+          "voice_style": "female"
+        },
+        {
+          "start": 0.8,
+          "end": 3.7600000000000002,
+          "original": "Our project meeting starts at 10:15 tomorrow.",
+          "translated": "Наше совещание по проекту начнется завтра в 10:15.",
+          "language": "en",
+          "target_lang": "ru",
+          "tts_start": 0.8500625,
+          "tts_end": 3.6702916666666665,
+          "speaker_id": null,
+          "speaker_confidence": null,
+          "voice_style": "female"
+        },
+        {
+          "start": 3.7600000000000002,
+          "end": 7.04,
+          "original": "Please bring the updated budget and a short list of risks.",
+          "translated": "Пожалуйста, предоставьте обновленный бюджет и краткий список рисков.",
+          "language": "en",
+          "target_lang": "ru",
+          "tts_start": 3.6702916666666665,
+          "tts_end": 6.8398125,
+          "speaker_id": null,
+          "speaker_confidence": null,
+          "voice_style": "female"
+        },
+        {
+          "start": 7.04,
+          "end": 10.8,
+          "original": "We will compare two options and choose the next steps before lunch.",
+          "translated": "Мы сравним два варианта и выберем следующие шаги до обеда.",
+          "language": "en",
+          "target_lang": "ru",
+          "tts_start": 6.89,
+          "tts_end": 10.5139375,
+          "speaker_id": null,
+          "speaker_confidence": null,
+          "voice_style": "female"
+        },
+        {
+          "start": 10.8,
+          "end": 13.84,
+          "original": "Do not send the draft to customers until it is approved.",
+          "translated": "Не отправляйте этот вариант клиентам, пока он не будет утвержден.",
+          "language": "en",
+          "target_lang": "ru",
+          "tts_start": 10.65,
+          "tts_end": 15.352041666666667,
+          "speaker_id": null,
+          "speaker_confidence": null,
+          "voice_style": "female"
+        }
+      ],
+      "peak_mlx_allocator_bytes": 2764520209,
+      "process_rss_high_water_bytes_macos": 1342160896,
+      "stage_summary": {
+        "stt_seconds_from_log": 3.7,
+        "translation_seconds_from_log": 13.8,
+        "tts_seconds_from_log": 2.3,
+        "translation_load_approx_seconds": 6.153,
+        "translation_generation_approx_seconds": 7.464
+      }
+    }
+  ],
+  "uvt_import_path": "/Users/teotim/Documents/голос/src/uvt/__init__.py",
+  "media_runtime_repaired": true,
+  "profile": {
+    "name": "local-balanced",
+    "stt": "parakeet-mlx",
+    "translation": "translategemma-mlx",
+    "tts": "piper",
+    "source_lang": "auto",
+    "target_lang": "ru",
+    "allow_download": false,
+    "fallbacks": null
+  },
+  "source_sha256": "323035822fadc8a93d2990093985eecf52bd10bcfe90f82af40ca6216ca24ad4",
+  "process_elapsed_seconds": 59.447,
+  "process_peak_rss_bytes_macos": 1342160896,
+  "command_wall_seconds_time_l": 61.83,
+  "peak_memory_footprint_bytes_time_l": 5261119952,
+  "comparison": {
+    "speedup_factor_first_over_second": 1.934,
+    "wall_time_reduction_percent": 48.29,
+    "first_render_wall_seconds_per_source_second": 2.786,
+    "second_render_wall_seconds_per_source_second": 1.441,
+    "original_texts_equal": true,
+    "translated_texts_equal": true,
+    "interpretation": "Second render benefits from prior work in the same process and OS/framework caches, but models still follow the normal close/reload lifecycle. This is not a permanently resident hot-model benchmark. A single pair does not isolate cache, thermal, or scheduling effects."
+  }
+}

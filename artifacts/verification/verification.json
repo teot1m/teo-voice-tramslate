@@ -1,0 +1,22 @@
+{
+  "checked_at": "2026-09-06T10:45:31.188030+00:00",
+  "project": "/Users/teotim/Documents/голос",
+  "python_tests": "320 passed in 8.77s",
+  "javascript_syntax": [
+    "browser/uvt.user.js",
+    "src/uvt/web/workspace.js"
+  ],
+  "shell_syntax": [
+    "scripts/serve-personal.sh",
+    "scripts/with-local-runtime.sh"
+  ],
+  "git_diff_check": "passed",
+  "browser_integration": "../workspace-integration/qa-report.json",
+  "real_local_models": "../benchmark/BENCHMARK.md",
+  "limitations": [
+    "Site videos were checked with short audio extraction, not full dubbing.",
+    "File UI integration used dummy engines; models benchmark used neutral EN-to-RU audio.",
+    "Live calls and newly researched voices have not been benchmarked."
+  ],
+  "ports_8765_8767": "No listeners at final verification; restarting UVT terminal stopped."
+}

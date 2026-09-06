@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>UVT — локальная студия перевода</title>
+  <link rel="stylesheet" href="/workspace/style.css">
+  <script src="/workspace/app.js" defer></script>
+</head>
+<body>
+  <header class="header wrap">
+    <a class="brand" href="/workspace" aria-label="UVT, студия перевода"><span class="brand-icon" aria-hidden="true"><i></i><i></i><i></i><i></i></span>UVT<span class="brand-label">студия перевода</span></a>
+    <nav class="header-links" aria-label="Дополнительно"><a href="/workspace/userscript.user.js">Для Chrome <span aria-hidden="true">↗</span></a><a href="/#settings">Настройки</a></nav>
+  </header>
+  <main class="wrap">
+    <section class="intro"><div><p class="eyebrow">ВАШЕ ВИДЕО · ВАШ ЯЗЫК</p><h1>Перевод, который рядом.</h1><p class="intro-copy">Озвучка и субтитры для видео, ссылок и ваших записей.</p></div><div class="connection"><span class="status-dot" id="connection-dot"></span><span id="connection-text" role="status">Проверяем подключение</span><button class="icon-button" id="refresh" aria-label="Обновить подключение и задания" title="Обновить">↻</button></div></section>
+
+    <section class="auth-card card" id="auth-panel" hidden aria-labelledby="auth-title">
+      <div><h2 id="auth-title">Подключитесь к своей студии</h2><p>Введите токен доступа из настроек запуска UVT. Он сохранится только в этой вкладке.</p></div>
+      <form id="auth-form"><label for="auth-token">Токен доступа</label><div class="inline-input"><input id="auth-token" type="password" autocomplete="off" required spellcheck="false"><button class="primary" type="submit">Подключиться</button></div><p class="error-text" id="auth-error" role="alert"></p></form>
+    </section>
+
+    <div class="studio-grid">
+      <section class="card source-card" aria-labelledby="source-title">
+        <div class="section-heading"><h2 id="source-title">Начнём с источника</h2><span class="subtle">01 / добавить</span></div>
+        <div class="tabs" role="tablist" aria-label="Источник перевода"><button id="tab-file" role="tab" aria-selected="true" aria-controls="panel-file" tabindex="0" data-tab="file">Файл</button><button id="tab-url" role="tab" aria-selected="false" aria-controls="panel-url" tabindex="-1" data-tab="url">Ссылка</button><button id="tab-live" role="tab" aria-selected="false" aria-controls="panel-live" tabindex="-1" data-tab="live">Звонки <span class="mini-tag">beta</span></button></div>
+        <form id="source-form">
+          <div id="panel-file" role="tabpanel" aria-labelledby="tab-file">
+            <div class="drop-zone" id="drop-zone"><span class="upload-icon" aria-hidden="true">↥</span><h3 id="file-title">Перетащите видео или аудио</h3><p id="file-description">или выберите файл с вашего Mac</p><label class="secondary file-picker" for="file-input">Выбрать файл</label><input class="sr-only" id="file-input" type="file" accept="video/*,audio/*,.mkv,.mov,.mp4,.webm,.mp3,.wav,.m4a,.flac,.ogg,.aac,.avi,.m4v,.ts"><span class="file-limits">До 2 ГБ · до 90 минут · один файл</span></div>
+            <label class="check-line"><input type="checkbox" id="export-video"><span>Сохранить также видео с переводом<small>MKV с новой озвучкой и оригинальной дорожкой. Только для видеофайлов.</small></span></label>
+          </div>
+          <div id="panel-url" role="tabpanel" aria-labelledby="tab-url" hidden><label for="video-url">Ссылка на видео</label><input id="video-url" type="url" placeholder="https://…" inputmode="url" autocomplete="url"><p class="field-note">Сервер сначала ищет звук по ссылке, затем начинает перевод. Страница может открываться в Chrome, но не отдавать видео серверу. В этом случае попробуйте UVT в плеере Chrome или загрузите скачанный файл.</p><div class="quiet-note">Для перевода прямо в плеере установите <a href="/workspace/userscript.user.js">расширение UVT для Tampermonkey ↗</a>.</div></div>
+
+          <div id="job-options"><details class="options" id="options-details"><summary><span>Настройки перевода</span><span id="options-summary">По настройкам студии</span></summary><label class="check-line"><input type="checkbox" id="override-settings"><span>Выбрать настройки для этого видео<small>Общие настройки студии сохранятся.</small></span></label><fieldset id="override-fields" disabled hidden><legend class="sr-only">Настройки этого перевода</legend><div class="field-grid"><label>Режим качества<select id="profile-select"></select></label><label>Язык оригинала<select id="source-lang"></select></label><label>Перевести на<select id="target-lang"></select></label><label>Голос<select id="voice-select"><option value="">Автоматически</option></select></label></div><p class="field-note" id="profile-note"></p></fieldset></details><div class="form-footer"><p id="privacy-note">Проверяем текущий режим обработки…</p><button id="start-job" class="primary" type="submit" disabled>Начать перевод <span aria-hidden="true">→</span></button></div></div>
+          <p class="error-text" id="form-error" role="alert"></p>
+        </form>
+
+        <div id="panel-live" role="tabpanel" aria-labelledby="tab-live" hidden><div class="live-intro"><span class="soft-icon" aria-hidden="true">◉</span><h3>Субтитры для разговора</h3><p>Экспериментальный локальный режим для Zoom, Meet и других звонков. Работает через захват системного звука на Mac.</p></div><ol class="guide"><li><strong>Подготовьте звук</strong><p>Установите <a href="https://existential.audio/blackhole/" target="_blank" rel="noopener noreferrer">BlackHole 2ch ↗</a>. В «Настройке Audio-MIDI» создайте многовыходное устройство с вашими наушниками и BlackHole.</p></li><li><strong>Выберите устройство для звонка</strong><p>Направьте звук собеседников в это многовыходное устройство. В настройках захвата UVT выберите BlackHole 2ch. Используйте наушники, чтобы избежать эха.</p></li><li><strong>Запустите локальные субтитры</strong><p>Для английской речи с переводом на русский:</p><div class="command-row"><code id="meeting-command">uvt run -p local-meeting --source-lang en</code><button type="button" class="icon-button" id="copy-command" aria-label="Скопировать команду запуска">Копировать</button></div><p class="field-note">Сначала подготовьте локальные модели. Устройство захвата можно выбрать в профиле или графическом интерфейсе UVT.</p></li></ol><div class="quiet-note">Эта страница не слушает микрофон и не захватывает звонок. Команда выше выводит перевод в терминал. Для отдельного окна запустите <code>uvt gui -p local-meeting</code>. Задержка зависит от речи и нагрузки Mac.</div></div>
+      </section>
+
+      <aside class="card device-card" aria-labelledby="device-title"><div class="section-heading"><h2 id="device-title">Ваша студия</h2><span class="mini-tag" id="mode-tag">Проверка</span></div><div class="device-art" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div><h3 id="profile-title">Получаем настройки</h3><p id="profile-description" class="subtle">Состояние появится после ответа студии.</p><dl class="device-facts"><div><dt>Перевод</dt><dd id="language-summary">—</dd></div><div><dt>Модели</dt><dd id="readiness">Проверяем</dd></div></dl><p class="device-note" id="device-note">Одна тяжёлая задача за раз помогает сохранить память для вашего Mac.</p><a class="text-link" href="/#settings">Модели, голоса и настройки <span aria-hidden="true">→</span></a><p class="field-note" id="metadata-note"></p></aside>
+    </div>
+
+    <section class="card job-card" id="job-card" hidden aria-labelledby="job-title"><div class="section-heading"><div><p class="eyebrow">02 / перевод</p><h2 id="job-title">Готовим перевод</h2></div><span class="job-status" id="job-status"></span></div><p class="job-detail" id="job-detail" role="status"></p><div class="progress-heading"><span id="progress-label">Подготовка</span><span id="progress-percent"></span></div><progress id="job-progress" max="1" aria-label="Прогресс перевода"></progress><div class="steps" id="job-steps" aria-label="Этапы перевода"><span data-stage="download">Источник</span><span data-stage="transcribe">Речь</span><span data-stage="translate">Перевод</span><span data-stage="synthesize">Озвучка</span><span data-stage="mix">Результат</span></div><div class="job-meta"><span id="job-timing"></span><button type="button" class="text-button danger" id="cancel-job">Отменить</button><button type="button" class="secondary" id="retry-job" hidden>Обновить состояние</button></div><div class="approval" id="job-approval" hidden><h3>Нужно ваше решение</h3><p id="approval-detail"></p><div class="button-row"><button type="button" class="primary" id="approve-job">Разрешить</button><button type="button" class="secondary" id="reject-job">Отклонить</button></div></div><p id="job-network" class="error-text" role="alert"></p><div id="source-recovery" class="quiet-note" hidden><p>Получить видео по этой ссылке не удалось. Откройте его в Chrome с Tampermonkey и нажмите UVT в плеере: userscript может передать адрес уже открытого медиапотока. Или выберите локальный видеофайл.</p><div class="button-row"><a href="/workspace/userscript.user.js" target="_blank" rel="noopener noreferrer">UVT для Chrome ↗</a><button type="button" class="secondary" id="recovery-file">Выбрать локальный файл</button></div></div><div id="job-results" hidden><h3>Готово к просмотру и сохранению</h3><audio id="result-audio" controls preload="none" aria-label="Прослушать перевод"></audio><div class="download-links" id="download-links"></div><p class="field-note">Сохраните результат: временные задания могут стать недоступны после перезапуска студии.</p></div></section>
+
+    <section class="card recent-card" aria-labelledby="recent-title"><div class="section-heading"><h2 id="recent-title">Последние переводы</h2><button type="button" class="text-button" id="refresh-jobs">Обновить</button></div><p class="empty-state" id="recent-empty">Получаем список заданий…</p><div class="recent-list" id="recent-list"></div></section>
+    <footer class="footer"><span>UVT · перевод в вашем темпе</span><span>Локальные файлы и модели остаются на вашем устройстве в локальном режиме.</span></footer>
+  </main>
+</body>
+</html>

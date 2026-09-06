@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         UVT — закадровый перевод видео
 // @namespace    uvt
-// @version      0.17.0
+// @version      0.18.1
 // @description  Пакетный закадровый перевод через личный UVT: реплики звучат по мере готовности; Free, GPT или ElevenLabs
 // @match        *://*/*
 // @grant        GM_getValue
@@ -47,7 +47,7 @@
       detail: "Whisper large-v3-turbo → TranslateGemma → Piper",
     },
     "local-natural": {
-      label: "Живые голоса",
+      label: "Клонирование голоса · тяжёлый",
       detail: "Demucs → Parakeet → Qwen3 с контекстом → F5 с клонированием (медленно)",
     },
   });
@@ -158,6 +158,8 @@
   const STAGE_NAMES = {
     queue: "очередь",
     download: "получение звука",
+    decode: "подготовка звука",
+    separate: "отделение голоса от фона",
     transcribe: "распознавание",
     translate: "перевод",
     synthesize: "озвучка",
@@ -168,8 +170,10 @@
   };
 
   const CHIP_STYLE = {
-    padding: "4px 10px",
-    font: "600 12px/1.4 -apple-system, system-ui, sans-serif",
+    padding: "7px 11px",
+    minHeight: "36px",
+    boxSizing: "border-box",
+    font: "600 13px/1.4 -apple-system, system-ui, sans-serif",
     color: "#fff",
     background: "rgba(20, 20, 20, 0.75)",
     border: "1px solid rgba(255,255,255,0.25)",
@@ -347,7 +351,7 @@
     panel.setAttribute("aria-atomic", "true");
     Object.assign(panel.style, {
       position: "absolute",
-      top: "38px",
+      top: "calc(100% + 8px)",
       left: "50%",
       transform: "translateX(-50%)",
       width: "min(360px, calc(100vw - 24px))",
@@ -357,7 +361,7 @@
       border: "1px solid rgba(255,255,255,0.28)",
       borderRadius: "10px",
       color: "#f4f4f4",
-      font: "12px/1.45 -apple-system, system-ui, sans-serif",
+      font: "13px/1.5 -apple-system, system-ui, sans-serif",
       textAlign: "left",
       whiteSpace: "normal",
       boxShadow: "0 8px 26px rgba(0,0,0,.38)",
@@ -456,10 +460,12 @@
     const s = state.get(video);
     if (!s) return;
     const stage = STAGE_NAMES[info.stage] || "подготовка";
-    const stageProgress = Number(info.stage_progress);
-    const overallPct = Math.round((Number(info.progress) || 0) * 100);
+    const profileId = info.profile_name || (info.meta && info.meta.profile && info.meta.profile.name) || "";
+    const heavyProfile = profileId === "local-natural";
+    const stageProgress = info.stage_progress == null ? NaN : Number(info.stage_progress);
+    const overallPct = Math.max(0, Math.min(100, Math.round((Number(info.progress) || 0) * 100)));
     const stagePct = Number.isFinite(stageProgress)
-      ? Math.round(stageProgress * 100)
+      ? Math.max(0, Math.min(100, Math.round(stageProgress * 100)))
       : overallPct;
     const routeLabel = (info.route && info.route.label)
       || (s.server && s.server.shortLabel)
@@ -473,23 +479,35 @@
     } else {
       message = `Этап: ${stage} (${stagePct}%). Общая готовность: ${overallPct}%.`;
     }
-    const eta = Number(info.eta_seconds);
+    if (heavyProfile) message += " Профиль local-natural: отделение и клонирование голоса могут занять в несколько раз больше времени, чем длится речь. Для скорости следующего перевода выберите «Сбалансированный».";
+    if (info.detail && ["decode", "separate"].includes(info.stage)) message += ` ${info.detail}`;
+    const eta = info.eta_seconds == null ? NaN : Number(info.eta_seconds);
     const etaText = info.eta_is_estimate && Number.isFinite(eta)
       ? `Оценка до готовности ${formatDuration(eta)}.`
       : "";
-    const heard = s.progressive ? s.progressive.count() : 0;
-    const heardText = heard
-      ? ` Уже озвучено реплик: ${heard} — перевод звучит по мере готовности.`
-      : "";
+    const readyClips = s.progressive ? s.progressive.player.ready() : 0;
+    const clipsText = readyClips
+      ? ` Загружено реплик: ${readyClips}. Звучат только реплики у текущей позиции видео.`
+      : " Первые реплики появятся после распознавания и перевода.";
     setButton(
       s.button,
-      heard
-        ? `${routeLabel} · слышно ${heard} · ${stagePct}%`
-        : `${routeLabel} · ${info.stage === "queue" ? "очередь" : `${stage} ${stagePct}%`}`,
+      readyClips
+        ? `${routeLabel} · реплик ${readyClips} · ${overallPct}%`
+        : `${routeLabel}${heavyProfile ? " · тяжёлый" : ""} · ${info.stage === "queue" ? "очередь" : `${stage} ${stagePct}%`}`,
       "rgba(120, 90, 0, 0.85)",
-      `Пакетный перевод: ${message} ${etaText}${heardText}`.trim()
+      `Пакетный перевод: ${message} ${etaText}${clipsText}`.trim()
     );
     s.button.setAttribute("aria-busy", "true");
+    s.button.title = `${message} ${etaText}${clipsText} Это подготовка видео, не прямой эфир.`;
+    s.progressTrack.hidden = false;
+    s.progressTrack.setAttribute("aria-valuenow", String(overallPct));
+    s.progressTrack.setAttribute("aria-valuetext", `${stage}: ${stagePct}%. Общая готовность: ${overallPct}%.`);
+    s.progressFill.style.width = `${overallPct}%`;
+    // Announce stage changes, not every poll or percentage point.
+    if (s.lastAnnouncedStage !== info.stage) {
+      s.jobAnnouncement.textContent = `${routeLabel}: ${message}`;
+      s.lastAnnouncedStage = info.stage;
+    }
   }
 
   // --- окна реплик: когда приглушать оригинал ---
@@ -845,8 +863,8 @@
   }
 
   function mediaUrlOf(video) {
-    const src = video.currentSrc || video.src || "";
-    return src && !src.startsWith("blob:") ? src : null;
+    const src = video.currentSrc || video.src || (video.querySelector("source[src]") || {}).src || "";
+    return /^https?:\/\//i.test(src) ? src : null;
   }
 
   // SPA-сайты меняют видео без перезагрузки страницы — запоминаем момент
@@ -865,26 +883,45 @@
   // Плееры с MSE (src=blob:) прячут настоящий адрес потока, но манифесты
   // (.m3u8/.mpd) видны в сетевых ресурсах страницы — отдаём их серверу,
   // ffmpeg скачает поток напрямую, даже если yt-dlp сайт не знает.
+  // Resource Timing usually retains only a small rolling buffer. Keep a
+  // bounded history from document-start so an early player manifest survives
+  // ads, analytics and long viewing sessions. This stays within this frame.
+  const observedMedia = new Map();
+  const MAX_MEDIA_HISTORY = 64;
+  const mediaKind = (url) => /m3u8|\.mpd([?#]|$)|\/(hls|dash)\//i.test(url)
+    ? "stream" : /\.(mp4|webm|m4a|mp3)([?#]|$)/i.test(url) ? "file" : "";
+  const rememberMedia = (entry) => {
+    if (!entry || !/^https?:\/\//i.test(entry.name) || !mediaKind(entry.name)) return;
+    observedMedia.delete(entry.name);
+    observedMedia.set(entry.name, { name: entry.name, startTime: entry.startTime });
+    while (observedMedia.size > MAX_MEDIA_HISTORY) observedMedia.delete(observedMedia.keys().next().value);
+  };
+  try {
+    if (typeof PerformanceObserver === "function") {
+      const mediaObserver = new PerformanceObserver((list) => list.getEntries().forEach(rememberMedia));
+      mediaObserver.observe({ type: "resource", buffered: true });
+    }
+  } catch (_) { /* older browsers still use the timing snapshot below */ }
+
   function findMediaCandidates() {
     const streams = [];
     const files = [];
     const freshStreams = [];
     const freshFiles = [];
     try {
-      for (const entry of performance.getEntriesByType("resource")) {
+      for (const entry of performance.getEntriesByType("resource")) rememberMedia(entry);
+      for (const entry of observedMedia.values()) {
         const url = entry.name;
         const fresh = entry.startTime >= lastNavigation;
-        // манифест не всегда оканчивается на .m3u8 — ловим и по пути/параметрам
-        if (/m3u8|\.mpd([?#]|$)|\/(hls|dash)\//i.test(url)) {
+        if (mediaKind(url) === "stream") {
           streams.push(url);
           if (fresh) freshStreams.push(url);
-        } else if (/\.(mp4|webm|m4a|mp3)([?#]|$)/i.test(url)) {
+        } else {
           files.push(url);
           if (fresh) freshFiles.push(url);
         }
       }
     } catch (_) { /* performance API недоступен — не страшно */ }
-    // потоки текущего видео приоритетнее; манифесты раньше файлов; свежие — первыми
     const useFresh = freshStreams.length > 0 || freshFiles.length > 0;
     const pickStreams = useFresh ? freshStreams : streams;
     const pickFiles = useFresh ? freshFiles : files;
@@ -917,6 +954,7 @@
     );
     s.button.setAttribute("aria-pressed", "false");
     s.button.setAttribute("aria-busy", "false");
+    s.progressTrack.hidden = true;
     s.button.title = "Подготовить готовую дорожку перевода (не live-перевод)";
   }
 
@@ -931,7 +969,9 @@
     );
     s.button.setAttribute("aria-pressed", "true");
     s.button.setAttribute("aria-busy", "false");
+    s.progressTrack.hidden = true;
     s.button.title = "Готовая дорожка включена; нажмите, чтобы выключить";
+    s.jobAnnouncement.textContent = "Перевод видео готов. Дорожка включена.";
   }
 
   function setRetryButton(video) {
@@ -945,6 +985,7 @@
     );
     s.button.setAttribute("aria-pressed", "false");
     s.button.setAttribute("aria-busy", "false");
+    s.progressTrack.hidden = true;
   }
 
   function snapshotPrefs(video) {
@@ -1012,6 +1053,7 @@
     s.busy = true;
     s.cancelled = false;
     s.jobId = null;
+    s.lastAnnouncedStage = "";
     // AudioContext создаётся здесь, внутри обработчика нажатия: созданный
     // позже, в цикле опроса, браузер оставил бы приостановленным, и первые
     // готовые реплики бы не зазвучали.
@@ -1033,6 +1075,7 @@
       current.routeSelect.disabled = false;
       current.cancelButton.hidden = true;
       current.cancelButton.disabled = false;
+      current.progressTrack.hidden = true;
       if (!current.on && !current.errorPanel) setIdleButton(video);
     });
   }
@@ -1111,6 +1154,7 @@
       }
     } catch (err) {
       if (s.cancelled) return;
+      detachProgressive(video);
       console.warn("[UVT]", err);
       setRetryButton(video);
       showError(video, err);
@@ -1121,6 +1165,8 @@
     const s = state.get(video);
     if (!s || !s.busy) return;
     s.cancelled = true;
+    detachProgressive(video);
+    s.jobAnnouncement.textContent = "Подготовка перевода отменена.";
     s.cancelButton.disabled = true;
     if (s.jobAbort) s.jobAbort.abort();
     if (s.jobId) {
@@ -1164,7 +1210,7 @@
     const videoState = video && state.get(video);
     return videoState && videoState.settingsMode === "override"
       ? prefs.source + " → " + prefs.target
-      : "Настройки панели";
+      : "Настройки";
   }
 
   function makeRouteSelect(onChange, id) {
@@ -1185,7 +1231,7 @@
       select.appendChild(option);
     }
     select.title = "Выберите тип перевода перед запуском";
-    select.setAttribute("aria-label", "Модель перевода");
+    select.setAttribute("aria-label", "Маршрут перевода");
     select.addEventListener("change", () => onChange(select.value));
     select.addEventListener("click", (event) => event.stopPropagation());
     return select;
@@ -1289,7 +1335,6 @@
     panel.tabIndex = -1;
     chip.setAttribute("aria-controls", panel.id);
     chip.setAttribute("aria-expanded", "true");
-    const panelOffset = 38;
     Object.assign(panel.style, {
       // A fixed portal is not clipped by a site's overflow:hidden player and
       // can be clamped to the actual viewport even for edge-aligned embeds.
@@ -1298,19 +1343,19 @@
       bottom: "auto",
       left: "8px",
       display: "grid",
-      gridTemplateColumns: "minmax(78px, auto) minmax(0, 1fr)",
-      gap: "8px",
+      gridTemplateColumns: "minmax(90px, auto) minmax(0, 1fr)",
+      gap: "10px 12px",
       alignItems: "center",
-      width: "min(460px, calc(100vw - 16px))",
-      maxHeight: "min(620px, calc(100vh - 16px))",
+      width: "min(520px, calc(100vw - 16px))",
+      maxHeight: "min(760px, calc(100vh - 16px))",
       overflowY: "auto",
       boxSizing: "border-box",
-      padding: "11px",
-      background: "rgba(15, 15, 15, 0.97)",
+      padding: "0 18px 18px",
+      background: "#161b24",
       border: "1px solid rgba(255,255,255,0.32)",
-      borderRadius: "10px",
-      color: "#ddd",
-      font: "12px -apple-system, system-ui, sans-serif",
+      borderRadius: "14px",
+      color: "#dce3ed",
+      font: "14px/1.5 -apple-system, system-ui, sans-serif",
       zIndex: "2147483647",
       whiteSpace: "normal",
       boxShadow: "0 8px 26px rgba(0,0,0,.38)",
@@ -1319,22 +1364,22 @@
     const positionPanel = () => {
       if (!panel.isConnected && s.settingsPanel !== panel) return;
       const wrapperRect = wrapper.getBoundingClientRect();
-      const panelWidth = Math.min(460, Math.max(160, window.innerWidth - 16));
+      const panelWidth = Math.min(520, Math.max(160, window.innerWidth - 16));
       const desiredLeft = wrapperRect.left + wrapperRect.width / 2 - panelWidth / 2;
       const maxLeft = Math.max(8, window.innerWidth - panelWidth - 8);
       const clampedLeft = Math.max(8, Math.min(desiredLeft, maxLeft));
-      const belowTop = wrapperRect.top + panelOffset;
+      const belowTop = wrapperRect.bottom + 8;
       const aboveBottom = wrapperRect.top - 8;
       const spaceBelow = window.innerHeight - belowTop - 8;
       const spaceAbove = aboveBottom - 8;
       const placeAbove = spaceBelow < 260 && spaceAbove > spaceBelow;
       const available = Math.max(
         80,
-        Math.floor(Math.min(window.innerHeight * 0.72, placeAbove ? spaceAbove : spaceBelow))
+        Math.floor(Math.min(window.innerHeight - 16, placeAbove ? spaceAbove : spaceBelow))
       );
       panel.style.width = `${panelWidth}px`;
       panel.style.left = `${clampedLeft}px`;
-      panel.style.maxHeight = `${Math.min(620, available)}px`;
+      panel.style.maxHeight = `${Math.min(760, available)}px`;
       if (placeAbove) {
         panel.style.top = "auto";
         panel.style.bottom = `${Math.max(8, window.innerHeight - aboveBottom)}px`;
@@ -1352,13 +1397,15 @@
 
     const selectStyle = {
       width: "100%",
-      minHeight: "30px",
-      font: "12px -apple-system, system-ui, sans-serif",
-      background: "#222",
+      maxWidth: "none",
+      minHeight: "42px",
+      boxSizing: "border-box",
+      font: "14px/1.4 -apple-system, system-ui, sans-serif",
+      background: "#222b38",
       color: "#fff",
       border: "1px solid #555",
       borderRadius: "6px",
-      padding: "3px 5px",
+      padding: "8px 10px",
     };
     const sectionTitle = (text) => {
       const heading = document.createElement("strong");
@@ -1367,8 +1414,9 @@
         gridColumn: "1 / -1",
         color: "#fff",
         borderTop: "1px solid rgba(255,255,255,.14)",
-        paddingTop: "7px",
-        marginTop: "2px",
+        paddingTop: "14px",
+        marginTop: "6px",
+        fontSize: "15px",
       });
       panel.appendChild(heading);
     };
@@ -1379,6 +1427,29 @@
       panel.appendChild(label);
       panel.appendChild(control);
     };
+    const header = document.createElement("header");
+    Object.assign(header.style, {
+      gridColumn: "1 / -1", position: "sticky", top: "0", zIndex: "2",
+      display: "flex", justifyContent: "space-between", alignItems: "center",
+      gap: "12px", background: "#161b24", padding: "14px 0 12px",
+      borderBottom: "1px solid #384354",
+    });
+    const headerTitle = document.createElement("strong");
+    headerTitle.textContent = "Перевод видео";
+    headerTitle.style.fontSize = "18px";
+    const close = document.createElement("button");
+    close.type = "button";
+    setButton(close, "✕", "#273242", "Закрыть настройки перевода");
+    Object.assign(close.style, CHIP_STYLE, { minWidth: "42px", minHeight: "42px" });
+    bindAction(close, () => closeLangPanel(wrapper, chip, true));
+    header.append(headerTitle, close);
+    panel.appendChild(header);
+
+    const modeNote = document.createElement("div");
+    modeNote.textContent = "Перевод готовится по этапам. Реплики доступны по мере озвучки; для видеозвонков нужен отдельный live-режим.";
+    Object.assign(modeNote.style, { gridColumn: "1 / -1", color: "#bac8da" });
+    panel.appendChild(modeNote);
+
     const refreshChip = () => syncChipLabels();
 
     let voiceCatalog = [...LOCAL_VOICES];
@@ -1387,7 +1458,7 @@
     let localSourceRestricted = false;
     let localTargetLanguages = null;
 
-    sectionTitle("Источник настроек");
+    sectionTitle("Настройки следующего перевода");
     const settingsModeId = nextControlId("settings-mode");
     const settingsModeSelect = document.createElement("select");
     settingsModeSelect.id = settingsModeId;
@@ -1427,12 +1498,12 @@
     useDashboardDefaults.type = "button";
     setButton(
       useDashboardDefaults,
-      "↩ Вернуться к настройкам web-панели",
+      "Вернуть настройки сервера",
       "rgba(35, 95, 155, .9)",
       "Отменить настройки этого видео и снова использовать настройки web-панели"
     );
     Object.assign(useDashboardDefaults.style, CHIP_STYLE, {
-      minHeight: "32px",
+      minHeight: "40px",
       padding: "4px 8px",
     });
     const openDashboard = document.createElement("button");
@@ -1444,27 +1515,44 @@
       "Открыть web-панель настроек текущего UVT-маршрута"
     );
     Object.assign(openDashboard.style, CHIP_STYLE, {
-      minHeight: "32px",
+      minHeight: "40px",
       padding: "4px 8px",
     });
-    settingsModeActions.append(useDashboardDefaults, openDashboard);
+    const openWorkspace = document.createElement("button");
+    openWorkspace.type = "button";
+    setButton(openWorkspace, "Файлы и переводы ↗", "rgba(255,255,255,.12)", "Открыть загрузку видеофайлов и готовые переводы");
+    Object.assign(openWorkspace.style, CHIP_STYLE, { minHeight: "40px" });
+    openWorkspace.addEventListener("click", () => {
+      window.open(urlFor(serverForRoute(prefs.route), "/workspace"), "_blank", "noopener,noreferrer");
+    });
+    settingsModeActions.append(openWorkspace, openDashboard, useDashboardDefaults);
     panel.appendChild(settingsModeActions);
 
     const setSettingsMode = (mode, { reloadMeta = true } = {}) => {
       s.settingsMode = mode === "override" ? "override" : "server";
       settingsModeSelect.value = s.settingsMode;
-      useDashboardDefaults.disabled = s.settingsMode === "server";
+      useDashboardDefaults.hidden = s.settingsMode === "server";
       settingsModeStatus.textContent = s.settingsMode === "server"
-        ? "Следующий перевод возьмёт модель, языки и голос из web-панели. Значения ниже не отправляются серверу."
+        ? "Действуют настройки сервера. Измените поле ниже, чтобы настроить только это видео."
         : "Для следующего перевода этого видео будут отправлены выбранные ниже язык, локальный профиль и голос.";
       syncChipLabels();
       if (reloadMeta) refreshMeta();
     };
     const activateManualOverride = () => {
-      if (s.settingsMode !== "override") setSettingsMode("override", { reloadMeta: false });
+      if (s.settingsMode !== "override") {
+        // Adopt the displayed server values together. Changing one field must
+        // not silently send unrelated stale preferences from another video.
+        prefs.source = sourceSelect.value;
+        prefs.target = targetSelect.value;
+        prefs.localProfile = profileSelect.value;
+        prefs.voice = voiceSelect.value;
+        prefs.voiceId = voiceModelSelect.value;
+        setSettingsMode("override", { reloadMeta: false });
+      }
     };
     settingsModeSelect.addEventListener("change", () => {
       stopPreviewAudio();
+      if (settingsModeSelect.value === "override") activateManualOverride();
       setSettingsMode(settingsModeSelect.value);
     });
     useDashboardDefaults.addEventListener("click", () => {
@@ -1564,8 +1652,9 @@
         const option = document.createElement("option");
         option.value = item.id;
         option.textContent = item.label || item.id;
-        if (item.installed === false) {
-          option.textContent += " · не установлен";
+        if (item.id === "local-natural" && !option.textContent.includes("тяжёлый")) option.textContent += " · тяжёлый";
+        if (item.installed !== true) {
+          option.textContent += item.installed === false ? " · не установлен" : " · проверка";
           option.disabled = true;
         }
         const engines = item.engines || {};
@@ -1576,7 +1665,7 @@
       profileSelect.value = selectedProfile;
     };
     renderProfileOptions([], prefs.localProfile || "local-balanced");
-    profileSelect.disabled = prefs.route !== "free";
+    profileSelect.disabled = true;
     profileSelect.addEventListener("change", () => {
       stopPreviewAudio();
       prefs.localProfile = profileSelect.value;
@@ -1584,9 +1673,31 @@
       localSourceRestricted = false;
       localTargetLanguages = null;
       refreshLanguageOptions();
+      updateProfileGuide(profileSelect.value);
       refreshMeta();
     });
-    appendLabel("Локально:", profileSelect);
+    appendLabel("Профиль:", profileSelect);
+
+    const profileGuide = document.createElement("div");
+    profileGuide.className = "uvt-profile-guide";
+    Object.assign(profileGuide.style, {
+      gridColumn: "1 / -1", padding: "10px 12px", borderRadius: "9px",
+      background: "#203043", color: "#dcecff", border: "1px solid #354a62",
+    });
+    const updateProfileGuide = (profile) => {
+      const guides = {
+        "local-fast": "Быстро: Parakeet + NLLB + Piper. Для повседневных видео и меньшей нагрузки; сложный контекст может переводиться хуже.",
+        "local-balanced": "Рекомендуем для M4 · 16 ГБ: Parakeet + TranslateGemma 4-bit + Piper. Начните с этого баланса смысла, скорости и памяти.",
+        "local-quality": "Качество: Whisper turbo + TranslateGemma + Piper. Попробуйте для сложной речи; распознавание требует больше ресурсов, ускорение не гарантируется.",
+        "local-natural": "Тяжёлый профиль local-natural: сначала Demucs отделяет голос от фона, затем F5 клонирует голос. На M4 / 16 ГБ обработка может занимать в несколько раз больше времени, чем длится речь. Для скорости выберите «Сбалансированный»; «Настройки сервера» возвращают сохранённый профиль сервера. Прямой эфир этот профиль не обеспечивает.",
+      };
+      profileGuide.hidden = prefs.route !== "free";
+      profileGuide.textContent = guides[profile] || "Пользовательский профиль. Состав моделей и готовность определяет сервер.";
+      profileGuide.style.background = profile === "local-natural" ? "#43341c" : "#203043";
+      profileGuide.style.borderColor = profile === "local-natural" ? "#816333" : "#354a62";
+    };
+    updateProfileGuide(prefs.localProfile || "local-balanced");
+    panel.appendChild(profileGuide);
 
     const readiness = document.createElement("div");
     readiness.setAttribute("role", "status");
@@ -1643,11 +1754,11 @@
     });
     appendLabel("Конкретный:", voiceModelSelect);
 
-    function refreshVoiceOptions({ clearInvalid = false } = {}) {
+    function refreshVoiceOptions({ clearInvalid = false, target = targetSelect.value, selected = prefs.voiceId } = {}) {
       const compatible = voiceCatalog.filter(
-        (voice) => voice.language === prefs.target && voice.installed !== false
+        (voice) => voice.language === target && voice.installed === true
       );
-      const previous = prefs.voiceId;
+      const previous = selected;
       voiceModelSelect.replaceChildren();
       const automatic = document.createElement("option");
       automatic.value = "";
@@ -1698,7 +1809,16 @@
       if (s.audio) s.audio.volume = value;
     }, volumeId));
 
-    sectionTitle("Проба локального голоса");
+    const previewDetails = document.createElement("details");
+    previewDetails.className = "uvt-preview";
+    previewDetails.style.gridColumn = "1 / -1";
+    const previewSummary = document.createElement("summary");
+    previewSummary.textContent = "Прослушать локальные голоса";
+    previewDetails.appendChild(previewSummary);
+    const previewContent = document.createElement("div");
+    Object.assign(previewContent.style, { display: "grid", gap: "10px", paddingTop: "10px" });
+    previewDetails.appendChild(previewContent);
+    panel.appendChild(previewDetails);
     const previewText = document.createElement("textarea");
     previewText.id = nextControlId("preview-text");
     previewText.maxLength = 240;
@@ -1714,7 +1834,7 @@
       boxSizing: "border-box",
     });
     previewText.setAttribute("aria-label", "Текст для пробы голоса");
-    panel.appendChild(previewText);
+    previewContent.appendChild(previewText);
 
     const previewActions = document.createElement("div");
     Object.assign(previewActions.style, {
@@ -1728,24 +1848,24 @@
     const stopPreview = document.createElement("button");
     for (const button of [malePreview, femalePreview, stopPreview]) {
       button.type = "button";
-      Object.assign(button.style, CHIP_STYLE, { minHeight: "32px", padding: "4px 8px" });
+      Object.assign(button.style, CHIP_STYLE, { minHeight: "40px", padding: "4px 8px" });
       previewActions.appendChild(button);
     }
     setButton(malePreview, "▶ Мужской", "rgba(30, 100, 150, .9)", "Прослушать мужской локальный голос");
     setButton(femalePreview, "▶ Женский", "rgba(125, 55, 130, .9)", "Прослушать женский локальный голос");
     setButton(stopPreview, "■ Стоп", "rgba(255,255,255,.12)", "Отменить подготовку или остановить пробу голоса");
-    panel.appendChild(previewActions);
+    previewContent.appendChild(previewActions);
 
     const previewStatus = document.createElement("div");
     previewStatus.setAttribute("role", "status");
     previewStatus.setAttribute("aria-live", "polite");
     Object.assign(previewStatus.style, { gridColumn: "1 / -1", color: "#aeb6c2" });
     previewStatus.textContent = "Введите короткую фразу и выберите пример.";
-    panel.appendChild(previewStatus);
+    previewContent.appendChild(previewStatus);
 
     const applyPreviewButtonState = () => {
       const compatible = voiceCatalog.filter(
-        (voice) => voice.language === prefs.target && voice.installed !== false
+        (voice) => voice.language === targetSelect.value && voice.installed === true
       );
       malePreview.disabled = !previewAllowed
         || !compatible.some((voice) => voice.gender === "male");
@@ -1780,7 +1900,7 @@
       malePreview.disabled = true;
       femalePreview.disabled = true;
       const selectedVoice = voiceCatalog.find(
-        (voice) => voice.id === prefs.voiceId && voice.gender === gender
+        (voice) => voice.id === voiceModelSelect.value && voice.gender === gender
       );
       const previewAbort = new AbortController();
       s.previewAbort = previewAbort;
@@ -1788,11 +1908,11 @@
         route: "free",
         server: serverForRoute("free"),
         settingsMode: "override",
-        source: prefs.source,
-        target: prefs.target,
+        source: sourceSelect.value,
+        target: targetSelect.value,
         voice: gender,
         voiceId: selectedVoice ? selectedVoice.id : "",
-        profileId: prefs.localProfile,
+        profileId: profileSelect.value,
       };
       try {
         const resolvedPreview = await resolveJobPrefs(previewPrefs, previewAbort.signal);
@@ -1840,13 +1960,16 @@
       previewStatus.textContent = "Проба остановлена.";
     });
 
-    sectionTitle("Подключение");
     const connection = document.createElement("details");
     connection.style.gridColumn = "1 / -1";
     const connectionSummary = document.createElement("summary");
-    connectionSummary.textContent = "Адрес текущего маршрута";
+    connectionSummary.textContent = "Подключение и диагностика";
     connectionSummary.style.cursor = "pointer";
     connection.appendChild(connectionSummary);
+    const engineStatus = document.createElement("div");
+    Object.assign(engineStatus.style, { marginTop: "10px", color: "#bac8da", overflowWrap: "anywhere" });
+    engineStatus.textContent = "Данные о моделях появятся после подключения.";
+    connection.appendChild(engineStatus);
     const serverUrlInput = document.createElement("input");
     serverUrlInput.type = "url";
     serverUrlInput.value = serverForRoute(prefs.route).url;
@@ -1894,6 +2017,7 @@
         readiness.textContent = "Проверяю сервер и модели…";
       }
       previewAllowed = false;
+      profileSelect.disabled = true;
       applyPreviewButtonState();
       try {
         const activeRoute = prefs.route;
@@ -1927,13 +2051,16 @@
           if (!panel.isConnected || sequence !== metaSequence) return;
         }
 
+        if (usingServerSettings) {
+          sourceSelect.value = (baseMeta.profile && baseMeta.profile.source_lang) || "auto";
+          targetSelect.value = (baseMeta.profile && baseMeta.profile.target_lang) || "ru";
+          voiceSelect.value = (baseMeta.defaults && baseMeta.defaults.voice_gender) || "auto";
+        }
         const engines = meta.profile && meta.profile.engines ? meta.profile.engines : {};
         const profileInfo = (meta.profiles || []).find((item) => item.id === selectedProfile);
         const engineInfo = profileInfo && profileInfo.engines ? profileInfo.engines : engines;
         localSourceRestricted = activeRoute === "free" && (
-          ["local-fast", "local-balanced", "local-quality", "local-natural"].includes(selectedProfile)
-          || engineInfo.stt === "parakeet-mlx"
-          || engineInfo.translation === "translategemma-mlx"
+          engineInfo.stt === "parakeet-mlx"
         );
         const advertisedTargets = meta.limits
           && Array.isArray(meta.limits.local_tts_languages)
@@ -1965,7 +2092,13 @@
         const readinessInfo = meta.model_readiness || {};
         const readinessText = readinessInfo.detail || "сервер отвечает";
         const settingsLabel = usingServerSettings ? "Web-панель" : "Для этого видео";
-        const statusText = `${settingsLabel} · ${profileInfo ? profileInfo.label : selectedProfile}: ${engineInfo.stt || "?"} → ${engineInfo.translation || "?"} → ${engineInfo.tts || "?"}. ${readinessText}`;
+        const privacy = meta.privacy || {};
+        const privacyText = privacy.data_leaves_device === false && !(privacy.unknown_components || []).length
+          ? "Обработка на устройстве сервера."
+          : privacy.data_leaves_device === true ? "Этот профиль отправляет данные внешним сервисам." : "Локальность обработки не подтверждена сервером.";
+        const statusText = `${settingsLabel}: ${readinessText}. ${privacyText}`;
+        engineStatus.textContent = `${profileInfo ? profileInfo.label : selectedProfile}: ${engineInfo.stt || "?"} → ${engineInfo.translation || "?"} → ${engineInfo.tts || "?"}. Режим: подготовка видео по этапам.`;
+        updateProfileGuide(selectedProfile);
         if (readiness.textContent !== statusText) readiness.textContent = statusText;
 
         renderProfileOptions(baseProfiles, selectedProfile);
@@ -1974,9 +2107,11 @@
           ? meta.voices : [];
         refreshVoiceOptions({
           clearInvalid: !usingServerSettings && activeRoute === "free",
+          target: targetSelect.value,
+          selected: usingServerSettings ? (baseMeta.defaults && baseMeta.defaults.voice_id) || "" : prefs.voiceId,
         });
         const compatible = voiceCatalog.filter(
-          (voice) => voice.language === prefs.target && voice.installed !== false
+          (voice) => voice.language === targetSelect.value && voice.installed === true
         );
         const hasMale = compatible.some((voice) => voice.gender === "male");
         const hasFemale = compatible.some((voice) => voice.gender === "female");
@@ -2008,26 +2143,15 @@
         }
       } catch (error) {
         if (error && error.name === "AbortError") return;
-        readiness.textContent = String(error && error.message ? error.message : error);
+        if (!panel.isConnected || sequence !== metaSequence) return;
+        profileSelect.disabled = true;
+        voiceModelSelect.disabled = true;
+        readiness.textContent = `Сервер недоступен. Проверьте запуск UVT и адрес в «Подключение и диагностика». ${String(error && error.message ? error.message : error)}`;
       }
     }
 
-    const close = document.createElement("button");
-    close.type = "button";
-    setButton(close, "Закрыть настройки", "transparent", "Закрыть настройки пакетного перевода");
-    Object.assign(close.style, CHIP_STYLE, {
-      gridColumn: "1 / -1",
-      minHeight: "34px",
-      justifySelf: "end",
-    });
-    close.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      closeLangPanel(wrapper, chip, true);
-    });
-    panel.appendChild(close);
-
     panel.addEventListener("keydown", (event) => {
+      event.stopPropagation();
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
@@ -2078,7 +2202,7 @@
       alignItems: "flex-start",
       opacity: "1",
       pointerEvents: "auto",
-      transition: "opacity 0.25s ease",
+      transition: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "none" : "opacity 0.25s ease",
     });
 
     const btn = document.createElement("button");
@@ -2129,6 +2253,21 @@
     wrapper.appendChild(routeSelect);
     wrapper.appendChild(chip);
     wrapper.appendChild(cancelBtn);
+    const progressTrack = document.createElement("div");
+    progressTrack.className = "uvt-progress";
+    progressTrack.hidden = true;
+    progressTrack.setAttribute("role", "progressbar");
+    progressTrack.setAttribute("aria-label", "Готовность перевода видео");
+    progressTrack.setAttribute("aria-valuemin", "0");
+    progressTrack.setAttribute("aria-valuemax", "100");
+    Object.assign(progressTrack.style, { flexBasis: "100%", height: "4px", background: "#29364b", borderRadius: "4px", overflow: "hidden" });
+    const progressFill = document.createElement("div");
+    Object.assign(progressFill.style, { height: "100%", width: "0", background: "#a9d1ff" });
+    progressTrack.appendChild(progressFill);
+    const jobAnnouncement = document.createElement("span");
+    jobAnnouncement.setAttribute("role", "status");
+    jobAnnouncement.className = "uvt-sr-only";
+    wrapper.append(progressTrack, jobAnnouncement);
     for (const control of [wrapper, btn, routeSelect, chip, cancelBtn]) {
       forcePointerEvents(control);
     }
@@ -2140,6 +2279,10 @@
       routeSelect,
       chip,
       cancelButton: cancelBtn,
+      progressTrack,
+      progressFill,
+      jobAnnouncement,
+      lastAnnouncedStage: "",
       on: false,
       busy: false,
       cancelled: false,
@@ -2359,6 +2502,24 @@
   // Перехват нажатий уже зарегистрирован выше — раньше скриптов плеера.
   // Обход DOM начинается, когда документ готов.
   function boot() {
+    const styles = document.createElement("style");
+    styles.textContent = `
+      .uvt-panel { color-scheme: dark; overscroll-behavior: contain; text-align: left; }
+      .uvt-panel * { box-sizing: border-box; }
+      .uvt-panel button, .uvt-wrap button { text-transform: none; letter-spacing: normal; }
+      .uvt-panel :is(button, select, input, textarea, summary):focus-visible,
+      .uvt-wrap :is(button, select):focus-visible { outline: 3px solid #9ecaff !important; outline-offset: 3px; }
+      .uvt-panel :disabled { opacity: .5; cursor: not-allowed !important; }
+      .uvt-panel details { border: 1px solid #3a4658; border-radius: 9px; padding: 10px 12px; }
+      .uvt-panel summary { cursor: pointer; min-height: 24px; font-weight: 600; color: #e8f0fc; }
+      .uvt-panel [hidden], .uvt-wrap [hidden] { display: none !important; }
+      .uvt-sr-only { position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+      @media (max-width: 480px) {
+        .uvt-panel { grid-template-columns: minmax(0, 1fr) !important; padding-left: 14px !important; padding-right: 14px !important; }
+        .uvt-panel label { margin-bottom: -6px; }
+      }
+    `;
+    (document.head || document.documentElement).appendChild(styles);
     scan();
     setInterval(scan, 2000);
     // Плеер и страница двигают видео (раскрытие, theatre mode, липкий плеер):

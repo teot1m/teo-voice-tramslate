@@ -1,0 +1,25 @@
+{
+  "issue": "local-natural Demucs appears stalled at 8 percent after cached source download",
+  "observed_job": {
+    "id": "741946eea97b",
+    "status": "cancelled",
+    "elapsed_seconds": 160.1,
+    "audio_seconds": 643.3
+  },
+  "observed_server_default": "local-balanced; settings saved=false, revision=0",
+  "changes": [
+    "separate/decode stages; thread-safe native chunk progress",
+    "cooperative separation cancellation and GPU cleanup",
+    "cached-only Demucs default; actual YAML and 84025440-byte weight cache verified without loading",
+    "release prepared STT before Demucs",
+    "userscript 0.18.1 heavy-profile guidance"
+  ],
+  "validation": {
+    "full_python_suite": "337 passed in 9.53s",
+    "followup_separation_suite": "25 passed after intermediate progress rounding adjustment",
+    "browser": "isolated userscript/workspace, heavy profile, separate stage, server defaults reset, mobile390px; no JS errors",
+    "syntax": "both JS files and git diff --check passed"
+  },
+  "activation": "existing user server and selected settings were not changed; restart required for backend changes; userscript update required",
+  "limits": "No real Demucs inference or user video translated during this fix; no new speed benchmark."
+}

@@ -225,6 +225,31 @@ async def _wait_for(predicate, timeout: float = 1.0) -> None:
     await asyncio.wait_for(_check(), timeout)
 
 
+async def test_live_service_restart_releases_audio_subscriptions():
+    bus = Bus()
+    service = _RecordingRealtimeService(bus, AppConfig(), Metrics())
+    topic = bus.topic(service.consumes)
+    for _ in range(3):
+        await service.start()
+        await _wait_for(lambda: len(topic._subs) == 1)
+        await service.stop()
+        assert topic._subs == []
+
+
+async def test_live_service_failed_setup_releases_subscription():
+    bus = Bus()
+    service = _RecordingRealtimeService(bus, AppConfig(), Metrics())
+
+    async def failed_setup():
+        raise RuntimeError("model unavailable")
+
+    service.setup = failed_setup
+    await service.start()
+    await service.task
+    assert bus.topic(service.consumes)._subs == []
+    await service.stop()
+
+
 async def test_realtime_service_drops_expired_and_uses_latest_wins_before_handle():
     cfg = AppConfig()
     cfg.output.latest_wins = True

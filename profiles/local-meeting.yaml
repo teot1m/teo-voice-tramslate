@@ -1,0 +1,37 @@
+# Experimental local subtitles for system audio through BlackHole on Apple Silicon.
+# Set capture.device to the BlackHole input selected on your Mac.
+mode: subtitles
+source_lang: en
+target_lang: ru
+capture:
+  backend: sounddevice
+  device: null
+vad:
+  engine: silero
+stt:
+  engine: parakeet-mlx
+  model: mlx-community/parakeet-tdt-0.6b-v3
+  revision: ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15
+  allow_download: false
+  concurrency: 1
+translation:
+  engine: translategemma-mlx
+  model: mlx-community/translategemma-4b-it-4bit
+  revision: 5788ec08c047f3f2e17808101b8d9566ac930d58
+  allow_download: false
+  batch_size: 1
+  concurrency: 1
+  max_tokens: 128
+tts:
+  engine: none
+latency:
+  preset: balanced
+output:
+  max_backlog_s: 20.0
+  target_delay_s: 0.75
+  latest_wins: true
+overlay:
+  show: translation
+  position: top
+history:
+  enabled: true

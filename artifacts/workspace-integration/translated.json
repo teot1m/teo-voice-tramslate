@@ -1,0 +1,28 @@
+[
+  {
+    "start": 0.32,
+    "end": 1.664,
+    "original": "hello 1",
+    "translated": "HELLO 1 [ru]",
+    "language": "en",
+    "target_lang": "ru",
+    "tts_start": 0.17,
+    "tts_end": 0.37,
+    "speaker_id": null,
+    "speaker_confidence": null,
+    "voice_style": "male"
+  },
+  {
+    "start": 2.336,
+    "end": 3.68,
+    "original": "hello 2",
+    "translated": "HELLO 2 [ru]",
+    "language": "en",
+    "target_lang": "ru",
+    "tts_start": 2.186,
+    "tts_end": 2.386,
+    "speaker_id": null,
+    "speaker_confidence": null,
+    "voice_style": "male"
+  }
+]

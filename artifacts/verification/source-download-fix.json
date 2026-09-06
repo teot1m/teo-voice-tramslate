@@ -1,0 +1,19 @@
+{
+  "problem": "URL workspace remains at connecting when yt-dlp progress uses carriage returns",
+  "changes": [
+    "newline/CR progress support and bounded output reader",
+    "metadata and byte-only progress without fake percentages",
+    "15s socket timeout and bounded retry counts",
+    "120s before transfer; 90s without new downloader data; overall 1800s",
+    "native FFmpeg time progress supports healthy long HLS downloads",
+    "total process timeout covers pipe drain; cancellation reaps owned descendants",
+    "failed_stage for source-specific UI recovery"
+  ],
+  "validation": {
+    "pytest": "361 passed in 9.52s",
+    "ui": "10 isolated browser scenarios, including390px; no JS errors",
+    "real_source": "first3s retrieved using actual server page downloader in4.04s, output3.019002s audio/71878bytes; no models or playback",
+    "syntax": "node --check and git diff --check passed"
+  },
+  "limits": "Full video translation was not run; normal UVT server was unavailable during diagnostic read and was not started by this fix."
+}

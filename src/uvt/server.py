@@ -45,7 +45,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from uvt.config import AppConfig, load_config
 from uvt import registry
-from uvt.dub import CLIP_LEAD_S, render_dub_track
+from uvt.dub import CLIP_LEAD_S, _run_blocking, render_dub_track
 from uvt.fallback import ApprovalGate, create_stt_engine
 from uvt.interfaces import STTEngine
 from uvt.server_settings import (
@@ -77,7 +77,7 @@ _LOCAL_PROFILE_LABELS = {
     "local-fast": "Быстро",
     "local-balanced": "Сбалансированный",
     "local-quality": "Качество",
-    "local-natural": "Живые голоса",
+    "local-natural": "Живые голоса · медленно",
 }
 _VOICE_LABELS = {
     "ru_RU-dmitri-medium": "Дмитрий",
@@ -225,6 +225,8 @@ _SOURCE_CACHE_LOCKS: dict[str, asyncio.Lock] = {}
 _STAGE_DETAILS = {
     "queue": "ожидает свободный обработчик…",
     "download": "получаю исходный звук…",
+    "decode": "декодирую исходный звук…",
+    "separate": "отделяю речь от фона…",
     "transcribe": "распознаю речь…",
     "translate": "перевожу реплики…",
     "synthesize": "озвучиваю перевод…",
@@ -275,25 +277,71 @@ def _source_cache_key(data: dict) -> str | None:
 
 
 async def _kill_process(proc: asyncio.subprocess.Process) -> None:
-    if proc.returncode is None:
-        proc.terminate()
+    """Terminate this invocation, including children in its owned POSIX group."""
+    group = getattr(proc, "_uvt_process_group", None)
+
+    def stop(force: bool = False) -> None:
         try:
+            if group is not None and os.name == "posix":
+                # Only _run_process marks a group that it created with
+                # start_new_session. Never signal an inherited process group.
+                os.killpg(group, signal.SIGKILL if force else signal.SIGTERM)
+            elif proc.returncode is None:
+                proc.kill() if force else proc.terminate()
+        except ProcessLookupError:
+            pass
+
+    stop()
+    try:
+        if proc.returncode is None:
             await asyncio.wait_for(proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        # The leader may already have exited while ffmpeg/node still holds a
+        # pipe open. Killing its owned group is required in that case as well.
+        stop(force=True)
+        transport = getattr(proc, "_transport", None)
+        if transport is not None:
+            transport.close()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=2)
+    except asyncio.TimeoutError:
+        log.warning("не удалось подтвердить завершение подпроцесса за время очистки")
 
 
 async def _read_process_lines(stream, on_line: Callable[[str], None]) -> None:
-    """Drain a subprocess stream so progress parsing can never deadlock it."""
-    while True:
-        line = await stream.readline()
-        if not line:
+    """Drain CR/LF progress with bounded memory, including oversized lines."""
+    pending = bytearray()
+    max_line_bytes = 16 * 1024
+
+    def emit() -> None:
+        if not pending:
+            return
+        text = pending.decode("utf-8", errors="replace").strip()
+        pending.clear()
+        if not text:
             return
         try:
-            on_line(line.decode("utf-8", errors="replace").strip())
-        except Exception:  # noqa: BLE001 — progress must never break download
+            on_line(text)
+        except Exception:  # noqa: BLE001 - progress must never break downloading
             log.debug("не удалось разобрать прогресс подпроцесса", exc_info=True)
+
+    while True:
+        chunk = await stream.read(16 * 1024)
+        if not chunk:
+            emit()
+            return
+        start = 0
+        for index, byte in enumerate(chunk):
+            if byte not in (10, 13):
+                continue
+            pending.extend(chunk[start:index][:max(0, max_line_bytes - len(pending))])
+            emit()
+            start = index + 1
+        # Keep the beginning of a diagnostic but continue consuming every byte
+        # of an arbitrarily long line, so child output can never fill the pipe.
+        pending.extend(chunk[start:][:max(0, max_line_bytes - len(pending))])
 
 
 async def _run_process(
@@ -303,33 +351,64 @@ async def _run_process(
     *,
     on_line: Callable[[str], None] | None = None,
 ) -> None:
-    """Запустить подпроцесс с опциональным безопасным парсером progress.
-
-    При включённом progress читаем оба pipe параллельно: иначе заполненный
-    stdout/stderr способен подвесить ffmpeg/yt-dlp. Отмена по-прежнему сначала
-    завершает дочерний процесс, затем дожидается drain-задач.
-    """
+    """Run a bounded process; timeout covers both execution and pipe draining."""
     pipe = asyncio.subprocess.PIPE if on_line is not None else None
-    proc = await asyncio.create_subprocess_exec(*cmd, stdout=pipe, stderr=pipe)
+    kwargs = {"stdout": pipe, "stderr": pipe}
+    if os.name == "posix":
+        kwargs["start_new_session"] = True
+    proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
+    if os.name == "posix" and getattr(proc, "pid", None) is not None:
+        proc._uvt_process_group = proc.pid
     readers: list[asyncio.Task] = []
     if on_line is not None:
         if proc.stdout is not None:
             readers.append(asyncio.create_task(_read_process_lines(proc.stdout, on_line)))
         if proc.stderr is not None:
             readers.append(asyncio.create_task(_read_process_lines(proc.stderr, on_line)))
+    process_wait = asyncio.create_task(proc.wait())
+
+    async def finished() -> int:
+        # A reader failure must be visible immediately, while a live child can
+        # still be terminated, rather than being hidden after proc.wait().
+        results = await asyncio.gather(process_wait, *readers)
+        return results[0]
+
+    async def cleanup() -> None:
+        try:
+            await _kill_process(proc)
+        finally:
+            for task in [process_wait, *readers]:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(process_wait, *readers, return_exceptions=True)
+
+    async def drain_cleanup() -> None:
+        # Repeated UI/API cancellation must not interrupt termination or leave
+        # ffmpeg/yt-dlp descendants running after the job says it is cancelled.
+        task = asyncio.create_task(cleanup())
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        try:
+            task.result()
+        except Exception:
+            log.exception("ошибка завершения подпроцесса %s", what)
+
     try:
-        code = await asyncio.wait_for(proc.wait(), timeout=timeout_s)
-        if readers:
-            await asyncio.gather(*readers, return_exceptions=True)
+        code = await asyncio.wait_for(finished(), timeout=timeout_s)
     except asyncio.TimeoutError:
-        await _kill_process(proc)
-        if readers:
-            await asyncio.gather(*readers, return_exceptions=True)
-        raise RuntimeError(f"{what} не уложился в {timeout_s / 60:.0f} мин — прерван") from None
+        await drain_cleanup()
+        limit = f"{timeout_s:.0f} с" if timeout_s < 120 else f"{timeout_s / 60:.0f} мин"
+        raise RuntimeError(f"{what} не уложился в {limit} — прерван") from None
     except asyncio.CancelledError:
-        await _kill_process(proc)
-        if readers:
-            await asyncio.gather(*readers, return_exceptions=True)
+        await drain_cleanup()
+        raise
+    except Exception:
+        await drain_cleanup()
         raise
     if code != 0:
         raise RuntimeError(f"{what} завершился с ошибкой (код {code})")
@@ -371,28 +450,51 @@ def _ffmpeg_progress_parser(
 
 
 def _yt_dlp_progress_parser(
-    progress: _ProgressCallback,
-    diagnostics: list[str] | None = None,
+    progress: _ProgressCallback, diagnostics: list[str] | None = None,
 ) -> Callable[[str], None]:
-    """Read progress and retain a short yt-dlp diagnostic tail on failure."""
+    """Expose extractor phases, byte-only progress, and a bounded error tail."""
+    from uvt.source_download import ffmpeg_progress_time
+
     pattern = re.compile(r"UVT_PROGRESS:\s*([0-9]+(?:[.,][0-9]+)?)%")
+    byte_pattern = re.compile(r"UVT_BYTES:(\d+)")
     ansi = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+    last_fraction = None
 
     def on_line(line: str) -> None:
-        match = pattern.search(line)
-        if match is None:
-            if diagnostics is not None:
-                clean = ansi.sub("", line).strip()
-                if clean:
-                    diagnostics.append(clean[:800])
-                    del diagnostics[:-8]
+        nonlocal last_fraction
+        matches = list(pattern.finditer(line))
+        if matches:
+            percent = min(99.0, max(0.0, float(matches[-1][1].replace(",", "."))))
+            last_fraction = percent / 100.0
+            progress(last_fraction, f"скачиваю звук со страницы: {percent:.0f}%")
             return
-        try:
-            percent = float(match.group(1).replace(",", "."))
-        except ValueError:
+        if "UVT_PROGRESS:" in line:
+            size = byte_pattern.search(line)
+            detail = f"получено {int(size[1]) / 1024**2:.1f} МБ; размер файла неизвестен" if size else "получаю звук; размер файла неизвестен"
+            progress(last_fraction, detail)
             return
-        percent = min(99.0, max(0.0, percent))
-        progress(percent / 100.0, f"скачиваю звук со страницы: {percent:.0f}%")
+        stamp = ffmpeg_progress_time(line)
+        if stamp is not None:
+            progress(last_fraction, f"получаю звук: обработано {stamp}; полный размер неизвестен")
+            return
+        clean = ansi.sub("", line).strip()
+        if not clean:
+            return
+        if diagnostics is not None:
+            diagnostics.append(clean[:800])
+            del diagnostics[:-8]
+        lowered = clean.lower()
+        detail = None
+        if "downloading" in lowered and "webpage" in lowered:
+            detail = "получаю страницу видео…"
+        elif "downloading" in lowered and any(kind in lowered for kind in ("m3u8", "mpd", "manifest")):
+            detail = "проверяю доступные медиапотоки…"
+        elif "downloading" in lowered and any(kind in lowered for kind in ("json", "metadata", "api")):
+            detail = "получаю сведения о видео…"
+        elif "retrying" in lowered or "retry " in lowered:
+            detail = "сайт не ответил; выполняю ограниченную повторную попытку…"
+        if detail is not None:
+            progress(last_fraction, detail)
 
     return on_line
 
@@ -485,6 +587,7 @@ async def _download_page(
 ) -> Path:
     """Скачивает ролик по адресу страницы через yt-dlp (асинхронно, убиваемо)."""
     from uvt.dub import _find_ytdlp, _ytdlp_js_args
+    from uvt.source_download import run_source_download, SourceDownloadTimeout
 
     ytdlp = _find_ytdlp()
     if ytdlp is None:
@@ -503,23 +606,24 @@ async def _download_page(
             # берём наименьший аудио-содержащий вариант.
             "--no-playlist",
             "--no-color",
+            "--newline", "--progress",
+            "--socket-timeout", "15",
+            "--retries", "2", "--fragment-retries", "2", "--extractor-retries", "1",
+            "--retry-sleep", "2",
             "-f", _YT_DLP_AUDIO_SELECTOR,
             "--progress-delta", "3",
         ]
-        if progress is not None:
-            cmd += ["--progress-template", "download:UVT_PROGRESS:%(progress._percent_str)s"]
-        cmd += ["-o", str(dest_dir / "%(title).80s.%(ext)s"), page_url]
+        cmd += ["--progress-template", "download:UVT_PROGRESS:%(progress._percent_str)s;UVT_BYTES:%(progress.downloaded_bytes)s"]
+        cmd += ["-o", str(dest_dir / "%(title).80s.%(ext)s"), "--", page_url]
         return cmd
 
     async def run_attempt(
         diagnostics: list[str], extra_args: list[str] | None = None
     ) -> None:
         callback = progress or (lambda _fraction, _detail: None)
-        await _run_process(
-            build_command(extra_args),
-            1800,
-            "yt-dlp",
-            on_line=_yt_dlp_progress_parser(callback, diagnostics),
+        await run_source_download(
+            _run_process, build_command(extra_args),
+            _yt_dlp_progress_parser(callback, diagnostics), progress,
         )
 
     files_before = set(dest_dir.iterdir())
@@ -558,9 +662,31 @@ async def _download_page(
             failure = exc
 
     if failure is not None:
+        if isinstance(failure, SourceDownloadTimeout):
+            raise RuntimeError(f"Не удалось получить источник: {failure}") from None
+        # Some ordinary HTML5/Playerjs sites have public media URLs but no
+        # dedicated yt-dlp extractor. Read only their explicit player config.
+        if "unsupported url" in "\n".join(diagnostics).lower():
+            import httpx
+            from uvt.media_discovery import discover_page_media
+
+            if progress is not None:
+                progress(0.0, "yt-dlp не знает этот сайт; проверяю ссылки видеоплеера…")
+            try:
+                page_candidates = await discover_page_media(page_url)
+            except (OSError, ValueError, httpx.HTTPError):
+                page_candidates = []
+            for index, candidate in enumerate(page_candidates):
+                try:
+                    return await _download_media(
+                        candidate, dest_dir, referer=page_url,
+                        out_name=f"page_media_{index}.m4a", progress=progress,
+                    )
+                except RuntimeError:
+                    log.info("публичный поток плеера %d недоступен; пробую следующий", index + 1)
         reason = next(
             (line for line in reversed(diagnostics) if "ERROR:" in line),
-            diagnostics[-1] if diagnostics else "",
+            str(failure),
         )
         detail = f" Причина yt-dlp: {reason}" if reason else ""
         raise RuntimeError(
@@ -610,9 +736,8 @@ def _rank_candidate(url: str) -> int:
 def _browser_media_candidates(data: dict) -> list[str]:
     """Собрать browser-provided источники в безопасном и быстром порядке.
 
-    Ранжируем и текущий ``media_url``, и сетевые ресурсы: явный audio/HLS/DASH
-    идёт раньше muxed MP4/WebM. yt-dlp получает страницу только после всех
-    этих попыток.
+    Сначала текущий ``media_url`` выбранного плеера, затем сетевые подсказки
+    audio/HLS/DASH перед прочими MP4/WebM. yt-dlp запускается последним.
     """
     raw_primary = data.get("media_url")
     primary = raw_primary.strip() if isinstance(raw_primary, str) else None
@@ -630,15 +755,13 @@ def _browser_media_candidates(data: dict) -> list[str]:
         return []
     # Python sort is stable, поэтому равные по типу ресурсы остаются в порядке,
     # в котором их увидел плеер/браузер.
+    # currentSrc belongs to the selected video. Resource-timing hints may
+    # belong to an ad player; prioritizing every HLS URL can dub an advert or
+    # spend minutes attempting unrelated streams before the real MP4.
     ordered = sorted(candidates, key=_rank_candidate)
-    if len(ordered) <= _MAX_BROWSER_MEDIA_CANDIDATES or primary not in ordered:
-        return ordered[:_MAX_BROWSER_MEDIA_CANDIDATES]
-
-    # userscript уже ограничивает extras шестью URL, но добавляет к ним
-    # media_url. Если он стал седьмым после сортировки, не теряем известный
-    # текущий src: он остаётся последней попыткой вместо худшего ресурса.
-    if primary not in ordered[:_MAX_BROWSER_MEDIA_CANDIDATES]:
-        return ordered[: _MAX_BROWSER_MEDIA_CANDIDATES - 1] + [primary]
+    if primary in ordered:
+        ordered.remove(primary)
+        ordered.insert(0, primary)
     return ordered[:_MAX_BROWSER_MEDIA_CANDIDATES]
 
 
@@ -652,6 +775,9 @@ class Job:
     detail: str = ""
     progress: float = 0.0
     audio_url: str | None = None
+    downloads: dict[str, str] = field(default_factory=dict)
+    source_name: str = ""
+    failed_stage: str = ""
     entries: list = field(default_factory=list)
     # Реплики, готовые ещё до конца обработки: браузер проигрывает их сразу,
     # не дожидаясь полной дорожки (прогрессивный дубляж).
@@ -1087,7 +1213,7 @@ class DubServer:
         """Remove old rendered tracks and shared browser sources on startup."""
         cutoff = time.time() - max_age_days * 86400
         removed = 0
-        for file in self.audio_dir.glob("*.m4a"):
+        for file in (*self.audio_dir.glob("*.m4a"), *self.audio_dir.glob("*.mkv")):
             try:
                 if file.stat().st_mtime < cutoff:
                     file.unlink()
@@ -1097,6 +1223,16 @@ class DubServer:
                 continue
         if removed:
             log.info("кэш дорожек: удалено %d старых файлов", removed)
+        # Interrupted uploads are task-owned temporary data; clean only stale
+        # files at startup so another active route cannot lose its upload.
+        uploads = self.audio_dir / "uploads"
+        if uploads.is_dir():
+            for uploaded in uploads.iterdir():
+                try:
+                    if uploaded.is_file() and uploaded.stat().st_mtime < cutoff:
+                        uploaded.unlink()
+                except OSError:
+                    continue
         source_removed = 0
         source_dir = self.audio_dir / "sources"
         if source_dir.is_dir():
@@ -1523,6 +1659,8 @@ class DubServer:
         self._validate_stt_language_support(cfg)
         return (
             str(source),
+            str(data.get("mix_original") is True),
+            str(data.get("export_video") is True),
             str(cfg.source_lang),
             str(cfg.target_lang),
             str(cfg.stt.engine),
@@ -1599,7 +1737,15 @@ class DubServer:
                 self._download_last_log_at[job.id] = now
                 log.info("задача %s: получение звука — %s", job.id, detail)
 
-    def _set_render_progress(self, job: Job, done: int, total: int) -> None:
+    def _set_preprocess_progress(self, job: Job, stage: str, fraction: float, detail: str) -> None:
+        if job.status != "running" or stage not in {"decode", "separate"}:
+            return
+        if stage == "separate":
+            overall = _DOWNLOAD_PROGRESS_SHARE + (1 - _DOWNLOAD_PROGRESS_SHARE) * 0.15 * self._clamp_progress(fraction)
+            job.progress = max(job.progress, round(overall, 3))
+        self._set_stage(job, stage, detail=detail, stage_progress=fraction)
+
+    def _set_render_progress(self, job: Job, done: int, total: int, *, preprocess_share: float = 0.0) -> None:
         """Переводит существующий progress render_dub_track в понятные этапы.
 
         Внутренний batch-конвейер уже сообщает 0–70 % для STT, 70–85 % для
@@ -1607,7 +1753,7 @@ class DubServer:
         API: только даём этой информации имена для браузера.
         """
         progress = self._clamp_progress(done / max(total, 1))
-        overall = round(_DOWNLOAD_PROGRESS_SHARE + (1.0 - _DOWNLOAD_PROGRESS_SHARE) * progress, 3)
+        overall = round(_DOWNLOAD_PROGRESS_SHARE + (1.0 - _DOWNLOAD_PROGRESS_SHARE) * (preprocess_share + (1 - preprocess_share) * progress), 3)
         if progress < 0.70:
             job.progress = overall
             self._set_stage(job, "transcribe", stage_progress=progress / 0.70)
@@ -1622,7 +1768,7 @@ class DubServer:
             # упаковка WAV → M4A ниже остаётся в том же честном финальном этапе.
             # Не показываем 100 %, пока ffmpeg ещё не отдал конечную M4A.
             job.progress = round(
-                _DOWNLOAD_PROGRESS_SHARE + (1.0 - _DOWNLOAD_PROGRESS_SHARE) * min(progress, 0.985),
+                _DOWNLOAD_PROGRESS_SHARE + (1.0 - _DOWNLOAD_PROGRESS_SHARE) * (preprocess_share + (1 - preprocess_share) * min(progress, 0.985)),
                 3,
             )
             self._set_stage(
@@ -1765,6 +1911,9 @@ class DubServer:
             "api_version": 2,
             "mode": "batch",
             "capabilities": {
+                "workspace": True,
+                "file_upload": True,
+                "subtitle_export": True,
                 "batch_dubbing": True,
                 "live_translation": False,
                 "streaming_audio": False,
@@ -2042,8 +2191,13 @@ class DubServer:
                     selected_profile = profile_snapshot or job.profile_name
                 job.profile_name = selected_profile
 
+                preprocess_share = 0.15 if cfg.separation.enabled else 0.0
+
                 def on_progress(done: int, total: int) -> None:
-                    self._set_render_progress(job, done, total)
+                    self._set_render_progress(job, done, total, preprocess_share=preprocess_share)
+
+                def on_stage(stage: str, fraction: float, detail: str) -> None:
+                    self._set_preprocess_progress(job, stage, fraction, detail)
 
                 def on_download_progress(fraction: float | None, detail: str) -> None:
                     self._set_download_progress(job, fraction, detail)
@@ -2067,34 +2221,55 @@ class DubServer:
                     # A downloader calls this on success too; repeat it here
                     # for plugin/local sources that only return a path.
                     self._set_download_progress(job, 1.0, "исходный звук получен")
-                    self._set_stage(job, "transcribe")
+                    self._set_stage(job, "decode")
                     stt_stage_started = True
-                    handed_stt = await self.take_prepared_stt(cfg)
+                    if cfg.separation.enabled:
+                        # On 16 GB keep Parakeet/Whisper out of memory while
+                        # Demucs processes the source; render loads STT later.
+                        await self.close_prepared_models()
+                        self._model_readiness = {
+                            "status": "on-demand",
+                            "detail": "распознавание загрузится после отделения речи, чтобы сэкономить память",
+                        }
+                    else:
+                        handed_stt = await self.take_prepared_stt(cfg)
                     # Для браузера — только голос перевода: оригинал играет сам
                     # плеер на странице (приглушённо), иначе звук двоится.
                     mixed, entries = await render_dub_track(
                         cfg,
                         source,
                         progress=on_progress,
-                        mix_original=False,
+                        mix_original=data.get("mix_original") is True,
                         approval=approval,
                         stt_engine=handed_stt,
                         on_clip=publish_clip,
+                        on_stage=on_stage,
                     )
 
                     import soundfile as sf
 
                     self._set_stage(job, "mix", stage_progress=max(job.stage_progress, 0.78))
                     wav = Path(td) / "mix.wav"
-                    sf.write(wav, mixed, 48000, subtype="PCM_16")
+                    await _run_blocking(sf.write, wav, mixed, 48000, subtype="PCM_16")
+                    del mixed
                     audio_path = self.audio_dir / f"{job.id}.m4a"
-                    subprocess.run(
+                    await _run_process(
                         [
                             "ffmpeg", "-v", "error", "-y", "-i", str(wav),
                             "-c:a", "aac", "-b:a", "160k", str(audio_path),
                         ],
-                        check=True,
+                        1800, "сохранение переведённой дорожки",
                     )
+                    if data.get("export_video") is True:
+                        self._set_stage(job, "mix", detail="сохраняю видео с переводом; видеоряд копируется без перекодирования")
+                        await _run_process(
+                            ["ffmpeg", "-v", "error", "-y", "-i", str(source),
+                             "-i", str(audio_path), "-map", "0:v:0", "-map", "1:a:0",
+                             "-map", "0:a?", "-c", "copy", "-disposition:a", "0",
+                             "-disposition:a:0", "default", "-metadata:s:a:0", "title=UVT translation",
+                             str(self.audio_dir / f"{job.id}.mkv")],
+                            1800, "сохранение видео с переводом",
+                        )
 
                 job.entries = [asdict(e) for e in entries]
                 if self.api_token:
@@ -2104,6 +2279,13 @@ class DubServer:
                     job.audio_url = f"/audio/{job.id}.m4a?access={audio_token}"
                 else:
                     job.audio_url = f"/audio/{job.id}.m4a"
+                access_query = f"?access={self._clip_token(job)}" if self.api_token else ""
+                formats = ["m4a", "srt", "vtt", "txt", "json"]
+                if data.get("export_video") is True:
+                    formats.append("mkv")
+                job.downloads = {
+                    kind: f"/download/{job.id}/{kind}{access_query}" for kind in formats
+                }
                 job.progress = 1.0
                 job.status = "done"
                 job.finished_at = time.time()
@@ -2124,6 +2306,7 @@ class DubServer:
             self._drop_clips(job.id)
             log.info("задача %s отменена", job.id)
         except Exception as exc:  # noqa: BLE001 — статус уходит клиенту
+            job.failed_stage = job.stage
             job.status = "error"
             job.finished_at = time.time()
             # Keep the selected route in the browser-visible error as well as
@@ -2139,6 +2322,10 @@ class DubServer:
             else:
                 log.exception("задача %s [%s] провалилась", job.id, route_context)
         finally:
+            if job.status in {"error", "cancelled"}:
+                for suffix in ("m4a", "mkv"):
+                    (self.audio_dir / f"{job.id}.{suffix}").unlink(missing_ok=True)
+                job.downloads.clear()
             if handed_stt is not None:
                 # Normally released by the STT stage; the second idempotent
                 # close also covers decode errors before transcription starts.
@@ -2200,10 +2387,13 @@ class DubServer:
             # Дорожка проверяет короткоживущий URL-токен в _get_audio: HTMLAudio
             # не позволяет передать X-UVT-Token. OPTIONS остаётся доступным для
             # корректного preflight userscript.
-            public_dashboard = request.method == "GET" and request.path == "/"
+            public_dashboard = request.method == "GET" and request.path in {
+                "/", "/workspace", "/workspace/app.js", "/workspace/style.css",
+                "/workspace/userscript.user.js",
+            }
             # Дорожка и отдельные реплики прогрессивного дубляжа проверяют
             # собственный URL-токен в своих обработчиках.
-            token_in_url = request.path.startswith(("/audio/", "/clip/"))
+            token_in_url = request.path.startswith(("/audio/", "/clip/", "/download/"))
             if (
                 request.method != "OPTIONS"
                 and not public_dashboard
@@ -2231,6 +2421,8 @@ class DubServer:
         app.router.add_post("/job/{jid}/approve", self._approve_job)
         app.router.add_get("/audio/{name}", self._get_audio)
         app.router.add_get("/clip/{jid}/{name}", self._get_clip)
+        from uvt.server_workspace import WorkspaceRoutes
+        WorkspaceRoutes(self).register(app)
         return app
 
     async def _index(self, request):
@@ -2574,6 +2766,9 @@ class DubServer:
                 </svg><span data-server-label>{server_label}</span>
               </div>
             </header><main>
+              <section class="instruction"><div><h2>Перевести скачанное видео</h2>
+                <p>Файлы, ссылки, субтитры и результаты в одном окне.</p></div>
+                <a class="meta-link" href="/workspace">Открыть рабочую панель</a></section>
               <table class="routes"><thead><tr><th>Маршрут</th><th>Профиль</th>
                 <th>Движок (цепочка)</th><th>Состояние</th><th>Действия</th></tr></thead>
                 <tbody>{''.join(route_rows)}</tbody></table>
@@ -3249,6 +3444,12 @@ class DubServer:
             raise web.HTTPBadRequest(text="ожидается JSON") from None
         if not isinstance(data, dict):
             raise web.HTTPBadRequest(text="ожидается JSON-object")
+        return await self._submit_dub_job(data)
+
+    async def _submit_dub_job(self, data: dict):
+        """Submit a validated request from JSON or the trusted upload handler."""
+        from aiohttp import web
+
         if self._settings_lock.locked():
             raise web.HTTPConflict(
                 text="настройки моделей обновляются; повторите через несколько секунд"
@@ -3271,8 +3472,16 @@ class DubServer:
                 payload.update({"job_url": f"/job/{cached_id}", "meta": request_meta})
                 return web.json_response(payload)
 
+        from uvt.server_workspace import upload_source_name
+
+        source_label = data.get("source_name")
+        if not isinstance(source_label, str) or not source_label.strip():
+            source_label = str(data.get("file") or "")
+        if not source_label:
+            source_label = urlsplit(str(data.get("page_url") or data.get("media_url") or "")).hostname or "Перевод видео"
         job = Job(
             id=uuid.uuid4().hex[:12],
+            source_name=upload_source_name(source_label),
             profile_name=str(request_meta["profile"]["name"]),
             engines=dict(request_meta["profile"]["engines"]),
         )
@@ -3287,6 +3496,9 @@ class DubServer:
                 cfg_snapshot.model_copy(deep=True),
                 selected_profile,
             )
+        )
+        self._tasks[job.id].add_done_callback(
+            lambda task: self._job_task_finished(job, task)
         )
         engines = request_meta["profile"]["engines"]
         log.info(
@@ -3303,6 +3515,16 @@ class DubServer:
         payload = self._job_payload(job)
         payload.update({"job_url": f"/job/{job.id}", "meta": request_meta})
         return web.json_response(payload)
+
+    def _job_task_finished(self, job: Job, task: asyncio.Task) -> None:
+        # A task cancelled before its first event-loop turn never enters
+        # _run_job, so its try/finally cannot finish the queued job.
+        if task.cancelled() and job.status == "queued":
+            job.status = "cancelled"
+            job.finished_at = time.time()
+            self._set_stage(job, "cancelled", stage_progress=1.0)
+        if self._tasks.get(job.id) is task:
+            self._tasks.pop(job.id, None)
 
     async def _post_tts_preview(self, request):
         from aiohttp import web

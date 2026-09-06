@@ -252,6 +252,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Запуск: {launch}")
         return 0
 
+    if args.command in {"dub", "serve", "serve-personal", "gui"}:
+        from uvt.media_runtime import MediaRuntimeError, ensure_media_runtime
+
+        try:
+            ensure_media_runtime()
+        except MediaRuntimeError as exc:
+            print(f"Ошибка аудио: {exc}", file=sys.stderr)
+            return 1
+
     if getattr(args, "mode", None) in _LEGACY_LIVE_MODES:
         print(
             f"Предупреждение: --mode {args.mode} устарел и работает как voiceover; "

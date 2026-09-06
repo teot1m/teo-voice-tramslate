@@ -1,0 +1,284 @@
+{
+  "started_at_utc": "2026-09-06T10:12:35.918139+00:00",
+  "mode": "one offline process; no HTTP listener",
+  "status": "done",
+  "source_duration_seconds": 13.970438,
+  "source_kind": "neutral English synthetic speech from installed macOS Samantha",
+  "source_text": "Good morning. Our project meeting starts at ten fifteen tomorrow. Please bring the updated budget and a short list of risks. We will compare two options and choose the next steps before lunch. Do not send the draft to customers until it is approved.",
+  "observations": [
+    {
+      "elapsed_seconds": 2.739,
+      "percent": 0.0
+    },
+    {
+      "elapsed_seconds": 6.196,
+      "percent": 70.0
+    },
+    {
+      "elapsed_seconds": 33.49,
+      "percent": 85.0
+    },
+    {
+      "elapsed_seconds": 35.407,
+      "percent": 87.0
+    },
+    {
+      "elapsed_seconds": 35.653,
+      "percent": 89.0
+    },
+    {
+      "elapsed_seconds": 35.665,
+      "percent": 92.0
+    },
+    {
+      "elapsed_seconds": 35.707,
+      "percent": 94.0
+    },
+    {
+      "elapsed_seconds": 35.718,
+      "percent": 97.0
+    },
+    {
+      "elapsed_seconds": 35.718,
+      "percent": 97.0
+    },
+    {
+      "elapsed_seconds": 35.88,
+      "percent": 100.0
+    }
+  ],
+  "clips": [
+    {
+      "index": 2,
+      "elapsed_seconds": 35.406,
+      "source_start": 3.7600000000000002,
+      "source_end": 7.04,
+      "duration_seconds": 3.239183673469388,
+      "original": "Please bring the updated budget and a short list of risks.",
+      "translated": "Пожалуйста, предоставьте обновленный бюджет и краткий список рисков.",
+      "voice_style": "female"
+    },
+    {
+      "index": 0,
+      "elapsed_seconds": 35.651,
+      "source_start": 0.0,
+      "source_end": 0.8,
+      "duration_seconds": 0.8712471655328798,
+      "original": "Good morning.",
+      "translated": "Доброе утро.",
+      "voice_style": "female"
+    },
+    {
+      "index": 4,
+      "elapsed_seconds": 35.664,
+      "source_start": 10.8,
+      "source_end": 13.84,
+      "duration_seconds": 4.702040816326531,
+      "original": "Do not send the draft to customers until it is approved.",
+      "translated": "Не отправляйте этот вариант клиентам, пока он не будет утвержден.",
+      "voice_style": "female"
+    },
+    {
+      "index": 1,
+      "elapsed_seconds": 35.707,
+      "source_start": 0.8,
+      "source_end": 3.7600000000000002,
+      "duration_seconds": 2.876780045351474,
+      "original": "Our project meeting starts at 10:15 tomorrow.",
+      "translated": "Наше совещание по проекту начнется завтра в 10:15.",
+      "voice_style": "female"
+    },
+    {
+      "index": 3,
+      "elapsed_seconds": 35.718,
+      "source_start": 7.04,
+      "source_end": 10.8,
+      "duration_seconds": 3.622312925170068,
+      "original": "We will compare two options and choose the next steps before lunch.",
+      "translated": "Мы сравним два варианта и выберем следующие шаги до обеда.",
+      "voice_style": "female"
+    }
+  ],
+  "limitations": [
+    "Single short clean synthetic speaker; no inference about noisy media or long video throughput.",
+    "Cold process including model load; not comparable to a fully warmed server."
+  ],
+  "elapsed_seconds": 35.889,
+  "peak_process_rss_bytes_macos": 1186922496,
+  "profile": {
+    "name": "local-balanced",
+    "source_lang": "auto",
+    "target_lang": "ru",
+    "stt": "parakeet-mlx",
+    "translation": "translategemma-mlx",
+    "tts": "piper",
+    "stt_allow_download": false,
+    "translation_allow_download": false
+  },
+  "pipeline_log": [
+    {
+      "elapsed_seconds": 0.186,
+      "message": "декодирую source-en.wav…"
+    },
+    {
+      "elapsed_seconds": 0.265,
+      "message": "декодирование завершено за 0.1 с"
+    },
+    {
+      "elapsed_seconds": 7.387,
+      "message": "пакетное распознавание: 5 фрагментов → 5 реплик"
+    },
+    {
+      "elapsed_seconds": 7.441,
+      "message": "распознавание завершено за 7.2 с"
+    },
+    {
+      "elapsed_seconds": 33.492,
+      "message": "перевод: 5/5 реплик"
+    },
+    {
+      "elapsed_seconds": 33.842,
+      "message": "перевод завершён за 26.3 с"
+    },
+    {
+      "elapsed_seconds": 33.842,
+      "message": "[@    0.0 с] Good morning. ⇒ Доброе утро."
+    },
+    {
+      "elapsed_seconds": 33.842,
+      "message": "[@    0.8 с] Our project meeting starts at 10:15 tomorrow. ⇒ Наше совещание по проекту начнется завтра в 10:15."
+    },
+    {
+      "elapsed_seconds": 33.842,
+      "message": "[@    3.8 с] Please bring the updated budget and a short list of risks. ⇒ Пожалуйста, предоставьте обновленный бюджет и краткий список рисков."
+    },
+    {
+      "elapsed_seconds": 33.842,
+      "message": "[@    7.0 с] We will compare two options and choose the next steps before lunch. ⇒ Мы сравним два варианта и выберем следующие шаги до обеда."
+    },
+    {
+      "elapsed_seconds": 33.843,
+      "message": "[@   10.8 с] Do not send the draft to customers until it is approved. ⇒ Не отправляйте этот вариант клиентам, пока он не будет утвержден."
+    },
+    {
+      "elapsed_seconds": 34.337,
+      "message": "сразу ускоряю 2 реплик по длительности выбранного голоса"
+    },
+    {
+      "elapsed_seconds": 35.718,
+      "message": "3 реплик подогнаны atempo под тайминги"
+    },
+    {
+      "elapsed_seconds": 35.862,
+      "message": "озвучка завершена за 2.0 с"
+    },
+    {
+      "elapsed_seconds": 35.862,
+      "message": "собираю дорожку (5 реплик, режим только голос)…"
+    },
+    {
+      "elapsed_seconds": 35.88,
+      "message": "дорожка подготовлена за 35.7 с"
+    }
+  ],
+  "first_clip_ready_seconds": 35.406,
+  "entries": [
+    {
+      "start": 0.0,
+      "end": 0.8,
+      "original": "Good morning.",
+      "translated": "Доброе утро.",
+      "language": "en",
+      "target_lang": "ru",
+      "tts_start": 0.0,
+      "tts_end": 0.87125,
+      "speaker_id": null,
+      "speaker_confidence": null,
+      "voice_style": "female"
+    },
+    {
+      "start": 0.8,
+      "end": 3.7600000000000002,
+      "original": "Our project meeting starts at 10:15 tomorrow.",
+      "translated": "Наше совещание по проекту начнется завтра в 10:15.",
+      "language": "en",
+      "target_lang": "ru",
+      "tts_start": 0.87125,
+      "tts_end": 3.7480208333333334,
+      "speaker_id": null,
+      "speaker_confidence": null,
+      "voice_style": "female"
+    },
+    {
+      "start": 3.7600000000000002,
+      "end": 7.04,
+      "original": "Please bring the updated budget and a short list of risks.",
+      "translated": "Пожалуйста, предоставьте обновленный бюджет и краткий список рисков.",
+      "language": "en",
+      "target_lang": "ru",
+      "tts_start": 3.7480208333333334,
+      "tts_end": 6.987208333333333,
+      "speaker_id": null,
+      "speaker_confidence": null,
+      "voice_style": "female"
+    },
+    {
+      "start": 7.04,
+      "end": 10.8,
+      "original": "We will compare two options and choose the next steps before lunch.",
+      "translated": "Мы сравним два варианта и выберем следующие шаги до обеда.",
+      "language": "en",
+      "target_lang": "ru",
+      "tts_start": 6.987208333333333,
+      "tts_end": 10.609520833333333,
+      "speaker_id": null,
+      "speaker_confidence": null,
+      "voice_style": "female"
+    },
+    {
+      "start": 10.8,
+      "end": 13.84,
+      "original": "Do not send the draft to customers until it is approved.",
+      "translated": "Не отправляйте этот вариант клиентам, пока он не будет утвержден.",
+      "language": "en",
+      "target_lang": "ru",
+      "tts_start": 10.65,
+      "tts_end": 15.352041666666667,
+      "speaker_id": null,
+      "speaker_confidence": null,
+      "voice_style": "female"
+    }
+  ],
+  "output_duration_seconds": 15.352041666666667,
+  "peak_mlx_allocator_bytes": 2764520201,
+  "wall_seconds_per_source_second": 2.569,
+  "timing_scope": {
+    "script_seconds": 35.889,
+    "render_function_seconds_from_log": 35.7,
+    "command_wall_seconds_time_l": 36.96,
+    "stt_seconds_including_load": 7.2,
+    "translation_seconds_including_load": 26.3,
+    "tts_seconds": 2.0,
+    "translategemma_model_load_approx_seconds": 18.6,
+    "translategemma_inference_approx_seconds": 7.4
+  },
+  "peak_memory_footprint_bytes_time_l": 4871442488,
+  "command_wall_seconds_per_source_second": 2.646,
+  "quality_sanity": {
+    "scope": "Manual text review and normalized source comparison on one clean synthetic English clip, not a model-quality benchmark.",
+    "normalized_recognition_matches_reference": true,
+    "normalization": "Case and punctuation ignored; ten fifteen and 10:15 treated as the same time.",
+    "preserved": [
+      "10:15 tomorrow",
+      "updated budget and risks",
+      "two options and next steps before lunch",
+      "do not send until approval"
+    ],
+    "caveats": [
+      "draft translated as this version (этот вариант), less specific than черновик",
+      "Speaker heuristic split one synthetic voice into two clusters, both female, so this case kept the same voice style.",
+      "Last translated line extends final audio from 13.970 s to 15.352 s; no claim of perfect slot fit.",
+      "Naturalness of speech has not been rated by listening; output WAV provided for review."
+    ]
+  }
+}

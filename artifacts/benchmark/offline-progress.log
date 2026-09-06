@@ -1,0 +1,17 @@
+{"event": "started", "profile": {"name": "local-balanced", "source_lang": "auto", "target_lang": "ru", "stt": "parakeet-mlx", "translation": "translategemma-mlx", "tts": "piper", "stt_allow_download": false, "translation_allow_download": false}}
+{"event": "progress", "elapsed_seconds": 2.739, "percent": 0.0}
+{"event": "progress", "elapsed_seconds": 6.196, "percent": 70.0}
+{"event": "progress", "elapsed_seconds": 33.49, "percent": 85.0}
+{"event": "clip", "index": 2, "elapsed_seconds": 35.406}
+{"event": "progress", "elapsed_seconds": 35.407, "percent": 87.0}
+{"event": "clip", "index": 0, "elapsed_seconds": 35.651}
+{"event": "progress", "elapsed_seconds": 35.653, "percent": 89.0}
+{"event": "clip", "index": 4, "elapsed_seconds": 35.664}
+{"event": "progress", "elapsed_seconds": 35.665, "percent": 92.0}
+{"event": "clip", "index": 1, "elapsed_seconds": 35.707}
+{"event": "progress", "elapsed_seconds": 35.707, "percent": 94.0}
+{"event": "clip", "index": 3, "elapsed_seconds": 35.718}
+{"event": "progress", "elapsed_seconds": 35.718, "percent": 97.0}
+{"event": "progress", "elapsed_seconds": 35.718, "percent": 97.0}
+{"event": "progress", "elapsed_seconds": 35.88, "percent": 100.0}
+{"event": "complete", "elapsed_seconds": 35.889, "peak_process_rss_bytes_macos": 1186922496, "entries": [{"start": 0.0, "end": 0.8, "original": "Good morning.", "translated": "Доброе утро.", "language": "en", "target_lang": "ru", "tts_start": 0.0, "tts_end": 0.87125, "speaker_id": null, "speaker_confidence": null, "voice_style": "female"}, {"start": 0.8, "end": 3.7600000000000002, "original": "Our project meeting starts at 10:15 tomorrow.", "translated": "Наше совещание по проекту начнется завтра в 10:15.", "language": "en", "target_lang": "ru", "tts_start": 0.87125, "tts_end": 3.7480208333333334, "speaker_id": null, "speaker_confidence": null, "voice_style": "female"}, {"start": 3.7600000000000002, "end": 7.04, "original": "Please bring the updated budget and a short list of risks.", "translated": "Пожалуйста, предоставьте обновленный бюджет и краткий список рисков.", "language": "en", "target_lang": "ru", "tts_start": 3.7480208333333334, "tts_end": 6.987208333333333, "speaker_id": null, "speaker_confidence": null, "voice_style": "female"}, {"start": 7.04, "end": 10.8, "original": "We will compare two options and choose the next steps before lunch.", "translated": "Мы сравним два варианта и выберем следующие шаги до обеда.", "language": "en", "target_lang": "ru", "tts_start": 6.987208333333333, "tts_end": 10.609520833333333, "speaker_id": null, "speaker_confidence": null, "voice_style": "female"}, {"start": 10.8, "end": 13.84, "original": "Do not send the draft to customers until it is approved.", "translated": "Не отправляйте этот вариант клиентам, пока он не будет утвержден.", "language": "en", "target_lang": "ru", "tts_start": 10.65, "tts_end": 15.352041666666667, "speaker_id": null, "speaker_confidence": null, "voice_style": "female"}]}

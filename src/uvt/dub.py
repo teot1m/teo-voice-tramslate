@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import logging
 import re
 import shutil
@@ -64,6 +65,7 @@ _MAX_COMPACT_SPAN_S = 12.0
 _MAX_COMPACT_GAP_S = 0.9
 
 ProgressFn = Callable[[int, int], None]
+StageFn = Callable[[str, float, str], None]
 _StageCb = Callable[[float], None]
 
 
@@ -143,6 +145,30 @@ def _compact_stt_spans(spans: list[STTSpan]) -> list[STTSpan]:
         current = STTSpan(item.start, item.end, text, item.language)
     compacted.append(current)
     return compacted
+
+
+async def _run_blocking(func: Callable, /, *args, _on_cancel: Callable[[], None] | None = None, **kwargs):
+    """Keep the event loop responsive and drain I/O before temporary files close."""
+    worker = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        if _on_cancel is not None:
+            _on_cancel()
+        # Cancelling to_thread does not stop its thread or subprocess. Wait for
+        # completion before a caller removes its temporary input/output folder.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        try:
+            worker.result()
+        except Exception:
+            log.debug("background I/O failed while cancellation was draining", exc_info=True)
+        raise
 
 
 def _ffmpeg(args: list[str]) -> None:
@@ -239,7 +265,7 @@ async def dub(
     """Дублирует локальный файл или ссылку. Возвращает путь к результату."""
     if is_url(source):
         with tempfile.TemporaryDirectory(prefix="uvt-dub-") as td:
-            downloaded = download_url(source, Path(td))
+            downloaded = await _run_blocking(download_url, source, Path(td))
             if output is None:
                 output = Path.cwd() / f"{downloaded.stem}.dub.mkv"
             return await dub_file(cfg, downloaded, output, duck_db, keep_original)
@@ -1059,6 +1085,7 @@ async def render_dub_track(
     approval: ApprovalGate | None = None,
     stt_engine: STTEngine | None = None,
     on_clip: ClipCallback | None = None,
+    on_stage: StageFn | None = None,
 ) -> tuple[np.ndarray, list[HistoryEntry]]:
     """Готовит дублированную дорожку.
 
@@ -1084,17 +1111,33 @@ async def render_dub_track(
     total_started = time.perf_counter()
     stage_started = total_started
     log.info("декодирую %s…", input_path.name)
+    if on_stage is not None:
+        on_stage("decode", 0.0, "декодирую исходный звук…")
     # Отделение речи от фона: распознавание идёт по чистой речи, а в микс
     # попадает полный фон — приглушать его под репликами больше не нужно.
     background_mix: np.ndarray | None = None
     separation = getattr(cfg, "separation", None)
     if bool(getattr(separation, "enabled", False)):
-        source = _decode_file(input_path, SEPARATION_RATE, 2)
+        source = await _run_blocking(_decode_file, input_path, SEPARATION_RATE, 2)
+        loop = asyncio.get_running_loop()
+        cancel_separation = threading.Event()
+
+        def separation_progress(done_seconds: float, total_seconds: float) -> None:
+            if on_stage is not None and not cancel_separation.is_set():
+                fraction = min(1.0, max(0.0, done_seconds / max(total_seconds, 0.001)))
+                detail = f"отделяю речь от фона: {done_seconds:.0f} из {total_seconds:.0f} с звука"
+                loop.call_soon_threadsafe(on_stage, "separate", fraction, detail)
+
+        if on_stage is not None:
+            on_stage("separate", 0.0, "готовлю модель отделения речи; этот режим требует времени…")
         try:
-            parts = await asyncio.to_thread(
+            parts = await _run_blocking(
                 separate_speech,
                 source,
                 SEPARATION_RATE,
+                progress=separation_progress,
+                cancel_event=cancel_separation,
+                _on_cancel=cancel_separation.set,
                 model_name=str(getattr(separation, "model", "htdemucs") or "htdemucs"),
                 device=str(getattr(separation, "device", "auto") or "auto"),
                 shifts=int(getattr(separation, "shifts", 0) or 0),
@@ -1112,7 +1155,7 @@ async def render_dub_track(
             background_mix = resample(parts.background, SEPARATION_RATE, MIX_RATE)
         del source
     else:
-        mono16 = _decode_file(input_path, PIPE_RATE, 1)
+        mono16 = await _run_blocking(_decode_file, input_path, PIPE_RATE, 1)
     log.info("декодирование завершено за %.1f с", time.perf_counter() - stage_started)
     duration = len(mono16) / PIPE_RATE
     if duration > 3600:
@@ -1261,14 +1304,16 @@ async def render_dub_track(
         native = (
             background_mix
             if background_mix is not None
-            else _decode_file(input_path, MIX_RATE, 2)
+            else await _run_blocking(_decode_file, input_path, MIX_RATE, 2)
         )
     # Речь уже удалена из фона — приглушать его нечего ради чего.
     duck_gain = 1.0 if background_mix is not None else float(10 ** (duck_db / 20))
     ramp = int(RAMP_S * MIX_RATE)
     total = len(native) if native is not None else int(duration * MIX_RATE)
     tts_track = np.zeros(total, dtype=np.float32)
-    envelope = np.ones(total, dtype=np.float32)
+    # Browser playback mixes the original itself. A full-length ducking envelope
+    # would waste 691 MB per hour of audio at 48 kHz in this mode.
+    envelope = np.ones(total, dtype=np.float32) if native is not None else None
     cursor = 0
     # Индекс реплики → её реальные границы в готовой дорожке. Раньше браузер
     # угадывал длительность из числа символов, из-за чего ducking расходился
@@ -1295,31 +1340,37 @@ async def render_dub_track(
         if end > total:  # TTS длиннее хвоста файла — дорожка удлиняется
             pad = end - total
             tts_track = np.concatenate([tts_track, np.zeros(pad, dtype=np.float32)])
-            envelope = np.concatenate([envelope, np.ones(pad, dtype=np.float32)])
+            if envelope is not None:
+                envelope = np.concatenate([envelope, np.ones(pad, dtype=np.float32)])
             if native is not None:
                 native = np.concatenate([native, np.zeros((pad, 2), dtype=np.float32)])
             total = end
         tts_track[start:end] += clip
-        ramp_from = max(0, start - ramp)
-        if start > ramp_from:
-            fade = np.linspace(1.0, duck_gain, start - ramp_from, dtype=np.float32)
-            envelope[ramp_from:start] = np.minimum(envelope[ramp_from:start], fade)
-        envelope[start:end] = np.minimum(envelope[start:end], duck_gain)
-        ramp_to = min(total, end + ramp)
-        if ramp_to > end:
-            fade = np.linspace(duck_gain, 1.0, ramp_to - end, dtype=np.float32)
-            envelope[end:ramp_to] = np.minimum(envelope[end:ramp_to], fade)
+        if envelope is not None:
+            ramp_from = max(0, start - ramp)
+            if start > ramp_from:
+                fade = np.linspace(1.0, duck_gain, start - ramp_from, dtype=np.float32)
+                np.minimum(envelope[ramp_from:start], fade, out=envelope[ramp_from:start])
+            np.minimum(envelope[start:end], duck_gain, out=envelope[start:end])
+            ramp_to = min(total, end + ramp)
+            if ramp_to > end:
+                fade = np.linspace(duck_gain, 1.0, ramp_to - end, dtype=np.float32)
+                np.minimum(envelope[end:ramp_to], fade, out=envelope[end:ramp_to])
         cursor = end
         tts_bounds[item.index] = (start / MIX_RATE, end / MIX_RATE)
 
     if native is not None:
-        mixed = native * envelope[:, None]
+        # Native audio is owned by this render. Reuse it instead of allocating
+        # a second full stereo array (1.38 GB per hour at 48 kHz).
+        np.multiply(native, envelope[:, None], out=native)
+        mixed = native
         mixed[:, 0] += tts_track
         mixed[:, 1] += tts_track
         np.clip(mixed, -1.0, 1.0, out=mixed)
         track = mixed
     else:
-        track = np.clip(tts_track, -1.0, 1.0)
+        np.clip(tts_track, -1.0, 1.0, out=tts_track)
+        track = tts_track
 
     entries = [
         HistoryEntry(
@@ -1353,7 +1404,7 @@ async def dub_file(
     input_path = Path(input_path).expanduser()
     mixed, entries = await render_dub_track(cfg, input_path, duck_db=duck_db, mix_original=True)
 
-    has_video = _has_video(input_path)
+    has_video = await _run_blocking(_has_video, input_path)
     if output is None:
         suffix = ".dub.mkv" if has_video else ".dub.wav"
         output = input_path.with_name(input_path.stem + suffix)
@@ -1365,7 +1416,7 @@ async def dub_file(
     if has_video:
         with tempfile.TemporaryDirectory(prefix="uvt-mix-") as td:
             wav = Path(td) / "mix.wav"
-            sf.write(wav, mixed, MIX_RATE, subtype="PCM_16")
+            await _run_blocking(sf.write, wav, mixed, MIX_RATE, subtype="PCM_16")
             args = ["-i", str(input_path), "-i", str(wav), "-map", "0:v", "-map", "1:a"]
             if keep_original:
                 args += ["-map", "0:a?"]
@@ -1375,9 +1426,9 @@ async def dub_file(
                 "-metadata:s:a:0", "title=UVT dub",
                 str(output_path),
             ]
-            _ffmpeg(args)
+            await _run_blocking(_ffmpeg, args)
     else:
-        sf.write(output_path, mixed, MIX_RATE, subtype="PCM_16")
+        await _run_blocking(sf.write, output_path, mixed, MIX_RATE, subtype="PCM_16")
 
     for fmt in ("srt", "json"):
         output_path.with_suffix(f".{fmt}").write_text(EXPORTERS[fmt](entries), encoding="utf-8")

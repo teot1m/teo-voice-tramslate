@@ -648,18 +648,18 @@ async def test_browser_media_sources_precede_page_and_rank_resources(monkeypatch
         {
             "page_url": "https://site.example.test/watch/42",
             "media_url": direct,
-            # Deliberately put video before manifest: a manifest must still
-            # win over the current muxed MP4, avoiding a full video download.
+            # The selected player's currentSrc is authoritative. If unavailable,
+            # try cheaper manifest hints before other muxed video hints.
             "media_candidates": [video, manifest, direct],
         },
         tmp_path,
     )
 
     assert resolved.is_file()
-    assert attempts == [("media", manifest)]
+    assert attempts == [("media", direct), ("media", manifest)]
 
 
-def test_browser_candidate_order_prefers_audio_then_hls_over_muxed_video():
+def test_browser_candidate_order_prefers_current_player_over_possible_ad_hints():
     from uvt.server import _browser_media_candidates
 
     direct = "https://cdn.example.test/current-video.mp4"
@@ -669,10 +669,10 @@ def test_browser_candidate_order_prefers_audio_then_hls_over_muxed_video():
 
     assert _browser_media_candidates(
         {"media_url": direct, "media_candidates": [video, manifest, audio]}
-    ) == [audio, manifest, direct, video]
+    ) == [direct, audio, manifest, video]
 
 
-def test_browser_candidate_cap_keeps_current_src_as_last_fallback():
+def test_browser_candidate_cap_keeps_current_src_first():
     from uvt.server import _browser_media_candidates
 
     direct = "https://cdn.example.test/current-video.mp4"
@@ -682,7 +682,7 @@ def test_browser_candidate_cap_keeps_current_src_as_last_fallback():
         {"media_url": direct, "media_candidates": manifests}
     )
 
-    assert candidates == [*manifests[:5], direct]
+    assert candidates == [direct, *manifests[:5]]
 
 
 async def test_page_ytdlp_is_fallback_after_all_browser_media_fail(monkeypatch, tmp_path):
@@ -717,8 +717,8 @@ async def test_page_ytdlp_is_fallback_after_all_browser_media_fail(monkeypatch, 
 
     assert resolved.name == "from-page.webm"
     assert calls == [
-        f"media:{manifest}",
         f"media:{direct}",
+        f"media:{manifest}",
         "page:https://site.example.test/watch/7",
     ]
 
@@ -972,3 +972,88 @@ async def test_clip_urls_respect_the_api_token(monkeypatch, tmp_path):
         assert escaped.status in (400, 404)
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_waiting", [False, True])
+async def test_cancel_job_before_coroutine_starts(monkeypatch, tmp_path, start_waiting):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+    from uvt.server import DubServer
+
+    monkeypatch.setenv("UVT_CACHE", str(tmp_path))
+    server = DubServer(_cfg())
+    await server._lock.acquire()
+    try:
+        response = await server._submit_dub_job({
+            "file": str(tmp_path / "meeting.wav"),
+            "source_name": "private/meeting.wav",
+        })
+        info = json.loads(response.body)
+        job = server.jobs[info["id"]]
+        task = server._tasks[job.id]
+        assert info["source_name"] == "meeting.wav"
+        if start_waiting:
+            await asyncio.sleep(0)
+        await server._cancel_job(SimpleNamespace(match_info={"jid": job.id}))
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert job.status == job.stage == "cancelled"
+        assert job.finished_at is not None
+        assert job.id not in server._tasks
+        assert not job.downloads
+    finally:
+        server._lock.release()
+        await server.close_prepared_models()
+
+
+def test_separation_stage_progress_is_visible_and_remains_monotonic():
+    from uvt.server import DubServer, Job
+
+    server = DubServer(_cfg())
+    job = Job(id="separation-progress", status="running")
+    server._set_download_progress(job, 1, "cached")
+    server._set_preprocess_progress(job, "decode", 0, "decode")
+    assert job.stage == "decode" and job.progress == pytest.approx(0.08)
+    server._set_preprocess_progress(job, "separate", 0.5, "half separated")
+    assert job.stage == "separate" and job.stage_progress == pytest.approx(0.5)
+    assert job.progress > 0.08
+    server._set_preprocess_progress(job, "separate", 1, "separated")
+    completed = job.progress
+    server._set_render_progress(job, 0, 100, preprocess_share=0.15)
+    assert job.stage == "transcribe" and job.progress == completed
+    server._set_render_progress(job, 70, 100, preprocess_share=0.15)
+    assert job.stage == "translate" and job.progress > completed
+    job.status = "cancelled"
+    server._set_stage(job, "cancelled")
+    server._set_preprocess_progress(job, "separate", 1, "late worker callback")
+    assert job.stage == "cancelled"
+
+
+async def test_separation_releases_preloaded_stt_before_render(monkeypatch, tmp_path):
+    import uvt.server as server_module
+    from uvt.server import DubServer, Job
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setenv("UVT_CACHE", str(tmp_path / "cache"))
+    cfg = _cfg()
+    cfg.separation.enabled = True
+    server = DubServer(cfg)
+    closed = AsyncMock()
+    taken = AsyncMock()
+    monkeypatch.setattr(server, "close_prepared_models", closed)
+    monkeypatch.setattr(server, "take_prepared_stt", taken)
+    monkeypatch.setattr(server, "_resolve_cached_source", AsyncMock(return_value=tmp_path / "source.wav"))
+
+    async def render(*args, stt_engine, **kwargs):
+        closed.assert_awaited_once()
+        taken.assert_not_awaited()
+        assert stt_engine is None
+        raise RuntimeError("end of memory handoff probe")
+
+    monkeypatch.setattr(server_module, "render_dub_track", render)
+    job = Job(id="separation-memory")
+    await server._run_job(job, {}, cfg, "configured")
+    assert job.status == "error"
+    assert "end of memory handoff probe" in job.detail

@@ -1,0 +1,59 @@
+2026-09-06 13:29:01,211 uvt.media_runtime Совместимая библиотека FFmpeg подключена только для текущего запуска UVT.
+2026-09-06 13:29:01,319 uvt.dub декодирую source-en.wav…
+2026-09-06 13:29:01,407 uvt.dub декодирование завершено за 0.1 с
+2026-09-06 13:29:01,407 uvt.stt.parakeet-mlx parakeet-mlx: loading model mlx-community/parakeet-tdt-0.6b-v3...
+2026-09-06 13:29:04,304 uvt.stt.parakeet-mlx parakeet-mlx: model ready: /Users/teotim/.cache/huggingface/hub/models--mlx-community--parakeet-tdt-0.6b-v3/snapshots/ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15 (GPU Apple Silicon)
+2026-09-06 13:29:09,429 uvt.dub пакетное распознавание: 5 фрагментов → 5 реплик
+2026-09-06 13:29:09,478 uvt.dub распознавание завершено за 8.1 с
+2026-09-06 13:29:09,585 uvt.diarize говорящих найдено 2 (speaker-1: female, 1 реплик, speaker-2: female, 4 реплик)
+2026-09-06 13:29:22,944 uvt.translate.mlx_translategemma TranslateGemma MLX загружена: 5788ec08c047f3f2e17808101b8d9566ac930d58
+2026-09-06 13:29:34,220 uvt.dub перевод: 5/5 реплик
+2026-09-06 13:29:34,780 uvt.dub перевод завершён за 25.2 с
+2026-09-06 13:29:34,781 uvt.dub [@    0.0 с] Good morning. ⇒ Доброе утро.
+2026-09-06 13:29:34,781 uvt.dub [@    0.8 с] Our project meeting starts at 10:15 tomorrow. ⇒ Наше совещание по проекту начнется завтра в 10:15.
+2026-09-06 13:29:34,781 uvt.dub [@    3.8 с] Please bring the updated budget and a short list of risks. ⇒ Пожалуйста, предоставьте обновленный бюджет и краткий список рисков.
+2026-09-06 13:29:34,781 uvt.dub [@    7.0 с] We will compare two options and choose the next steps before lunch. ⇒ Мы сравним два варианта и выберем следующие шаги до обеда.
+2026-09-06 13:29:34,781 uvt.dub [@   10.8 с] Do not send the draft to customers until it is approved. ⇒ Не отправляйте этот вариант клиентам, пока он не будет утвержден.
+2026-09-06 13:29:34,952 uvt.dub сразу ускоряю 2 реплик по длительности выбранного голоса
+2026-09-06 13:29:39,608 uvt.dub 3 реплик подогнаны atempo под тайминги
+2026-09-06 13:29:40,126 uvt.dub озвучка завершена за 5.3 с
+2026-09-06 13:29:40,127 uvt.dub собираю дорожку (5 реплик, режим только голос)…
+2026-09-06 13:29:40,195 uvt.dub дорожка подготовлена за 38.9 с
+2026-09-06 13:29:40,196 uvt.dub декодирую source-en.wav…
+2026-09-06 13:29:40,333 uvt.dub декодирование завершено за 0.1 с
+2026-09-06 13:29:40,334 uvt.stt.parakeet-mlx parakeet-mlx: loading model mlx-community/parakeet-tdt-0.6b-v3...
+2026-09-06 13:29:41,992 uvt.stt.parakeet-mlx parakeet-mlx: model ready: /Users/teotim/.cache/huggingface/hub/models--mlx-community--parakeet-tdt-0.6b-v3/snapshots/ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15 (GPU Apple Silicon)
+2026-09-06 13:29:43,422 uvt.dub пакетное распознавание: 5 фрагментов → 5 реплик
+2026-09-06 13:29:44,030 uvt.dub распознавание завершено за 3.7 с
+2026-09-06 13:29:44,152 uvt.diarize говорящих найдено 2 (speaker-1: female, 1 реплик, speaker-2: female, 4 реплик)
+2026-09-06 13:29:50,305 uvt.translate.mlx_translategemma TranslateGemma MLX загружена: 5788ec08c047f3f2e17808101b8d9566ac930d58
+2026-09-06 13:29:57,770 uvt.dub перевод: 5/5 реплик
+2026-09-06 13:29:57,989 uvt.dub перевод завершён за 13.8 с
+2026-09-06 13:29:57,989 uvt.dub [@    0.0 с] Good morning. ⇒ Доброе утро.
+2026-09-06 13:29:57,989 uvt.dub [@    0.8 с] Our project meeting starts at 10:15 tomorrow. ⇒ Наше совещание по проекту начнется завтра в 10:15.
+2026-09-06 13:29:57,989 uvt.dub [@    3.8 с] Please bring the updated budget and a short list of risks. ⇒ Пожалуйста, предоставьте обновленный бюджет и краткий список рисков.
+2026-09-06 13:29:57,989 uvt.dub [@    7.0 с] We will compare two options and choose the next steps before lunch. ⇒ Мы сравним два варианта и выберем следующие шаги до обеда.
+2026-09-06 13:29:57,989 uvt.dub [@   10.8 с] Do not send the draft to customers until it is approved. ⇒ Не отправляйте этот вариант клиентам, пока он не будет утвержден.
+2026-09-06 13:29:57,992 uvt.dub сразу ускоряю 2 реплик по длительности выбранного голоса
+2026-09-06 13:29:59,941 uvt.dub 3 реплик подогнаны atempo под тайминги
+2026-09-06 13:30:00,308 uvt.dub озвучка завершена за 2.3 с
+2026-09-06 13:30:00,308 uvt.dub собираю дорожку (5 реплик, режим только голос)…
+2026-09-06 13:30:00,322 uvt.dub дорожка подготовлена за 20.1 с
+       61.83 real        32.34 user        13.84 sys
+          1342160896  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              810273  page reclaims
+               10330  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                  37  messages sent
+                  37  messages received
+                   0  signals received
+               11111  voluntary context switches
+              243946  involuntary context switches
+        183538133718  instructions retired
+         88551107635  cycles elapsed
+          5261119952  peak memory footprint

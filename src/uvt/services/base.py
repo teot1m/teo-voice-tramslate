@@ -168,6 +168,10 @@ class Service(ABC):
                         continue
                     self.publish(event)
         finally:
+            if inbox is not None:
+                # A stopped/restarted live service must not retain queued audio
+                # or keep receiving events while its engine is shutting down.
+                self.bus.topic(self.consumes).unsubscribe(inbox)
             with contextlib.suppress(Exception):
                 await self.teardown()
             with contextlib.suppress(Exception):

@@ -1,0 +1,94 @@
+{
+  "result": "PASS",
+  "testedAt": "2026-09-06T10:34:10.051Z",
+  "scope": "real workspace API and media operations; dummy speech/translation/TTS; no model-quality benchmark",
+  "port": 18974,
+  "desktop": "1280x1000",
+  "mobile": "390x844",
+  "auth401": true,
+  "initiallyNoActiveJob": true,
+  "jobStatus": "done",
+  "observed": [
+    {
+      "status": "running",
+      "stage": "transcribe",
+      "progress": 0.08
+    },
+    {
+      "status": "running",
+      "stage": "translate",
+      "progress": 0.724
+    },
+    {
+      "status": "running",
+      "stage": "translate",
+      "progress": 0.724
+    },
+    {
+      "status": "done",
+      "stage": "done",
+      "progress": 1
+    },
+    {
+      "status": "running",
+      "stage": "transcribe",
+      "progress": 0.08
+    },
+    {
+      "status": "cancelled",
+      "stage": "cancelled",
+      "progress": 0.08
+    }
+  ],
+  "downloads": {
+    "m4a": {
+      "bytes": 53704,
+      "type": "application/octet-stream"
+    },
+    "srt": {
+      "bytes": 91,
+      "type": "text/plain; charset=utf-8"
+    },
+    "vtt": {
+      "bytes": 95,
+      "type": "text/plain; charset=utf-8"
+    },
+    "txt": {
+      "bytes": 81,
+      "type": "text/plain; charset=utf-8"
+    },
+    "json": {
+      "bytes": 564,
+      "type": "application/json; charset=utf-8"
+    },
+    "mkv": {
+      "bytes": 77523,
+      "type": "application/octet-stream"
+    }
+  },
+  "audio": {
+    "duration": 4.032,
+    "readyState": 4
+  },
+  "video": {
+    "programs": [],
+    "stream_groups": [],
+    "streams": [
+      {
+        "codec_type": "video"
+      },
+      {
+        "codec_type": "audio"
+      },
+      {
+        "codec_type": "audio"
+      }
+    ],
+    "format": {
+      "duration": "4.096000"
+    }
+  },
+  "cancelled": "cancelled",
+  "recentJobs": 2,
+  "pageErrors": []
+}

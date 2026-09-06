@@ -5,6 +5,8 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
+# Resolve this checkout even if the environment was installed from another path.
+export PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 
 if [[ -f .venv/bin/activate ]]; then
   # shellcheck disable=SC1091
@@ -16,4 +18,4 @@ if ! command -v uvt >/dev/null 2>&1; then
   exit 1
 fi
 
-exec uvt serve-personal
+exec uvt serve-personal "$@"

@@ -1,0 +1,57 @@
+{
+  "scope": "real workspace page downloader; first 3 seconds only; no models or playback",
+  "success": true,
+  "output_bytes": 71878,
+  "output_duration": 3.019002,
+  "streams": [
+    "audio"
+  ],
+  "events": [
+    {
+      "at_s": 0.0,
+      "fraction": 0.0,
+      "detail": "подключаюсь к странице через yt-dlp…"
+    },
+    {
+      "at_s": 0.64,
+      "fraction": null,
+      "detail": "получаю страницу видео…"
+    },
+    {
+      "at_s": 1.16,
+      "fraction": null,
+      "detail": "проверяю доступные медиапотоки…"
+    },
+    {
+      "at_s": 1.28,
+      "fraction": null,
+      "detail": "проверяю доступные медиапотоки…"
+    },
+    {
+      "at_s": 1.48,
+      "fraction": null,
+      "detail": "проверяю доступные медиапотоки…"
+    },
+    {
+      "at_s": 1.6,
+      "fraction": null,
+      "detail": "проверяю доступные медиапотоки…"
+    },
+    {
+      "at_s": 1.92,
+      "fraction": null,
+      "detail": "получаю сведения о видео…"
+    },
+    {
+      "at_s": 3.75,
+      "fraction": 0.99,
+      "detail": "скачиваю звук со страницы: 99%"
+    },
+    {
+      "at_s": 4.0,
+      "fraction": 1.0,
+      "detail": "исходный звук получен"
+    }
+  ],
+  "elapsed_seconds": 4.04
+}

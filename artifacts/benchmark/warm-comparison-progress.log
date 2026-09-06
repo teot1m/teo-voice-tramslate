@@ -1,0 +1,5 @@
+{"event": "run_started", "run": 1, "uvt_import_path": "/Users/teotim/Documents/голос/src/uvt/__init__.py"}
+{"event": "run_complete", "run": 1, "elapsed_seconds": 38.92, "first_clip_ready_seconds": 37.393, "peak_mlx_allocator_bytes": 2764520201}
+{"event": "run_started", "run": 2, "uvt_import_path": "/Users/teotim/Documents/голос/src/uvt/__init__.py"}
+{"event": "run_complete", "run": 2, "elapsed_seconds": 20.127, "first_clip_ready_seconds": 19.06, "peak_mlx_allocator_bytes": 2764520209}
+{"event": "complete", "runs": [{"run": 1, "elapsed_seconds": 38.92}, {"run": 2, "elapsed_seconds": 20.127}]}
