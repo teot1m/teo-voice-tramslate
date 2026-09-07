@@ -13,3 +13,11 @@ Scope, verification and follow-up: `TODO_LOCAL_M4.md`. Research: `docs/LOCAL_MOD
 Global gender voice pairs are scoped by TTS engine and target language in server settings. voice_references.py stores private F5/MOSS samples; MOSS exposes Adam/Nathan/Ava/Bella. Offline HyMT/MLX/OpenAI translation receives bounded before/after source context; live remains past-only. Shared reference TTS serializes each replica role without duplicating weights. Verification: artifacts/verification/voice-selection/.
 
 Userscript 0.18.3: all visible video players are eligible again (preview filtering explicitly reverted by user); idle controls fully fade and stop hit-testing, movement wakes them. Profile/language/voice overrides are video-local and inherit server defaults; they apply to the next job. Browser fixtures: tests/userscript_main_player.cjs and tests/userscript_video_settings.cjs.
+
+Userscript 0.18.5 uses GM_xmlhttpRequest/GM.xmlHttpRequest for UVT JSON and compressed audio (localhost-only @connect by default), abortable requests and no automatic POST retry; completed audio uses a revocable Blob URL. Installer update is required for new grants. See tests/userscript_transport.cjs and tests/userscript_completed_audio.cjs. Installed extension inventory is unavailable through current browser tool policy.
+
+MOSS uses bounded same-reference recovery on output limits; fatal_tts/user_message stops the current dub when exhausted. Tests: test_tts_moss_onnx.py and test_dub_moss_failure.py. Real recovery smoke waits for idle user jobs; never run a second local model alongside active dubbing.
+
+Per-video profile metadata must explicitly use settings_mode=override, including when global settings are saved; empty local voice_id is a string, not null. See tests/userscript_video_settings.cjs and the per-request server compatibility regression tests.
+
+media_discovery.py also handles bunkr.cr/f pages via dedicated literal config and the pinned public CDN signer, within the existing discovery deadline. No page JS execution or browser cookies. Tests: tests/test_bunkr_discovery.py; live verification was URL discovery + HEAD200, not full media/dubbing.

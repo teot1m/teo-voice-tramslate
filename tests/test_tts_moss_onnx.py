@@ -32,7 +32,8 @@ class Codec:
 
 class Runtime:
     def __init__(self):
-        self.codec_meta = {"codec_config": {"sample_rate": 48000, "channels": 2}}
+        self.codec_meta = {"codec_config": {"sample_rate": 48000, "channels": 2, "downsample_rate": 3840}}
+        self.manifest = {"generation_defaults": {"max_new_frames": 375}}
         self.sessions = {"codec_encode": Codec()}
         self.requests = []
         self.frames = [[1] * 16] * 3
@@ -189,7 +190,7 @@ async def test_long_output_never_silently_truncated(setup_engine):
     engine = make(max_new_frames=25)
     await engine.warmup()
     runtime.frames = [[1] * 16] * 25
-    with pytest.raises(RuntimeError, match="предела реплики"):
+    with pytest.raises(moss.MossSynthesisLimitError, match="не смогла завершить реплику"):
         await engine.synthesize("Привет", "ru")
 
 
@@ -227,3 +228,201 @@ async def test_saved_role_reference_overrides_original_speaker(setup_engine, mon
         assert float(audio.mean()) == pytest.approx(.2, abs=.005)
     finally:
         await engine.close()
+
+
+def _record_generation(engine, runtime, monkeypatch, generate):
+    """Retain exact submitted text while controlling only native generation."""
+    class TextTokenizer:
+        def encode(self, text, out_type=int):
+            return [ord(c) for c in text]
+
+    engine._tokenizer = TextTokenizer()
+    calls = []
+
+    def run(request, on_frame=None):
+        codes, tokens = request
+        text = "".join(chr(c) for c in tokens)
+        limit = runtime.manifest["generation_defaults"]["max_new_frames"]
+        calls.append((text, codes, limit))
+        return generate(text, limit, on_frame)
+
+    monkeypatch.setattr(runtime, "generate_audio_frames", run)
+    return calls
+
+
+async def test_recovery_preserves_prefix_text_order_and_voice(setup_engine, monkeypatch):
+    make, runtime, _ = setup_engine
+    engine = make()
+    await engine.warmup()
+    chunks = ["Начало.", "Вторая часть. Последняя часть."]
+    monkeypatch.setattr(moss, "_text_chunks", lambda *_: chunks)
+    calls = _record_generation(
+        engine, runtime, monkeypatch,
+        lambda text, limit, _: [[1] * 16] * (limit if text == chunks[1] else 3),
+    )
+    decoded = []
+    original_decode = runtime.decode_full_audio
+
+    def decode(frames):
+        decoded.append(len(frames))
+        return original_decode(frames)
+
+    monkeypatch.setattr(runtime, "decode_full_audio", decode)
+    audio, _ = await engine.synthesize(" ".join(chunks), "ru")
+    assert [c[0] for c in calls] == [
+        "Начало.", "Вторая часть. Последняя часть.", "Вторая часть.", "Последняя часть.",
+    ]
+    assert " ".join(calls[i][0] for i in (0, 2, 3)) == " ".join(chunks)
+    assert all(c[1] is calls[0][1] for c in calls)
+    assert decoded == [3, 3, 3]  # Capped audio was never decoded/published.
+    assert len(audio) == 3 * 480 + 2 * int(48000 * .15)
+    assert runtime.manifest["generation_defaults"]["max_new_frames"] == 375
+
+
+async def test_indivisible_chunk_retries_once_with_same_voice(setup_engine, monkeypatch):
+    make, runtime, _ = setup_engine
+    engine = make()
+    await engine.warmup()
+    results = iter([True, False])
+    calls = _record_generation(
+        engine, runtime, monkeypatch,
+        lambda text, limit, _: [[1] * 16] * (limit if next(results) else 3),
+    )
+    audio, _ = await engine.synthesize("Да.", "ru")
+    assert len(audio) == 480
+    assert [c[0] for c in calls] == ["Да.", "Да."]
+    assert calls[0][1] is calls[1][1]
+    assert calls[0][2] == 101  # Eight seconds plus one EOS probe frame.
+
+
+async def test_exhausted_recovery_is_fatal_and_next_call_can_succeed(setup_engine, monkeypatch):
+    make, runtime, _ = setup_engine
+    engine = make()
+    await engine.warmup()
+    calls = _record_generation(
+        engine, runtime, monkeypatch, lambda _, limit, __: [[1] * 16] * limit,
+    )
+    with pytest.raises(moss.MossSynthesisLimitError) as failure:
+        await engine.synthesize("Да.", "ru")
+    assert failure.value.fatal_tts is True
+    assert len(calls) == 2
+    assert runtime.manifest["generation_defaults"]["max_new_frames"] == 375
+    monkeypatch.setattr(runtime, "generate_audio_frames", lambda *a, **kw: [[1] * 16] * 3)
+    audio, _ = await engine.synthesize("Готово.", "ru")
+    assert len(audio) == 480
+
+
+async def test_recursive_recovery_obeys_shared_attempt_budget(setup_engine, monkeypatch):
+    make, runtime, _ = setup_engine
+    engine = make(max_chunk_attempts=3)
+    await engine.warmup()
+    calls = _record_generation(
+        engine, runtime, monkeypatch, lambda _, limit, __: [[1] * 16] * limit,
+    )
+    monkeypatch.setattr(runtime, "decode_full_audio", lambda _: pytest.fail("decoded capped frames"))
+    with pytest.raises(moss.MossSynthesisLimitError):
+        await engine.synthesize("А Б В Г Д Е Ж З.", "ru")
+    assert len(calls) == 3
+    assert len({c[0] for c in calls}) == 3
+
+
+@pytest.mark.parametrize("probe", [False, True])
+async def test_eos_exactly_at_limit_is_accepted_but_probe_frame_is_not(
+        setup_engine, monkeypatch, probe):
+    make, runtime, _ = setup_engine
+    engine = make()
+    await engine.warmup()
+    calls = _record_generation(
+        engine, runtime, monkeypatch,
+        lambda _, limit, __: [[1] * 16] * (limit if probe else limit - 1),
+    )
+    if probe:
+        with pytest.raises(moss.MossSynthesisLimitError):
+            await engine.synthesize("Да.", "ru")
+        assert len(calls) == 2
+    else:
+        audio, _ = await engine.synthesize("Да.", "ru")
+        assert len(audio) == 480
+        assert len(calls) == 1
+
+
+@pytest.mark.parametrize("failure_kind", ["native", "empty", "invalid"])
+async def test_other_failures_are_not_retried_and_restore_limit(
+        setup_engine, monkeypatch, failure_kind):
+    make, runtime, _ = setup_engine
+    engine = make()
+    await engine.warmup()
+
+    def generate(text, limit, callback):
+        if failure_kind == "native":
+            raise ValueError("native failure")
+        return [] if failure_kind == "empty" else [[1] * 16] * 3
+
+    calls = _record_generation(engine, runtime, monkeypatch, generate)
+    if failure_kind == "invalid":
+        monkeypatch.setattr(runtime, "decode_full_audio", lambda _: ([np.array([np.nan])], 1))
+    with pytest.raises((ValueError, RuntimeError)) as failure:
+        await engine.synthesize("Готово.", "ru")
+    assert not isinstance(failure.value, moss.MossSynthesisLimitError)
+    assert len(calls) == 1
+    assert runtime.manifest["generation_defaults"]["max_new_frames"] == 375
+
+
+async def test_cancellation_during_recovery_drains_and_restores_limit(setup_engine, monkeypatch):
+    make, runtime, _ = setup_engine
+    engine = make()
+    await engine.warmup()
+    recovering, finished = threading.Event(), threading.Event()
+    attempts = 0
+
+    def generate(text, limit, callback):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return [[1] * 16] * limit
+        recovering.set()
+        try:
+            while True:
+                time.sleep(.002)
+                callback([], 0, [])
+        finally:
+            finished.set()
+
+    calls = _record_generation(engine, runtime, monkeypatch, generate)
+    task = asyncio.create_task(engine.synthesize("Первая часть. Вторая часть.", "ru"))
+    assert await asyncio.to_thread(recovering.wait, 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished.is_set()
+    assert len(calls) == 2
+    assert runtime.manifest["generation_defaults"]["max_new_frames"] == 375
+    await engine.close()
+
+
+async def test_duration_bound_uses_codec_rate_and_hard_limit(setup_engine):
+    make, runtime, _ = setup_engine
+    engine = make()
+    await engine.warmup()
+    assert engine._budget == 48
+    assert engine._frame_limit("Да.") == 100
+    assert engine._frame_limit("界" * 20) > engine._frame_limit("a" * 20)
+    assert engine._frame_limit("a" * 1000) == 374
+    runtime.codec_meta["codec_config"]["downsample_rate"] = 1920
+    assert engine._frame_limit("Да.") == 200
+
+
+@pytest.mark.parametrize("text", [
+    "Один фрагмент. Затем второй фрагмент.", "Несколько слов без знаков",
+    "这是一段没有空格的长句子用于检查切分文本",
+    "12345.6789", "НеделимоеСлово",
+])
+def test_recovery_split_preserves_characters_and_whole_words(text):
+    parts = moss._split_failed_chunk(text)
+    assert "".join("".join(parts).split()) == "".join(text.split())
+    assert all(parts)
+    if text in {"12345.6789", "НеделимоеСлово"}:
+        assert parts == [text]
+    else:
+        assert len(parts) == 2
+        assert all(len(part) < len(text) for part in parts)

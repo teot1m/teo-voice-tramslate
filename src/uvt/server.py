@@ -530,7 +530,7 @@ async def _download_media(
     deliberately does not try to replay browser cookies or bypass restrictions.
     """
     out = dest_dir / out_name
-    log.info("скачиваю поток через ffmpeg: %.120s…", url)
+    log.info("скачиваю поток через ffmpeg: %.120s…", url.split("?", 1)[0].split("#", 1)[0])
     cmd = ["ffmpeg", "-v", "error", "-y", "-user_agent", _UA]
     if progress is not None:
         progress(0.0, "подключаюсь к исходному звуку…")
@@ -672,6 +672,7 @@ async def _download_page(
             raise RuntimeError(f"Не удалось получить источник: {failure}") from None
         # Some ordinary HTML5/Playerjs sites have public media URLs but no
         # dedicated yt-dlp extractor. Read only their explicit player config.
+        discovery_detail = ""
         if "unsupported url" in "\n".join(diagnostics).lower():
             import httpx
             from uvt.media_discovery import discover_page_media
@@ -680,8 +681,17 @@ async def _download_page(
                 progress(0.0, "yt-dlp не знает этот сайт; проверяю ссылки видеоплеера…")
             try:
                 page_candidates = await discover_page_media(page_url)
-            except (OSError, ValueError, httpx.HTTPError):
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                discovery_detail = f" Публичный плеер не выдал поток (HTTP {status})."
+                log.info("проверка публичного плеера: HTTP %s", status)
                 page_candidates = []
+            except (OSError, ValueError, httpx.HTTPError):
+                discovery_detail = " Не удалось получить адрес потока из публичного плеера."
+                log.info("проверка публичного плеера не завершилась")
+                page_candidates = []
+            if page_candidates:
+                log.info("публичный плеер: найдено потоков — %d", len(page_candidates))
             for index, candidate in enumerate(page_candidates):
                 try:
                     return await _download_media(
@@ -696,7 +706,7 @@ async def _download_page(
         )
         detail = f" Причина yt-dlp: {reason}" if reason else ""
         raise RuntimeError(
-            f"yt-dlp не поддержал или не смог скачать {page_url}.{detail} UVT не обходит "
+            f"yt-dlp не поддержал или не смог скачать {page_url}.{detail}{discovery_detail} UVT не обходит "
             "авторизацию, DRM и ограничения сайта; используйте законно сохранённый "
             "локальный файл или публичную ссылку поддерживаемого сервиса."
         ) from failure
@@ -1468,6 +1478,11 @@ class DubServer:
         fields = {key: data[key] for key in names if key in data}
         if self._settings_kind == "local":
             fields["profile_id"] = requested_profile
+            # Older userscripts sent JSON null for automatic voice selection.
+            # Accept that spelling only at the per-request boundary; persisted
+            # global settings and other non-string values remain strictly typed.
+            if "voice_id" in fields and fields["voice_id"] is None:
+                fields["voice_id"] = ""
         normalized = normalize_settings(
             fields,
             current=effective_settings(self.cfg, kind=self._settings_kind, profile_name=self.profile_name),
@@ -3434,6 +3449,10 @@ class DubServer:
         data = dict(request.query)
         if not data:
             return web.json_response(self._metadata())
+        # A catalog query previews an explicit per-video choice even after
+        # global defaults were saved. An explicit server mode still wins.
+        if any(key in data for key in ("profile_id", "profile", "source_lang", "target_lang")):
+            data.setdefault("settings_mode", "override")
         try:
             return web.json_response(self._metadata_for_request(data))
         except ValueError as exc:

@@ -29,7 +29,8 @@ tts:
   sample_mode: fixed
   threads: 4
   concurrency: 1
-  max_text_tokens: 75
+  max_text_tokens: 48
+  max_chunk_attempts: 7
   max_new_frames: 375
 
 latency:

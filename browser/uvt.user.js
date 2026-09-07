@@ -1,16 +1,22 @@
 // ==UserScript==
 // @name         UVT — закадровый перевод видео
 // @namespace    uvt
-// @version      0.18.3
+// @version      0.18.5
 // @description  Пакетный закадровый перевод через личный UVT: реплики звучат по мере готовности; Free, GPT или ElevenLabs
 // @match        *://*/*
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_xmlhttpRequest
+// @grant        GM.xmlHttpRequest
+// @connect      127.0.0.1
+// @connect      localhost
 // @run-at       document-start
 // ==/UserScript==
 
 (function () {
   "use strict";
+
+  const SCRIPT_VERSION = "0.18.5";
 
   // --- настройки ---
   // `uvt serve-personal` поднимает три маршрута. Для удалённого личного VPS
@@ -51,12 +57,7 @@
       detail: "Demucs → Parakeet → Qwen3 с контекстом → F5 с клонированием (медленно)",
     },
   });
-  const LOCAL_VOICES = Object.freeze([
-    { id: "ru_RU-dmitri-medium", label: "Дмитрий", language: "ru", gender: "male" },
-    { id: "ru_RU-irina-medium", label: "Ирина", language: "ru", gender: "female" },
-    { id: "uk_UA-mykyta-high", label: "Микита", language: "uk", gender: "male" },
-    { id: "uk_UA-tetiana-high", label: "Тетяна", language: "uk", gender: "female" },
-  ]);
+
   // Задайте тот же секрет, что и UVT_API_TOKEN на удалённом сервере. Для
   // localhost оставьте пустую строку. Это личный доступ, не биллинг-аккаунт.
   const UVT_API_TOKEN = "";
@@ -320,11 +321,105 @@
     ).toString();
   }
 
-  async function apiResponse(path, options, server) {
+  function extensionRequest() {
+    if (typeof GM_xmlhttpRequest === "function") return GM_xmlhttpRequest;
+    if (typeof GM !== "undefined" && typeof GM.xmlHttpRequest === "function") return GM.xmlHttpRequest.bind(GM);
+    return null;
+  }
+
+  function connectionError(server, reason) {
+    const error = new Error(`${server.shortLabel}: не удалось связаться с UVT (${new URL(server.url).origin}). ${reason}`);
+    error.code = "UVT_CONNECTION";
+    return error;
+  }
+
+  function extensionResponse(url, options, send, server, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      let handle;
+      let settled = false;
+      let timer;
+      const signal = options.signal;
+      const finish = (error, response) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener("abort", abort);
+        if (error) reject(error); else resolve(response);
+      };
+      const stopRequest = () => { try { if (handle && handle.abort) handle.abort(); } catch (_) { /* already closed */ } };
+      const abort = () => {
+        finish(new DOMException("Запрос отменён", "AbortError"));
+        stopRequest();
+      };
+      if (signal && signal.aborted) { abort(); return; }
+      if (signal) signal.addEventListener("abort", abort, { once: true });
+      const fail = () => finish(connectionError(server,
+        "Проверьте адрес и разрешение Tampermonkey на подключение к этому серверу в разделе «Подключение и диагностика»."));
+      const timeout = () => {
+        finish(connectionError(server, "Сервер не ответил вовремя. Проверьте его состояние и повторите запрос."));
+        stopRequest();
+      };
+      const loaded = raw => {
+        if (settled) return;
+        if (!raw || raw.status < 200 || raw.status > 599) { fail(); return; }
+        try {
+          const headers = new Headers();
+          for (const line of String(raw.responseHeaders || "").split(/\r?\n/)) {
+            const colon = line.indexOf(":");
+            if (colon > 0) headers.append(line.slice(0, colon).trim(), line.slice(colon + 1).trim());
+          }
+          const body = [204, 205, 304].includes(raw.status) ? null : (raw.response ?? raw.responseText ?? null);
+          finish(null, new Response(body, { status: raw.status, headers }));
+        } catch (_) { finish(connectionError(server, "Не удалось прочитать ответ сервера.")); }
+      };
+      // anonymous uses Tampermonkey's fetch mode, whose native timeout can be
+      // ignored in Chrome. Keep our own deadline and abort the transport too.
+      timer = setTimeout(timeout, timeoutMs);
+      try {
+        handle = send({
+          url, method: options.method || "GET", headers: Object.fromEntries(options.headers.entries()),
+          data: options.body, responseType: "arraybuffer", anonymous: true,
+          redirect: "error", timeout: timeoutMs,
+          onload: loaded, onerror: fail, ontimeout: timeout,
+          onabort: () => finish(new DOMException("Запрос отменён", "AbortError")),
+        });
+        // Modern GM.xmlHttpRequest returns a Promise; older GM_xmlhttpRequest
+        // completes through callbacks. Some managers use both, so settle once.
+        if (handle && typeof handle.then === "function") handle.then(loaded, fail);
+        if (signal && signal.aborted) stopRequest();
+      } catch (_) { fail(); }
+    });
+  }
+
+  async function apiResponse(path, options = {}, server, timeoutMs = 30000) {
     const activeServer = server || serverForRoute(prefs.route);
-    const headers = new Headers((options && options.headers) || {});
+    const headers = new Headers(options.headers || {});
     if (UVT_API_TOKEN) headers.set("X-UVT-Token", UVT_API_TOKEN);
-    const response = await fetch(urlFor(activeServer, path), { ...options, headers });
+    const url = urlFor(activeServer, path);
+    const send = extensionRequest();
+    let response;
+    if (send) {
+      // Requests run in the extension, outside a video's CSP/connect-src and
+      // page-to-localhost restrictions. Never retry POST through another path.
+      response = await extensionResponse(url, { ...options, headers }, send, activeServer, timeoutMs);
+    } else {
+      // Also support direct script injection for neutral fixtures/local pages.
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      if (options.signal && options.signal.aborted) throw new DOMException("Запрос отменён", "AbortError");
+      if (options.signal) options.signal.addEventListener("abort", abort, { once: true });
+      const timer = setTimeout(abort, timeoutMs);
+      try {
+        response = await fetch(url, { ...options, headers, signal: controller.signal, credentials: "omit", redirect: "error" });
+      } catch (error) {
+        if (options.signal && options.signal.aborted) throw new DOMException("Запрос отменён", "AbortError");
+        throw connectionError(activeServer,
+          `Связь со страницы заблокирована или сервер недоступен. Обновите userscript до ${SCRIPT_VERSION} в Tampermonkey и разрешите его сетевые запросы, затем перезагрузите вкладку.`);
+      } finally {
+        clearTimeout(timer);
+        if (options.signal) options.signal.removeEventListener("abort", abort);
+      }
+    }
     if (!response.ok) {
       const detail = await response.text().catch(() => "");
       throw new Error(
@@ -341,7 +436,7 @@
   }
 
   async function apiAudio(path, options, server) {
-    const response = await apiResponse(path, options, server);
+    const response = await apiResponse(path, options, server, 120000);
     return response.blob();
   }
 
@@ -403,7 +498,10 @@
     const billingError = /HTTP\s+40[123]|доступ или оплату|ключ, тариф|balance/i.test(errorText);
     const rateLimitError = /HTTP\s+429|частот[уы]|Too Many Requests/i.test(errorText);
     const paidRouteError = (billingError || rateLimitError) && activeRoute.key !== "free";
-    help.textContent = paidRouteError
+    const networkError = error && error.code === "UVT_CONNECTION";
+    help.textContent = networkError
+      ? "Откройте адрес UVT в отдельной вкладке. Если панель работает, обновите userscript в Tampermonkey и разрешите доступ к 127.0.0.1. Версия и способ связи указаны в «Подключение и диагностика»."
+      : paidRouteError
       ? rateLimitError
         ? `${activeRoute.shortLabel} временно ограничил частоту запросов. Повторите через минуту или выберите Free: исходный звук уже в общем кэше.`
         : `${activeRoute.shortLabel} отклонил запрос по ключу или квоте. Проверьте остаток символов/баланс либо выберите Free: исходный звук уже в общем кэше.`
@@ -796,72 +894,96 @@
 
   // --- синхронное воспроизведение готовой дорожки ---
 
-  function attachAudio(video, audioUrl, entries, server) {
+  async function attachAudio(video, audioUrl, entries, server, signal) {
     const s = state.get(video);
-    const audio = new Audio(urlFor(server, audioUrl));
-    audio.preload = "auto";
-    s.audio = audio;
-    s.windows = buildWindows(entries);
-    s.ducker = createDucker(video);
-    s.audioErrorHandler = () => {
-      if (!s.on) return;
-      detachAudio(video);
-      setRetryButton(video);
-      showError(video, new Error("готовая аудиодорожка не загрузилась с выбранного UVT-сервера"));
-    };
-    audio.addEventListener("error", s.audioErrorHandler, { once: true });
+    if (!s || s.cancelled || (signal && signal.aborted)) return false;
+    // A page's localhost restrictions apply to HTMLAudio too. Download through
+    // the userscript transport, keeping progressive clips playing until ready.
+    const blob = await apiAudio(audioUrl, { signal }, server);
+    if (state.get(video) !== s || s.cancelled || (signal && signal.aborted)) return false;
+    const objectUrl = URL.createObjectURL(blob);
+    try {
+      const audio = new Audio(objectUrl);
+      audio.preload = "auto";
+      detachProgressive(video);
+      s.audio = audio;
+      s.audioObjectUrl = objectUrl;
+      s.windows = buildWindows(entries);
+      s.ducker = createDucker(video);
+      s.audioErrorHandler = () => {
+        if (!s.on) return;
+        detachAudio(video);
+        setRetryButton(video);
+        showError(video, new Error("готовая аудиодорожка не воспроизводится: браузер отклонил звук; откройте результат в UVT"));
+      };
+      audio.addEventListener("error", s.audioErrorHandler, { once: true });
 
-    // Пока перевод не включён (s.on=false), оригинал никто не трогает:
-    // приглушение действует только внутри окон реплик работающего перевода.
-    const applyDuck = () => {
-      if (!s.on) return;
-      s.ducker.set(inWindow(s.windows, video.currentTime) ? prefs.duck : 1);
-    };
-    const sync = () => {
-      if (!s.on) return;
-      if (Math.abs(audio.currentTime - video.currentTime) > DRIFT_S) {
-        // небольшое упреждение компенсирует задержку старта аудиоэлемента
-        audio.currentTime = video.currentTime + SEEK_BIAS_S;
-      }
+      // Пока перевод не включён (s.on=false), оригинал никто не трогает:
+      // приглушение действует только внутри окон реплик работающего перевода.
+      const applyDuck = () => {
+        if (!s.on) return;
+        s.ducker.set(inWindow(s.windows, video.currentTime) ? prefs.duck : 1);
+      };
+      const sync = () => {
+        if (!s.on) return;
+        if (Math.abs(audio.currentTime - video.currentTime) > DRIFT_S) {
+          // небольшое упреждение компенсирует задержки старта аудиоэлемента
+          audio.currentTime = video.currentTime + SEEK_BIAS_S;
+        }
+        applyDuck();
+      };
+
+      const playAudio = () => {
+        audio.play().catch(error => {
+          if (s.audio !== audio || !s.on || error.name === "AbortError") return;
+          s.audioErrorHandler();
+        });
+      };
+      s.handlers = {
+        play: () => { playAudio(); sync(); },
+        pause: () => audio.pause(),
+        seeked: sync,
+        timeupdate: sync, // ~4 раза в секунду: и синхрон, и приглушение
+        ratechange: () => { audio.playbackRate = video.playbackRate; },
+        // Синхронизируем только mute. UVT не читает и не меняет video.volume.
+        volumechange: () => { audio.muted = video.muted; },
+      };
+      for (const [event, fn] of Object.entries(s.handlers)) video.addEventListener(event, fn);
+      s.timer = setInterval(sync, 100);
+      s.on = true;
+
+      audio.playbackRate = video.playbackRate;
+      audio.muted = video.muted;
+      audio.volume = prefs.voiceVol;
+      if (!video.paused) { audio.currentTime = video.currentTime; playAudio(); }
       applyDuck();
-    };
-
-    s.handlers = {
-      play: () => { audio.play(); sync(); },
-      pause: () => audio.pause(),
-      seeked: sync,
-      timeupdate: sync, // ~4 раза в секунду: и синхрон, и приглушение
-      ratechange: () => { audio.playbackRate = video.playbackRate; },
-      // Синхронизируем только mute. UVT не читает и не меняет video.volume.
-      volumechange: () => { audio.muted = video.muted; },
-    };
-    for (const [event, fn] of Object.entries(s.handlers)) video.addEventListener(event, fn);
-    s.timer = setInterval(sync, 100);
-    s.on = true;
-
-    audio.playbackRate = video.playbackRate;
-    audio.muted = video.muted;
-    audio.volume = prefs.voiceVol;
-    if (!video.paused) { audio.currentTime = video.currentTime; audio.play(); }
-    applyDuck();
+      return true;
+    } catch (error) {
+      if (s.audioObjectUrl === objectUrl) detachAudio(video);
+      else URL.revokeObjectURL(objectUrl);
+      throw error;
+    }
   }
 
   function detachAudio(video) {
     const s = state.get(video);
     if (!s) return;
     detachProgressive(video);
-    if (!s.audio) return;
     // Сначала вернуть GainNode в 1, пока перевод ещё формально включён. Для
     // fallback это no-op; user-selected video.volume всегда остаётся нетронут.
     if (s.ducker) { s.ducker.release(); s.ducker = null; }
     s.on = false;
     clearInterval(s.timer);
     for (const [event, fn] of Object.entries(s.handlers || {})) video.removeEventListener(event, fn);
-    if (s.audioErrorHandler) s.audio.removeEventListener("error", s.audioErrorHandler);
+    if (s.audio) {
+      if (s.audioErrorHandler) s.audio.removeEventListener("error", s.audioErrorHandler);
+      s.audio.pause();
+      s.audio.src = "";
+      s.audio = null;
+    }
     s.audioErrorHandler = null;
-    s.audio.pause();
-    s.audio.src = "";
-    s.audio = null;
+    if (s.audioObjectUrl) URL.revokeObjectURL(s.audioObjectUrl);
+    s.audioObjectUrl = "";
   }
 
   function mediaUrlOf(video) {
@@ -1036,7 +1158,7 @@
     const baseProfile = baseMeta.profile && baseMeta.profile.name;
     const baseTarget = baseMeta.profile && baseMeta.profile.target_lang;
     if ((advertisedProfile && advertisedProfile !== baseProfile) || jobPrefs.target !== baseTarget) {
-      const query = new URLSearchParams({ target_lang: jobPrefs.target });
+      const query = new URLSearchParams({ settings_mode: "override", target_lang: jobPrefs.target });
       if (advertisedProfile) query.set("profile_id", advertisedProfile);
       selectedMeta = await api(`/meta?${query.toString()}`, requestOptions, jobPrefs.server);
     }
@@ -1120,8 +1242,12 @@
           source_lang: resolvedPrefs.source,
           target_lang: resolvedPrefs.target,
           voice_gender: resolvedPrefs.voice,
-          voice_id: resolvedPrefs.voiceId || null,
-          profile_id: resolvedPrefs.profileId || null,
+          ...(resolvedPrefs.route === "free" ? {
+            // Empty string explicitly clears a voice inherited from another
+            // profile; null is not a valid settings value on older servers.
+            voice_id: resolvedPrefs.voiceId || "",
+            ...(resolvedPrefs.profileId ? { profile_id: resolvedPrefs.profileId } : {}),
+          } : {}),
         });
       }
       const job = await api("/dub", {
@@ -1146,10 +1272,9 @@
         const info = await api("/job/" + job.id, { signal }, s.server);
         if (info.status === "done") {
           if (!info.audio_url) throw new Error("сервер отметил задачу готовой, но не отдал аудиодорожку");
-          // Готова целая дорожка — она надёжнее набора реплик при перемотке
-          // в любое место, поэтому прогрессивный плеер уступает ей место.
-          detachProgressive(video);
-          attachAudio(video, info.audio_url, info.entries, s.server);
+          // Keep progressive clips active while the complete track downloads.
+          const attached = await attachAudio(video, info.audio_url, info.entries, s.server, signal);
+          if (!attached || !s.on) return;
           setEnabledButton(video);
           return;
         }
@@ -1458,7 +1583,7 @@
       borderBottom: "1px solid #384354",
     });
     const headerTitle = document.createElement("strong");
-    headerTitle.textContent = "Перевод видео";
+    headerTitle.textContent = `Перевод видео · ${SCRIPT_VERSION}`;
     headerTitle.style.fontSize = "18px";
     const close = document.createElement("button");
     close.type = "button";
@@ -1475,7 +1600,7 @@
 
     const refreshChip = () => syncChipLabels();
 
-    let voiceCatalog = [...LOCAL_VOICES];
+    let voiceCatalog = [];
     let metaSequence = 0;
     let previewAllowed = false;
     let localSourceRestricted = false;
@@ -1788,12 +1913,12 @@
         voiceModelSelect.appendChild(option);
       }
       const stillCompatible = compatible.some((voice) => voice.id === previous);
-      // LOCAL_VOICES is only an offline fallback.  A custom Piper voice stays
-      // pending until a successful Free /meta response authoritatively says it
-      // is unavailable; switching to GPT/ElevenLabs must not erase it.
+      // Only the selected profile's successful metadata can invalidate a
+      // concrete choice. Remember the clear so later refreshes cannot restore
+      // an incompatible voice inherited from global settings (MOSS → Piper).
       if (clearInvalid && !stillCompatible) {
         videoPrefs.voiceId = "";
-        if (Object.hasOwn(s.videoOverrides, "voiceId")) s.videoOverrides.voiceId = "";
+        if (previous || Object.hasOwn(s.videoOverrides, "voiceId")) s.videoOverrides.voiceId = "";
       }
       voiceModelSelect.value = stillCompatible ? previous : "";
       voiceModelSelect.disabled = prefs.route !== "free" || compatible.length === 0;
@@ -1943,9 +2068,9 @@
             text,
             settings_mode: "override",
             target_lang: resolvedPreview.target,
-            profile_id: resolvedPreview.profileId || null,
+            ...(resolvedPreview.profileId ? { profile_id: resolvedPreview.profileId } : {}),
             voice_gender: gender,
-            voice_id: resolvedPreview.voiceId || null,
+            voice_id: resolvedPreview.voiceId || "",
           }),
           signal: previewAbort.signal,
         }, resolvedPreview.server);
@@ -1986,6 +2111,11 @@
     connectionSummary.textContent = "Подключение и диагностика";
     connectionSummary.style.cursor = "pointer";
     connection.appendChild(connectionSummary);
+    const scriptStatus = document.createElement("div");
+    scriptStatus.className = "uvt-script-version";
+    scriptStatus.textContent = `UVT ${SCRIPT_VERSION} · ${extensionRequest() ? "связь через Tampermonkey" : "связь со страницы (без сетевого API Tampermonkey)"}`;
+    Object.assign(scriptStatus.style, { marginTop: "8px", color: "#bac8da" });
+    connection.appendChild(scriptStatus);
     const engineStatus = document.createElement("div");
     Object.assign(engineStatus.style, { marginTop: "10px", color: "#bac8da", overflowWrap: "anywhere" });
     engineStatus.textContent = "Данные о моделях появятся после подключения.";
@@ -2005,7 +2135,7 @@
     connectionActions.appendChild(saveServer);
     connection.appendChild(connectionActions);
     const connectionHint = document.createElement("div");
-    connectionHint.textContent = "Для сети используйте HTTPS reverse proxy и UVT_API_TOKEN; секрет в эту панель не вводится.";
+    connectionHint.textContent = "Локальные адреса 127.0.0.1 и localhost разрешены скрипту. Для своего HTTPS-сервера добавьте его домен в @connect в Tampermonkey; UVT_API_TOKEN остаётся в скрипте, не в этой панели.";
     Object.assign(connectionHint.style, { color: "#aeb6c2", marginTop: "5px" });
     connection.appendChild(connectionHint);
     panel.appendChild(connection);
@@ -2037,6 +2167,12 @@
         readiness.textContent = "Проверяю сервер и модели…";
       }
       previewAllowed = false;
+      // Hide the previous profile's voices immediately. Keep the candidate ID
+      // internally until the new catalog validates it, including failed or
+      // out-of-order metadata responses during fast profile switches.
+      voiceCatalog = [];
+      refreshVoiceOptions();
+      voiceModelSelect.options[0].textContent = "Проверяю голоса выбранного профиля…";
       profileSelect.disabled = prefs.route !== "free";
       applyPreviewButtonState();
       try {
@@ -2077,7 +2213,7 @@
         if (!usingServerSettings && (
           (canSelectProfile && selectedProfile !== baseProfile) || videoPrefs.target !== baseTarget
         )) {
-          const query = new URLSearchParams({ target_lang: videoPrefs.target });
+          const query = new URLSearchParams({ settings_mode: "override", target_lang: videoPrefs.target });
           if (canSelectProfile && selectedProfile) query.set("profile_id", selectedProfile);
           meta = await api(`/meta?${query.toString()}`, { signal: s.settingsAbort.signal }, activeServer);
           if (!panel.isConnected || sequence !== metaSequence) return;
@@ -2176,6 +2312,7 @@
         if (!panel.isConnected || sequence !== metaSequence) return;
         profileSelect.disabled = prefs.route !== "free";
         voiceModelSelect.disabled = true;
+        voiceModelSelect.options[0].textContent = "Не удалось получить голоса профиля";
         readiness.textContent = `Сервер недоступен. Профиль можно выбрать заранее; доступность моделей проверится при запуске перевода. Проверьте запуск UVT и адрес в «Подключение и диагностика». ${String(error && error.message ? error.message : error)}`;
       }
     }

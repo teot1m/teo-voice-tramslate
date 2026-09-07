@@ -7,16 +7,18 @@ from __future__ import annotations
 import asyncio
 import html
 import ipaddress
+import json
 import re
 from collections import deque
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
 
 MAX_HTML_BYTES = 2 * 1024 * 1024
 MAX_MEDIA_CANDIDATES = 6
 MAX_PLAYER_CHARS = 32768
+MAX_SIGN_BYTES = 16384
 DISCOVERY_TIMEOUT_SECONDS = 20
 _ESCAPE = re.compile(r"\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[/\\\"'])")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
@@ -89,7 +91,7 @@ class _MediaParser(HTMLParser):
             self.scripts.append(data)
 
 
-def _js_tokens(script: str):
+def _js_tokens(script: str, *, strict: bool = False):
     """Distinguish literals, comments and nesting; never evaluate expressions."""
     index = 0
     while index < len(script):
@@ -104,6 +106,8 @@ def _js_tokens(script: str):
             continue
         if script.startswith("/*", index):
             end = script.find("*/", index + 2)
+            if strict and end < 0:
+                raise ValueError("unterminated script comment")
             index = len(script) if end < 0 else end + 2
             continue
         if char in "\"'`":
@@ -116,6 +120,8 @@ def _js_tokens(script: str):
                 else:
                     index += 1
             if index >= len(script):
+                if strict:
+                    raise ValueError("unterminated script string")
                 return
             kind = "template" if char == "`" else "string"
             yield kind, _unescape_js(script[start + 1:index]), start
@@ -202,6 +208,115 @@ def extract_media_urls(document: str, page_url: str) -> list[str]:
     return sorted(unique, key=unique.__getitem__)[:MAX_MEDIA_CANDIDATES]
 
 
+def _bunkr_player_config(document: str, page_url: str) -> tuple[str, str] | None:
+    """Read the site's literal player configuration, never execute its scripts."""
+    page = urlsplit(page_url)
+    host = (page.hostname or "").lower()
+    if not (host == "bunkr.cr" or host.endswith(".bunkr.cr")):
+        return None
+    if not re.fullmatch(r"/f/[A-Za-z0-9]+/?", page.path):
+        return None
+    parser = _MediaParser()
+    parser.feed(document)
+    names = {"jsCDN", "jsType", "signUrl"}
+    values: dict[str, str] = {}
+    for script in parser.scripts:
+        if len(script) > MAX_PLAYER_CHARS:
+            continue
+        # Bunkr exposes a separate, literal-only configuration block. Validate
+        # the whole block: regex literals and other JS data must not be scanned
+        # for declarations that happen to resemble player configuration.
+        block: dict[str, str] = {}
+        statement = []
+
+        def declaration():
+            if not statement:
+                return True
+            if (len(statement) != 4 or statement[0][:2] not in {
+                    ("identifier", "var"), ("identifier", "let"), ("identifier", "const")}
+                    or statement[1][0] != "identifier"
+                    or statement[2][:2] != ("punctuation", "=")
+                    or statement[3][0] != "string"):
+                return False
+            block[statement[1][1]] = statement[3][1]
+            return True
+
+        try:
+            tokens = list(_js_tokens(script, strict=True))
+        except ValueError:
+            continue
+        valid = True
+        for token in tokens:
+            if token[:2] == ("punctuation", ";"):
+                if not declaration():
+                    valid = False
+                    break
+                statement = []
+            else:
+                statement.append(token)
+                if len(statement) > 4:
+                    valid = False
+                    break
+        if valid and declaration() and names <= block.keys():
+            if values:  # More than one complete configuration is ambiguous.
+                return None
+            values = block
+    raw, media_type, signer = (values.get(name) for name in ("jsCDN", "jsType", "signUrl"))
+    if (not raw or not media_type or not re.fullmatch(r"video/[A-Za-z0-9.+-]+", media_type)
+            or signer != "https://glb-apisign.cdn.cr/sign"):
+        return None
+    if not raw.startswith("https://") or not public_http_url(raw, page_url):
+        return None
+    media = urlsplit(raw)
+    if (not (media.hostname or "").lower().endswith(".cdn.cr")
+            or media.port not in {None, 443} or not media.path.startswith("/storage/media/")
+            or media.fragment or _CONTROL.search(unquote(media.path))):
+        return None
+    return raw, signer
+
+
+async def _bunkr_page_media(client: httpx.AsyncClient, document: str, page_url: str) -> list[str]:
+    config = _bunkr_player_config(document, page_url)
+    if not config:
+        return []
+    raw, signer = config
+    media = urlsplit(raw)
+    # This is the same unauthenticated GET used by the public web player.
+    # No cookies from page redirects, arbitrary signer hosts or redirect retries.
+    client.cookies.clear()
+    async with client.stream(
+        "GET", signer, params={"path": unquote(media.path)},
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json", "Accept-Encoding": "identity"},
+    ) as response:
+        response.raise_for_status()
+        try:
+            if int(response.headers.get("content-length", "0")) > MAX_SIGN_BYTES:
+                return []
+        except ValueError:
+            return []
+        body = bytearray()
+        async for chunk in response.aiter_bytes(chunk_size=4096):
+            if len(body) + len(chunk) > MAX_SIGN_BYTES:
+                return []
+            body.extend(chunk)
+        try:
+            payload = json.loads(body)
+        except (ValueError, UnicodeError):
+            return []
+    if not isinstance(payload, dict):
+        return []
+    token, expiry = payload.get("token"), payload.get("ex")
+    if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,4096}", token):
+        return []
+    if (isinstance(expiry, bool) or not isinstance(expiry, (int, str))
+            or not re.fullmatch(r"[0-9]{1,20}", str(expiry)) or int(expiry) <= 0):
+        return []
+    query = [(key, value) for key, value in parse_qsl(media.query, keep_blank_values=True)
+             if key not in {"token", "ex"}]
+    query.extend([("token", token), ("ex", str(expiry))])
+    return [urlunsplit(media._replace(query=urlencode(query)))]
+
+
 async def _fetch_page_media(page_url: str) -> list[str]:
     url = public_http_url(page_url, page_url)
     if not url:
@@ -229,7 +344,11 @@ async def _fetch_page_media(page_url: str) -> list[str]:
                     if len(body) + len(chunk) > MAX_HTML_BYTES:
                         return []
                     body.extend(chunk)
-                return extract_media_urls(body.decode("utf-8", errors="replace"), str(response.url))
+                document = body.decode("utf-8", errors="replace")
+                candidates = extract_media_urls(document, str(response.url))
+                if candidates:
+                    return candidates
+                return await _bunkr_page_media(client, document, str(response.url))
     return []
 
 

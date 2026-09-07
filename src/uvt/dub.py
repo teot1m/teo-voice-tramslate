@@ -672,8 +672,11 @@ _TTS_PROVIDER_LABELS = {
 
 
 def _is_fatal_tts_error(error: BaseException) -> bool:
-    """Auth/payment errors cannot be fixed by retrying every subtitle line."""
-    return _tts_http_status(error) in _FATAL_TTS_HTTP_STATUSES
+    """Stop on provider failures or a local engine's exhausted recovery."""
+    return (
+        getattr(error, "fatal_tts", False) is True
+        or _tts_http_status(error) in _FATAL_TTS_HTTP_STATUSES
+    )
 
 
 def _tts_http_status(error: BaseException) -> int | None:
@@ -704,7 +707,11 @@ def _tts_failure_reason(provider: str, error: BaseException) -> str:
     # credits and rate limits in its JSON body. Do not replace that verified
     # explanation with the old generic assumption that every 402 is quota.
     provider_reason = getattr(error, "user_message", None)
-    if provider == "ElevenLabs" and isinstance(provider_reason, str) and provider_reason:
+    if (
+        (provider == "ElevenLabs" or getattr(error, "fatal_tts", False) is True)
+        and isinstance(provider_reason, str)
+        and provider_reason
+    ):
         return provider_reason
     status = _tts_http_status(error)
     if status == 429:

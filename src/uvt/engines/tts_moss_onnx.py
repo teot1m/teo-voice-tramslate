@@ -11,6 +11,7 @@ import hashlib
 import logging
 import math
 import re
+import unicodedata
 import threading
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,44 @@ SUPPORTED_LANGUAGES = frozenset({
 })
 DEFAULT_VOICES = {"male": "Adam", "female": "Bella"}
 BUILTIN_VOICES = {"Adam": "male", "Nathan": "male", "Ava": "female", "Bella": "female"}
+
+
+class MossSynthesisLimitError(RuntimeError):
+    """Exhausted bounded recovery; never publish a dub with this line missing."""
+
+    fatal_tts = True
+    user_message = (
+        "MOSS не смогла завершить реплику после ограниченных повторов и разделения текста. "
+        "Выберите встроенный голос MOSS вместо клонирования из оригинала "
+        "или профиль Hy-MT / Быстро с Piper и повторите перевод."
+    )
+
+    def __init__(self):
+        super().__init__(self.user_message)
+
+
+class _FrameLimitReached(Exception):
+    pass
+
+
+def _split_failed_chunk(text: str) -> list[str]:
+    """Split near the middle without dropping text or breaking words/numbers."""
+    minimum, maximum = len(text) // 4, len(text) * 3 // 4
+    boundaries = [m.end() for m in re.finditer(r"[.!?;:,。！？](?:\s+|$)", text)
+                  if minimum <= m.end() <= maximum]
+    if not boundaries:
+        boundaries = [m.end() for m in re.finditer(r"\s+", text)
+                      if minimum <= m.end() <= maximum]
+    if not boundaries:
+        # Unspaced CJK can split between characters; a single word cannot.
+        boundaries = [i for i in range(max(1, minimum), min(len(text), maximum + 1))
+                      if all(unicodedata.east_asian_width(c) in {"W", "F"}
+                             for c in text[i - 1:i + 1])]
+    if not boundaries:
+        return [text]
+    cut = min(boundaries, key=lambda i: abs(i - len(text) / 2))
+    parts = [text[:cut].strip(), text[cut:].strip()]
+    return parts if all(parts) else [text]
 
 
 class _SynthesisCancelled(Exception):
@@ -111,8 +150,9 @@ class MossOnnxTTS(TTSEngine):
         self._lock = asyncio.Lock()
         self._runtime = None
         self._reference_cache: dict[str, list[list[int]]] = {}
-        self._budget = max(8, min(150, int(getattr(self.cfg, "max_text_tokens", 75))))
+        self._budget = max(8, min(150, int(getattr(self.cfg, "max_text_tokens", 48))))
         self._max_frames = max(25, min(750, int(getattr(self.cfg, "max_new_frames", 375))))
+        self._max_chunk_attempts = max(1, min(10, int(getattr(self.cfg, "max_chunk_attempts", 7))))
         self._reference_path = getattr(self.cfg, "reference_wav", None)
         if self._reference_path:
             self._reference_path = _local_path(self._reference_path, "")
@@ -206,32 +246,90 @@ class MossOnnxTTS(TTSEngine):
         self._reference_cache[key] = codes
         return codes
 
-    def _synthesize(self, text: str, reference: VoiceReference | None,
-                    cancelled: threading.Event) -> tuple[np.ndarray, int]:
+    def _frame_limit(self, text: str) -> int:
+        # A deliberately generous bound, including pauses. The extra probe frame
+        # distinguishes EOS exactly at the limit from unfinished generation.
+        weight = sum(3 if unicodedata.east_asian_width(c) in {"W", "F"} else 1
+                     for c in text if not c.isspace())
+        seconds = max(8.0, 3.0 + weight / 6.0)
+        hop = int(self._runtime.codec_meta["codec_config"]["downsample_rate"])
+        return min(self._max_frames - 1, math.ceil(seconds * self._sample_rate / hop))
+
+    def _generate_chunk(self, chunk: str, prompt_codes, cancelled: threading.Event) -> np.ndarray:
         def check_cancel(*_):
             if cancelled.is_set():
                 raise _SynthesisCancelled()
+
+        check_cancel()
+        request = self._runtime.build_voice_clone_request_rows(
+            prompt_codes, self._tokenizer.encode(chunk, out_type=int))
+        limit = self._frame_limit(chunk)
+        defaults = self._runtime.manifest["generation_defaults"]
+        previous_limit = defaults["max_new_frames"]
+        # _speak serializes access and drains the worker before releasing its lock.
+        try:
+            defaults["max_new_frames"] = limit + 1
+            frames = self._runtime.generate_audio_frames(request, on_frame=check_cancel)
+        finally:
+            defaults["max_new_frames"] = previous_limit
+        check_cancel()
+        if not frames:
+            raise RuntimeError("MOSS-TTS вернула пустую озвучку; попробуйте другой голос")
+        if len(frames) > limit:
+            raise _FrameLimitReached()
+        channels, length = self._runtime.decode_full_audio(frames)
+        check_cancel()
+        audio = np.asarray(channels, dtype=np.float32).mean(axis=0)[:length]
+        if not audio.size or not np.isfinite(audio).all():
+            raise RuntimeError("MOSS-TTS вернула некорректный звук")
+        return audio
+
+    def _synthesize(self, text: str, reference: VoiceReference | None, cancelled: threading.Event
+                    ) -> tuple[np.ndarray, int]:
+        def check_cancel():
+            if cancelled.is_set():
+                raise _SynthesisCancelled()
+
         check_cancel()
         prompt_codes = self._reference_codes(reference)
         chunks = _text_chunks(text, self._tokenizer, self._budget)
         audio_chunks = []
         for chunk in chunks:
-            check_cancel()
-            request = self._runtime.build_voice_clone_request_rows(
-                prompt_codes, self._tokenizer.encode(chunk, out_type=int))
-            frames = self._runtime.generate_audio_frames(request, on_frame=check_cancel)
-            check_cancel()
-            if not frames:
-                raise RuntimeError("MOSS-TTS вернула пустую озвучку; попробуйте другой голос")
-            if len(frames) >= self._max_frames:
-                raise RuntimeError("MOSS-TTS достигла предела реплики; уменьшите max_text_tokens")
-            channels, length = self._runtime.decode_full_audio(frames)
-            audio = np.asarray(channels, dtype=np.float32).mean(axis=0)[:length]
-            if not audio.size or not np.isfinite(audio).all():
-                raise RuntimeError("MOSS-TTS вернула некорректный звук")
-            if audio_chunks:
-                audio_chunks.append(np.zeros(int(self._sample_rate * 0.15), dtype=np.float32))
-            audio_chunks.append(audio)
+            attempts = 0
+
+            def recover(part: str, depth: int = 0) -> list[np.ndarray]:
+                nonlocal attempts
+                check_cancel()
+                if attempts >= self._max_chunk_attempts:
+                    raise MossSynthesisLimitError()
+                attempts += 1
+                try:
+                    return [self._generate_chunk(part, prompt_codes, cancelled)]
+                except _FrameLimitReached:
+                    check_cancel()
+                    parts = _split_failed_chunk(part) if depth < 2 else [part]
+                    log.warning(
+                        "MOSS: предел фрагмента (%d символов, попытка %d/%d); %s",
+                        len(part), attempts, self._max_chunk_attempts,
+                        "делю текст" if len(parts) > 1 else "повторяю с тем же голосом",
+                    )
+                    if len(parts) > 1:
+                        return [audio for child in parts for audio in recover(child, depth + 1)]
+                    # Fixed sampling parameters still draw fresh values. One retry
+                    # may recover a stalled generation without changing the voice.
+                    check_cancel()
+                    if attempts >= self._max_chunk_attempts:
+                        raise MossSynthesisLimitError() from None
+                    attempts += 1
+                    try:
+                        return [self._generate_chunk(part, prompt_codes, cancelled)]
+                    except _FrameLimitReached:
+                        raise MossSynthesisLimitError() from None
+
+            for audio in recover(chunk):
+                if audio_chunks:
+                    audio_chunks.append(np.zeros(int(self._sample_rate * 0.15), dtype=np.float32))
+                audio_chunks.append(audio)
         return (np.concatenate(audio_chunks).astype(np.float32) if audio_chunks
                 else np.empty(0, dtype=np.float32)), self._sample_rate
 
